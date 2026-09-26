@@ -1,0 +1,256 @@
+import { readFile } from "node:fs/promises";
+import { extname } from "node:path";
+import { Channel } from "./protocol";
+import { nativeModels } from "./models";
+import { claudeCommands } from "./catalog";
+import { claudeWindows } from "./quota";
+import { codebitInstructions } from "../extensions";
+import type {
+  AgentEvent,
+  AgentSession,
+  Installation,
+  Model,
+  Task,
+} from "../../shared/types";
+const editTools = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
+export class ClaudeSession implements AgentSession {
+  private channel: Channel;
+  private ready: Promise<any>;
+  private requests = new Map<string, any>();
+  private textSeen = false;
+  private model = "";
+  private used = 0;
+  constructor(
+    i: Installation,
+    private task: Task,
+    mcp: Record<string, any>,
+    private emit: (event: AgentEvent) => void,
+    private guidelines = "",
+  ) {
+    const args = [
+      "--print",
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--include-partial-messages",
+      "--permission-prompt-tool",
+      "stdio",
+      "--permission-mode",
+      { plan: "plan", execute: "manual", bypass: "bypassPermissions" }[
+        task.mode
+      ],
+      "--setting-sources",
+      "user,project,local",
+      "--mcp-config",
+      JSON.stringify({ mcpServers: mcp }),
+      "--append-system-prompt",
+      codebitInstructions(mcp, guidelines),
+    ];
+    if (task.mode === "bypass")
+      args.push("--allow-dangerously-skip-permissions");
+    if (task.nativeId) args.push(`--resume=${task.nativeId}`);
+    if (task.model) args.push("--model", task.model);
+    if (task.effort) args.push("--effort", task.effort);
+    this.channel = new Channel(
+      i,
+      args,
+      task.cwd,
+      "claude",
+      (msg) => this.receive(msg),
+      (e) => emit({ type: "error", text: e.message }),
+    );
+    this.ready = this.channel.request("initialize", { hooks: {} });
+    this.ready.then(
+      (r) => emit({ type: "commands", commands: claudeCommands(r.commands) }),
+      () => {},
+    );
+  }
+  private receive(msg: any) {
+    // Every turn starts with init, including the ones Claude starts on its
+    // own to report background work that finished.
+    if (msg.type === "system" && msg.subtype === "init") {
+      if (msg.session_id) this.emit({ type: "native", id: msg.session_id });
+      this.model = msg.model || "";
+      this.textSeen = false;
+      this.emit({ type: "turn" });
+    }
+    if (msg.type === "system" && msg.subtype === "background_tasks_changed")
+      this.emit({ type: "background", count: (msg.tasks || []).length });
+    // Sub-agent messages share the stream; only their tool use is shown.
+    const subagent = !!msg.parent_tool_use_id;
+    if (msg.type === "rate_limit_event")
+      this.emit({ type: "quota", windows: claudeWindows(msg.rate_limit_info) });
+    // The latest API call's input plus output is what the context holds now.
+    const usage = msg.type === "assistant" && !subagent && msg.message?.usage;
+    if (usage)
+      this.used =
+        (usage.input_tokens || 0) +
+        (usage.cache_creation_input_tokens || 0) +
+        (usage.cache_read_input_tokens || 0) +
+        (usage.output_tokens || 0);
+    if (msg.type === "stream_event" && !subagent) {
+      const e = msg.event;
+      if (e?.type === "content_block_delta" && e.delta?.type === "text_delta") {
+        this.textSeen = true;
+        this.emit({ type: "text", text: e.delta.text });
+      }
+    }
+    if (msg.type === "assistant")
+      for (const block of msg.message?.content || []) {
+        if (block.type === "text" && !this.textSeen && !subagent)
+          this.emit({ type: "text", text: block.text });
+        if (block.type === "tool_use")
+          this.emit({
+            type: "activity",
+            text: `${subagent ? "Sub-agente · " : ""}${block.name} · ${block.input?.command || block.input?.file_path || block.input?.description || ""}`,
+            files: editTools.includes(block.name)
+              ? [block.input?.file_path || block.input?.notebook_path].filter(
+                  Boolean,
+                )
+              : undefined,
+          });
+      }
+    if (msg.type === "result") {
+      const models = Object.entries<any>(msg.modelUsage || {});
+      const size =
+        models.find(([id]) => id === this.model)?.[1].contextWindow ??
+        Math.max(0, ...models.map(([, m]) => m.contextWindow || 0));
+      // Local commands such as /context do not call the model.
+      if (this.used)
+        this.emit({ type: "usage", used: this.used, size: size || undefined });
+      this.used = 0;
+      if (msg.is_error)
+        this.emit({
+          type: "error",
+          text: (msg.errors || [msg.result || "Falha no Claude."]).join("\n"),
+        });
+      else this.emit({ type: "done" });
+    }
+    if (msg.type === "control_request") {
+      const r = msg.request,
+        id = msg.request_id;
+      if (r.subtype !== "can_use_tool") {
+        this.channel.send({
+          type: "control_response",
+          response: {
+            subtype: "error",
+            request_id: id,
+            error: "Controle não suportado pelo Codebit.",
+          },
+        });
+        return;
+      }
+      this.requests.set(id, r);
+      if (r.tool_name === "AskUserQuestion")
+        this.emit({
+          type: "request",
+          request: {
+            id,
+            kind: "question",
+            title: "O agente precisa da sua resposta",
+            detail: "",
+            questions: (r.input.questions || []).map((q: any) => ({
+              id: q.question,
+              question: q.question,
+              options: q.options?.map((o: any) => o.label),
+              multiSelect: q.multiSelect,
+            })),
+          },
+        });
+      else
+        this.emit({
+          type: "request",
+          request: {
+            id,
+            kind: "approval",
+            title: `Permitir ${r.tool_name}?`,
+            detail: JSON.stringify(r.input, null, 2),
+            choices: ["decline", "accept"],
+            tool: r.tool_name,
+          },
+        });
+    }
+  }
+  async send(text: string, attachments: string[]) {
+    await this.ready;
+    this.textSeen = false;
+    const content: any[] = [{ type: "text", text }];
+    for (const path of attachments) {
+      const mime = (
+        {
+          ".png": "image/png",
+          ".jpg": "image/jpeg",
+          ".jpeg": "image/jpeg",
+          ".webp": "image/webp",
+          ".gif": "image/gif",
+        } as Record<string, string>
+      )[extname(path).toLowerCase()];
+      if (mime) {
+        content.push({
+          type: "text",
+          text: `Imagem anexada. Identificador para codebit_images.edit_image: ${path}`,
+        });
+        content.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: mime,
+            data: (await readFile(path)).toString("base64"),
+          },
+        });
+      } else
+        content.push({
+          type: "text",
+          text: `Arquivo anexado pelo usuário: ${path}`,
+        });
+    }
+    this.channel.send({
+      type: "user",
+      session_id: this.task.nativeId || "",
+      parent_tool_use_id: null,
+      message: { role: "user", content },
+    });
+  }
+  respond(id: string, value: any) {
+    const r = this.requests.get(id);
+    if (!r) throw new Error("Esta solicitação não está mais ativa.");
+    const response =
+      r.tool_name === "AskUserQuestion"
+        ? {
+            behavior: "allow",
+            updatedInput: {
+              ...r.input,
+              answers: Object.fromEntries(
+                Object.entries(value.answers || {}).map(([key, answer]) => [
+                  key,
+                  Array.isArray(answer) ? answer.join(", ") : answer,
+                ]),
+              ),
+            },
+          }
+        : value.decision === "accept"
+          ? { behavior: "allow", updatedInput: r.input }
+          : {
+              behavior: "deny",
+              message: value.message || "Ação recusada pelo usuário.",
+            };
+    this.channel.send({
+      type: "control_response",
+      response: { subtype: "success", request_id: id, response },
+    });
+    this.requests.delete(id);
+  }
+  async models(): Promise<Model[]> {
+    const r = await this.ready;
+    return nativeModels("claude", r.models || []);
+  }
+  async interrupt() {
+    await this.ready;
+    await this.channel.request("interrupt");
+  }
+  close() {
+    this.channel.close();
+  }
+}

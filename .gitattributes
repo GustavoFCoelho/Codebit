@@ -1,0 +1,3 @@
+# The code is formatted with LF (Prettier); keep it on Windows checkouts too.
+* text=auto eol=lf
+*.png binary
