@@ -1,0 +1,260 @@
+/* Side panel: changes, files, terminal, images and plan. */
+.inspector {
+  border-left: 1px solid var(--border);
+  background: var(--surface-1);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+.panel-tabs {
+  display: flex;
+  align-items: stretch;
+  height: 49px;
+  min-height: 49px;
+  border-bottom: 1px solid var(--border);
+  padding: 0 7px;
+}
+.panel-tabs > button {
+  flex: 1;
+  border-radius: 0;
+  padding: 0 5px;
+  font-size: 11px;
+  color: var(--muted);
+  position: relative;
+}
+.panel-tabs > button.selected {
+  color: var(--text);
+}
+.panel-tabs > button.selected:after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  left: 8px;
+  right: 8px;
+  height: 2px;
+  background: var(--green);
+}
+.panel-heading {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 15px 16px;
+  font-size: 12px;
+  min-height: 54px;
+}
+.panel-heading > strong {
+  font-weight: 550;
+  flex: 1;
+}
+.panel-heading > span {
+  flex: 1;
+}
+.panel-heading .count {
+  font-size: 11px;
+  color: var(--green-muted);
+  text-align: right;
+}
+.diff-panel,
+.file-panel,
+.terminal-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+.changed-files {
+  display: flex;
+  flex-direction: column;
+  margin: 0 10px 8px;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+.changed-file {
+  justify-content: flex-start;
+  gap: 9px;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--text-2);
+  border-radius: 0;
+  text-align: left;
+}
+.changed-file + .changed-file {
+  border-top: 1px solid var(--border);
+}
+.changed-file > .truncate {
+  flex: 1;
+  min-width: 0;
+}
+.change-code {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  font:
+    600 11px/1 "Cascadia Code",
+    Consolas,
+    monospace;
+  color: var(--amber);
+  background: var(--amber-bg);
+}
+.change-code.code-A,
+.change-code.code-new {
+  color: var(--green);
+  background: var(--green-bg);
+}
+.change-code.code-D {
+  color: var(--red);
+  background: var(--red-bg);
+}
+.change-count {
+  display: inline-flex;
+  gap: 6px;
+  flex-shrink: 0;
+  font:
+    11px "Cascadia Code",
+    Consolas,
+    monospace;
+}
+.change-count .added {
+  color: var(--green);
+}
+.change-count .removed {
+  color: var(--red);
+}
+.monaco-editor .diff-line-add {
+  background: #64ce8e14;
+}
+.monaco-editor .diff-line-del {
+  background: #eaa7a114;
+}
+.monaco-editor .diff-line-file {
+  background: #ffffff08;
+  border-top: 1px solid var(--border-card);
+}
+.panel-empty {
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  justify-content: center;
+  padding: 42px 20px;
+  text-align: center;
+  gap: 12px;
+  color: var(--faint);
+}
+.panel-empty > p {
+  font-size: 12px;
+  color: var(--text-2);
+}
+.panel-empty > small {
+  max-width: 260px;
+  font-size: 11px;
+  color: var(--faint);
+}
+.file-row {
+  display: flex;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 10px 18px;
+  font-size: 11px;
+  width: 100%;
+  color: var(--text-2);
+  min-height: 35px;
+}
+.file-row > span {
+  flex: 1;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-row svg {
+  color: var(--green-muted);
+  flex-shrink: 0;
+}
+.terminal-surface {
+  flex: 1;
+  min-height: 100px;
+  padding: 5px 9px;
+  background: var(--sunken);
+  overflow: hidden;
+}
+.terminal-surface .xterm {
+  height: 100%;
+}
+.images-panel {
+  overflow: auto;
+  flex: 1;
+}
+.thumbnails {
+  display: flex;
+  gap: 8px;
+  overflow: auto;
+  padding: 0 14px 16px;
+}
+.thumbnails button {
+  padding: 3px;
+  border-radius: var(--radius-lg);
+  min-width: 74px;
+  width: 85px;
+  height: 85px;
+  border: 1px solid var(--border-strong);
+  overflow: hidden;
+  background: var(--surface-3);
+}
+.thumbnails button.selected {
+  border: 2px solid var(--green);
+}
+.thumbnails img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+}
+.inspector-image {
+  display: block;
+  width: calc(100% - 28px);
+  max-height: 270px;
+  object-fit: contain;
+  background: var(--surface-2);
+  border-radius: var(--radius);
+  margin: 0 14px 10px;
+}
+.image-settings {
+  padding: 5px 17px 20px;
+}
+.property {
+  display: flex;
+  gap: 14px;
+  justify-content: space-between;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+}
+.property > span {
+  color: var(--muted);
+}
+.property strong {
+  font-weight: 450;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.image-settings > label {
+  margin-top: 16px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+.image-settings select,
+.image-settings input,
+.image-settings textarea {
+  font-size: 11px;
+}
+.image-settings > .primary {
+  width: 100%;
+}

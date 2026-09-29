@@ -151,9 +151,11 @@ test("imagens: seleção independente, anexo, edição e exportação", async ()
     await page
       .getByLabel("Mensagem", { exact: true })
       .fill("Uma variação azul");
+    // Image generation lives in the images chip of the composer.
+    await page.getByRole("button", { name: "Configurar imagens" }).click();
     await page
+      .getByRole("dialog", { name: "Imagens" })
       .getByRole("button", { name: "Gerar imagem", exact: true })
-      .first()
       .click();
     await expect(page.locator(".image-message img")).toBeVisible();
     await expect
@@ -273,13 +275,33 @@ test("fluxo desktop: projeto, confiança, tarefa, configurações e persistênci
       { timeout: 15000 },
     )
     .toBe(true);
+  // Agent, model and effort live in the first chip of the composer.
+  await page.getByRole("button", { name: "Agente e modelo" }).click();
   await expect(page.getByLabel("Agente", { exact: true })).toHaveValue("codex");
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("dialog", { name: "Agente e modelo" }),
+  ).toHaveCount(0);
   await page.getByRole("button", { name: "Configurar sub-agentes" }).click();
   const subagents = page.getByRole("dialog", { name: "Sub-agentes" });
   // Controlled by the saved task, so it turns checked after the IPC round trip.
   const delegate = subagents.getByLabel(
     "Permitir que o agente delegue a sub-agentes",
   );
+  await delegate.click();
+  await expect(delegate).toBeChecked();
+  await subagents.getByLabel("Quantidade de sub-agentes").fill("3");
+  await expect(
+    page.getByRole("button", { name: "Configurar sub-agentes" }),
+  ).toHaveText(/Codex · 3/);
+  // Back to the default (off), then the chat's own choice again.
+  await subagents.getByRole("button", { name: "Voltar ao padrão" }).click();
+  await expect(
+    page.getByRole("button", { name: "Configurar sub-agentes" }),
+  ).toHaveText(/Desligados/);
+  await expect(
+    subagents.getByRole("button", { name: "Voltar ao padrão" }),
+  ).toHaveCount(0);
   await delegate.click();
   await expect(delegate).toBeChecked();
   await subagents.getByLabel("Quantidade de sub-agentes").fill("3");
@@ -343,6 +365,12 @@ test("fluxo desktop: projeto, confiança, tarefa, configurações e persistênci
     page.getByRole("heading", { name: "Agentes e modelos", exact: true }),
   ).toBeVisible();
   await screenshot("02-agentes.png");
+  await page
+    .getByRole("button", { name: "Comportamento", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Comportamento dos agentes" }),
+  ).toBeVisible();
   const guidelines = page.getByLabel("Diretrizes para os agentes");
   await expect(guidelines).toHaveValue(/desatualizada/);
   await guidelines.fill("Sempre rode os testes.");
@@ -356,6 +384,47 @@ test("fluxo desktop: projeto, confiança, tarefa, configurações e persistênci
   ).toBe("Sempre rode os testes.");
   await page.getByRole("button", { name: "Restaurar padrão" }).click();
   await expect(guidelines).toHaveValue(/desatualizada/);
+  // Loop guard: on by default, with limits that can be changed.
+  await expect(
+    page.getByLabel(
+      "Parar o agente quando ele insistir numa ação que não funciona",
+    ),
+  ).toBeChecked();
+  const repeats = page.getByLabel("Mesma ação, sem editar arquivos");
+  await expect(repeats).toHaveValue("4");
+  await expect(page.getByLabel("Falhas seguidas")).toHaveValue("6");
+  await repeats.fill("3");
+  await repeats.blur();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        async () =>
+          (await window.codebit.call<any>("snapshot")).settings.loopGuard
+            ?.repeats,
+      ),
+    )
+    .toBe(3);
+  // Default sub-agents, then applied to every chat.
+  const defaults = page.locator(".subagents-defaults");
+  const delegateByDefault = defaults.getByLabel(
+    "Permitir que o agente delegue a sub-agentes",
+  );
+  await delegateByDefault.click();
+  await expect(delegateByDefault).toBeChecked();
+  await defaults.getByLabel("Quantidade de sub-agentes").fill("5");
+  await page.getByLabel("Aplicar a todas as conversas automaticamente").click();
+  await expect
+    .poll(() =>
+      page.evaluate(async () => {
+        const s = (await window.codebit.call<any>("snapshot")).settings;
+        return [
+          s.defaultSubagents?.enabled,
+          s.defaultSubagents?.max,
+          s.syncSubagents,
+        ];
+      }),
+    )
+    .toEqual([true, 5, true]);
   await page.getByRole("button", { name: "Imagens", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "Geração de imagens" }),
@@ -378,6 +447,7 @@ test("fluxo desktop: projeto, confiança, tarefa, configurações e persistênci
     (t: any) => t.title === "Revisar autenticação",
   );
   expect(review.cwd).toBe(project);
+  // The chat keeps its own choice, used again if the sync is turned off.
   expect(review.subagents).toMatchObject({ enabled: true, max: 3 });
   expect(review.mode).toBe("execute");
   expect(
@@ -396,6 +466,17 @@ test("fluxo desktop: projeto, confiança, tarefa, configurações e persistênci
   await expect(
     reopened.getByRole("heading", { name: "Ideias soltas", exact: true }),
   ).toBeVisible();
+  // Synced: the chat shows the default and cannot change it on its own.
+  const synced = reopened.getByRole("button", {
+    name: "Configurar sub-agentes",
+  });
+  await expect(synced).toHaveText(/Codex · 5/);
+  await synced.click();
+  const syncedDialog = reopened.getByRole("dialog", { name: "Sub-agentes" });
+  await expect(syncedDialog).toContainText("segue os sub-agentes padrão");
+  await expect(
+    syncedDialog.getByLabel("Quantidade de sub-agentes"),
+  ).toBeDisabled();
   // Renderer must not have Node or unrestricted IPC access.
   expect(await reopened.evaluate(() => typeof (window as any).require)).toBe(
     "undefined",

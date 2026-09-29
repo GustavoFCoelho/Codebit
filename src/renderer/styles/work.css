@@ -1,0 +1,301 @@
+/* Project task board. */
+.work-link {
+  justify-content: flex-start;
+  width: 100%;
+  gap: 9px;
+  padding: 7px 10px 7px 26px;
+  font-size: 12px;
+  color: var(--text-2);
+  border-radius: var(--radius);
+}
+.work-link > span:first-of-type {
+  flex: 1;
+  text-align: left;
+}
+.work-link.active-link {
+  background: var(--selected);
+  color: var(--green-text);
+}
+.work-link .badge {
+  margin-left: 0;
+}
+.badge.attention {
+  color: var(--amber);
+  border-color: var(--amber-border);
+  background: var(--amber-bg);
+}
+.back-to-board {
+  align-self: center;
+  -webkit-app-region: no-drag;
+}
+.work {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 22px 24px 20px;
+}
+.work-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 20px;
+}
+.work-head h2 {
+  font-size: 22px;
+}
+.work-head p {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.work-switch {
+  flex-shrink: 0;
+  padding: 10px 14px;
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-lg);
+  background: var(--surface-2);
+}
+.work-switch.on {
+  border-color: var(--green-border);
+  background: var(--green-bg);
+}
+.work-switch .checkbox {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 550;
+}
+.work-config {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-lg);
+  background: var(--surface-2);
+}
+.work-config label,
+.work-config .field {
+  margin: 0;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.work-config select {
+  min-width: 150px;
+  font-size: 12px;
+  padding: 7px 8px;
+}
+.work-config input.narrow {
+  width: 70px;
+  padding: 7px 8px;
+}
+.work-config .mode-toggle {
+  margin: 0;
+}
+.work-note {
+  margin: -4px 0 0;
+}
+.work-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.work-tabs button {
+  gap: 7px;
+  padding: 8px 12px 10px;
+  font-size: 13px;
+  color: var(--muted);
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+}
+.work-tabs button.selected {
+  color: var(--text);
+  border-bottom-color: var(--green);
+}
+.work-tabs .badge {
+  margin-left: 0;
+}
+.work-columns {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(220px, 1fr));
+  gap: 12px;
+  align-items: start;
+  min-height: 0;
+}
+.work-column {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border-radius: var(--radius-lg);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+}
+.work-column h3 {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 4px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  color: var(--text-2);
+}
+.work-column h3 span {
+  color: var(--faint);
+  font-weight: 500;
+}
+.work-column > .help {
+  margin: 4px;
+  font-size: 12px;
+}
+.work-new {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.work-new input,
+.work-new textarea,
+.work-card input,
+.work-card textarea {
+  font-size: 12px;
+  padding: 8px 9px;
+}
+.work-new .row-actions,
+.work-card .row-actions {
+  gap: 6px;
+}
+.work-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 11px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius);
+}
+.work-card header {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+.work-card header strong {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.work-card header .badge {
+  margin-left: 0;
+  color: var(--devin);
+  border-color: var(--devin-bg);
+}
+.work-card > p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-wrap;
+}
+.work-source {
+  font-size: 11px;
+  color: var(--faint);
+}
+.work-card footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: space-between;
+}
+.work-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.work-status.running {
+  color: var(--green);
+}
+.work-status.waiting {
+  color: var(--amber);
+}
+.work-status.failed,
+.work-status.interrupted {
+  color: var(--red);
+}
+.work-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+.work-actions .icon {
+  width: 26px;
+  height: 26px;
+  color: var(--muted);
+}
+.work-actions .icon.confirm {
+  color: var(--red);
+  background: var(--red-bg);
+}
+.work-card.status-running {
+  border-color: var(--green-border);
+}
+.work-card.status-waiting {
+  border-color: var(--amber-border);
+  border-left: 3px solid var(--amber-strong);
+}
+.work-card.status-failed,
+.work-card.status-interrupted {
+  border-color: var(--red-border);
+}
+.work-card.status-pending {
+  border-style: dashed;
+}
+.work-card.status-done > p {
+  -webkit-line-clamp: 2;
+}
+.work-pending {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 760px;
+}
+.work-pending-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.work-pending-head .help {
+  margin: 0;
+}
+@media (max-width: 1250px) {
+  .work-columns {
+    grid-template-columns: repeat(2, minmax(220px, 1fr));
+  }
+}
+button.work-source {
+  align-self: flex-start;
+  justify-content: flex-start;
+  padding: 0;
+  font-size: 11px;
+  color: var(--faint);
+  white-space: normal;
+  text-align: left;
+}
+button.work-source:not(:disabled):hover {
+  color: var(--green);
+}

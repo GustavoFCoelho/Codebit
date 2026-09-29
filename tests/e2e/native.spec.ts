@@ -79,6 +79,10 @@ test("CLIs reais: descoberta, catálogo, conversa e retomada nativa", async () =
       await page
         .getByRole("button", { name: "Smoke " + agent, exact: true })
         .click();
+      // Model and effort live in the agent chip of the composer.
+      const openPicker = () =>
+        page.getByRole("button", { name: "Agente e modelo" }).click();
+      await openPicker();
       const modelPicker = page.getByLabel("Modelo do agente", { exact: true });
       const effortPicker = page.getByLabel("Esforço do agente", {
         exact: true,
@@ -98,6 +102,7 @@ test("CLIs reais: descoberta, catálogo, conversa e retomada nativa", async () =
       await effortPicker.selectOption("low");
       await expect(effortPicker).toHaveValue("low");
       await page.reload();
+      await openPicker();
       await expect(modelPicker).toHaveValue(model.id);
       await expect(effortPicker).toHaveValue("low");
       if (agent === "codex") {

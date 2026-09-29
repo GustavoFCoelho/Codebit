@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { Store } from "../src/main/store";
 import { JsonLines, Channel } from "../src/main/agents/protocol";
@@ -11,11 +13,14 @@ import { CodexSession } from "../src/main/agents/codex";
 import { ClaudeSession } from "../src/main/agents/claude";
 import { DevinSession } from "../src/main/agents/devin";
 import { Runtime } from "../src/main/runtime";
+import { LoopGuard } from "../src/main/guard";
 import { parseClaudeUsage } from "../src/main/agents/quota";
 import {
   appVersion,
   defaultGuidelines,
   defaultImages,
+  defaultSubagents,
+  subagentsFor,
   type AgentEvent,
   type AgentId,
   type AgentSession,
@@ -548,6 +553,118 @@ describe("runtime: agentes, conversas e sub-agentes", () => {
     );
     expect(rows[0].error).toContain("encerrada");
   });
+  it("sub-agentes padrão valem para conversas sem ajuste e, sincronizados, para todas", async () => {
+    const own = {
+      enabled: true,
+      agent: "codex",
+      model: "m",
+      effort: "",
+      max: 1,
+    } as const;
+    const fallback = { ...own, agent: "devin", max: 4 } as const;
+    expect(subagentsFor({}, {})).toEqual(defaultSubagents);
+    expect(subagentsFor({}, { defaultSubagents: fallback })).toBe(fallback);
+    expect(
+      subagentsFor({ subagents: own }, { defaultSubagents: fallback }),
+    ).toBe(own);
+    expect(
+      subagentsFor(
+        { subagents: own },
+        { defaultSubagents: fallback, syncSubagents: true },
+      ),
+    ).toBe(fallback);
+    const rt = await runtime(["codex", "devin"]);
+    const servers: string[][] = [];
+    const create = (rt as any).createSession.bind(rt);
+    (rt as any).createSession = (...args: any[]) => {
+      servers.push(Object.keys(args[2]));
+      return create(...args);
+    };
+    const plain = await rt.createTask({ title: "Sem ajuste", agent: "codex" });
+    const custom = await rt.createTask({ title: "Ajustada", agent: "codex" });
+    rt.updateTask(custom.id, { subagents: { ...own, enabled: false } });
+    rt.store.saveSettings({
+      ...rt.store.settings(),
+      defaultSubagents: { ...fallback, model: "" },
+    });
+    const turn = async (id: string) => {
+      await rt.send(id, "Oi");
+      await idle(rt, id);
+      return servers.at(-1);
+    };
+    expect(await turn(plain.id)).toContain("codebit_agents");
+    expect(await turn(custom.id)).not.toContain("codebit_agents");
+    await expect(
+      rt.subagentTool(custom.id, { tasks: [{ prompt: "x" }] }),
+    ).rejects.toThrow("desligados");
+    rt.store.saveSettings({ ...rt.store.settings(), syncSubagents: true });
+    expect(await turn(custom.id)).toContain("codebit_agents");
+    // The chat keeps its own choice for when the sync is turned off.
+    expect(rt.task(custom.id).subagents?.enabled).toBe(false);
+    rt.store.saveSettings({
+      ...rt.store.settings(),
+      defaultSubagents: { ...fallback, enabled: false },
+    });
+    expect(await turn(plain.id)).not.toContain("codebit_agents");
+  });
+  it("excluir apaga histórico, imagens, anexos e plano; pastas só quando pedido", async () => {
+    const rt = await runtime(["codex"]);
+    const root = rt.store.root;
+    const owned = (id: string) => [
+      join(root, "attachments", id),
+      join(root, "artifacts", id),
+      join(root, "plans", `${id}.md`),
+    ];
+    const make = async (projectId?: string) => {
+      const t = await rt.createTask({
+        title: "Apagar",
+        agent: "codex",
+        projectId,
+      });
+      rt.entry(t.id, "user", "oi");
+      rt.store.put("artifact", {
+        id: randomUUID(),
+        taskId: t.id,
+        path: join(root, "artifacts", t.id, "a.png"),
+        prompt: "gato",
+        provider: "codex",
+        model: "gpt-image",
+        createdAt: "",
+        options: defaultImages,
+      });
+      for (const dir of ["attachments", "artifacts"]) {
+        await mkdir(join(root, dir, t.id), { recursive: true });
+        await writeFile(join(root, dir, t.id, "a.png"), "x");
+      }
+      await mkdir(join(root, "plans"), { recursive: true });
+      await writeFile(join(root, "plans", `${t.id}.md`), "# Plano");
+      await writeFile(join(t.cwd, "nota.txt"), "x");
+      return t;
+    };
+    // The conversation's own folder stays unless asked.
+    const kept = await make();
+    await rt.deleteTask(kept.id);
+    expect(() => rt.task(kept.id)).toThrow();
+    expect(rt.store.entries(kept.id)).toEqual([]);
+    expect(rt.store.artifacts(kept.id)).toEqual([]);
+    for (const path of owned(kept.id)) expect(existsSync(path)).toBe(false);
+    expect(existsSync(join(kept.cwd, "nota.txt"))).toBe(true);
+    const gone = await make();
+    await rt.deleteTask(gone.id, true);
+    expect(existsSync(gone.cwd)).toBe(false);
+    // A project folder is never removed, even when asked.
+    const project = await rt.project(await temp());
+    const inProject = await make(project.id);
+    await rt.deleteTask(inProject.id, true);
+    expect(existsSync(join(project.path, "nota.txt"))).toBe(true);
+    // A task still working is not deleted.
+    const busy = await rt.createTask({ title: "Ocupada", agent: "codex" });
+    await rt.send(busy.id, "HOLD");
+    await eventually(() => rt.task(busy.id).status === "running");
+    await expect(rt.deleteTask(busy.id)).rejects.toThrow("Interrompa");
+    await rt.interrupt(busy.id);
+    expect(rt.task(busy.id).title).toBe("Ocupada");
+  });
   it("salva imagem colada como anexo da tarefa", async () => {
     const rt = await runtime(["codex"]);
     const t = await rt.createTask({ title: "Anexo", agent: "codex" });
@@ -586,6 +703,15 @@ describe("trabalho em segundo plano", () => {
     await eventually(() => !open(rt, t.id));
     expect(rt.task(t.id).status).toBe("idle");
     expect(rt.task(t.id).background).toBeUndefined();
+  });
+  it("Claude: depois de uma parada abrupta, a próxima mensagem é respondida", async () => {
+    const rt = await runtime(["claude"]);
+    const t = await rt.createTask({ title: "Retomada", agent: "claude" });
+    // Claude first ends a turn of its own (the stopped background work),
+    // which used to close the session before our message was answered.
+    await rt.send(t.id, "ORPHAN ECHO depois da parada");
+    await idle(rt, t.id);
+    expect(lastReply(rt, t.id)?.text).toBe("ORPHAN ECHO depois da parada");
   });
   it("Claude: a próxima mensagem vai para a sessão aberta e interromper encerra tudo", async () => {
     const rt = await runtime(["claude"]);
@@ -788,6 +914,213 @@ describe("prompts salvos", () => {
     await expect(rt.startQuick(local.id)).rejects.toThrow("Confie no projeto");
     rt.deletePrompt(local.id);
     expect(rt.store.snapshot().prompts.map((x) => x.name)).toEqual(["Testes"]);
+  });
+});
+describe("proteção contra repetição", () => {
+  const warnings = (rt: Runtime, id: string) =>
+    rt.store.entries(id).filter((e) => e.kind === "warning");
+  it("conta tentativas iguais sem edição e falhas seguidas", () => {
+    const g = new LoopGuard({ enabled: true, repeats: 3, failures: 3 });
+    const download = "Terminal · curl -O https://x.com/a.zip";
+    expect(g.action(download, download, false)).toBeUndefined();
+    expect(g.action(download, download, false)).toBeUndefined();
+    // Editing a file is progress: the count starts over.
+    expect(g.action("Edit · a.ts", "Edit · a.ts", true)).toBeUndefined();
+    expect(g.action(download, download, false)).toBeUndefined();
+    expect(g.action(download, download, false)).toBeUndefined();
+    expect(g.action(download, download, false)).toContain("3 vezes");
+    // Reading or polling repeats freely.
+    for (let i = 0; i < 5; i++)
+      expect(g.action("Read · {}", "Read · a.ts", false)).toBeUndefined();
+    expect(g.outcome(false)).toBeUndefined();
+    expect(g.outcome(false)).toBeUndefined();
+    expect(g.outcome(true)).toBeUndefined();
+    expect(g.outcome(false)).toBeUndefined();
+    expect(g.outcome(false)).toBeUndefined();
+    expect(g.outcome(false)).toContain("3 ações seguidas falharam");
+  });
+  it("Codex repetindo o mesmo download é parado e o motivo vai na próxima mensagem", async () => {
+    const rt = await runtime(["codex"]);
+    const notices: string[] = [];
+    rt.attention = (n) => notices.push(n.body);
+    const t = await rt.createTask({ title: "Download", agent: "codex" });
+    await rt.send(t.id, "LOOP");
+    await eventually(() => rt.task(t.id).status === "interrupted");
+    const [warning] = warnings(rt, t.id);
+    expect(warning.title).toBe("Ação interrompida pelo Codebit");
+    expect(warning.text).toContain("tentada 4 vezes");
+    expect(warning.text).toContain(
+      "Start-Process https://exemplo.com/arquivo.zip",
+    );
+    // It stopped at the limit, not after all six attempts.
+    const attempts = rt.store
+      .entries(t.id)
+      .filter(
+        (e) => e.kind === "activity" && e.text.includes("Start-Process"),
+      ).length;
+    expect(attempts).toBe(4);
+    expect(notices).toContain(
+      "Parei o agente: uma ação se repetia sem sucesso.",
+    );
+    await rt.send(t.id, "ECHO baixe você mesmo");
+    await idle(rt, t.id);
+    expect(lastReply(rt, t.id).text).toContain(
+      "[Codebit] Sua execução anterior foi interrompida automaticamente porque a mesma ação foi tentada 4 vezes",
+    );
+    expect(rt.task(t.id).guardNote).toBeUndefined();
+  });
+  it("rodar os testes de novo depois de cada edição não é repetição", async () => {
+    const rt = await runtime(["codex"]);
+    const t = await rt.createTask({ title: "TDD", agent: "codex" });
+    await rt.send(t.id, "TDD");
+    await idle(rt, t.id);
+    expect(warnings(rt, t.id)).toHaveLength(0);
+  });
+  it("o resultado de cada ação marca a linha dela na conversa", async () => {
+    const rows = (rt: Runtime, id: string) =>
+      rt.store.entries(id).filter((e) => e.kind === "activity");
+    const codex = await runtime(["codex"]);
+    const ok = await codex.createTask({ title: "TDD", agent: "codex" });
+    await codex.send(ok.id, "TDD");
+    await idle(codex, ok.id);
+    expect(rows(codex, ok.id).length).toBeGreaterThan(0);
+    expect(rows(codex, ok.id).every((e) => e.ok === true)).toBe(true);
+    const claude = await runtime(["claude"]);
+    const failed = await claude.createTask({
+      title: "Falhas",
+      agent: "claude",
+    });
+    await claude.send(failed.id, "FAILS");
+    await eventually(() => claude.task(failed.id).status === "interrupted");
+    const settled = rows(claude, failed.id).filter((e) => e.ok !== undefined);
+    expect(settled.length).toBeGreaterThanOrEqual(6);
+    expect(settled.every((e) => e.ok === false)).toBe(true);
+  });
+  it("Claude repetindo o comando com descrições diferentes é parado", async () => {
+    const rt = await runtime(["claude"]);
+    const t = await rt.createTask({ title: "Repete", agent: "claude" });
+    await rt.send(t.id, "REPEAT");
+    await eventually(() => rt.task(t.id).status === "interrupted");
+    expect(warnings(rt, t.id)[0].text).toContain("tentada 4 vezes");
+  });
+  it("Claude com falhas seguidas é parado", async () => {
+    const rt = await runtime(["claude"]);
+    const t = await rt.createTask({ title: "Falhas", agent: "claude" });
+    await rt.send(t.id, "FAILS");
+    await eventually(() => rt.task(t.id).status === "interrupted");
+    expect(warnings(rt, t.id)[0].text).toContain("6 ações seguidas falharam");
+  });
+  it("sub-agente preso é parado e o agente principal é orientado a perguntar", async () => {
+    const rt = await runtime(["codex"]);
+    const parent = await rt.createTask({ title: "Pai", agent: "codex" });
+    rt.updateTask(parent.id, {
+      subagents: {
+        enabled: true,
+        agent: "codex",
+        model: "",
+        effort: "",
+        max: 1,
+      },
+    });
+    await rt.send(parent.id, "HOLD");
+    await eventually(() => rt.task(parent.id).status === "running");
+    const result = await rt.subagentTool(parent.id, {
+      tasks: [{ prompt: "LOOP" }],
+    });
+    const [row] = JSON.parse(result.content[0].text);
+    expect(row.error).toContain("O Codebit interrompeu este sub-agente");
+    expect(row.error).toContain("explique o problema ao usuário");
+    expect(warnings(rt, parent.id)[0].title).toBe(
+      "Sub-agente interrompido pelo Codebit",
+    );
+    await rt.interrupt(parent.id);
+  });
+  it("desligada nas configurações, não interrompe", async () => {
+    const rt = await runtime(["codex"]);
+    rt.store.saveSettings({
+      ...rt.store.settings(),
+      loopGuard: { enabled: false, repeats: 4, failures: 6 },
+    });
+    const t = await rt.createTask({ title: "Livre", agent: "codex" });
+    await rt.send(t.id, "LOOP");
+    await eventually(
+      () =>
+        rt.store
+          .entries(t.id)
+          .filter(
+            (e) => e.kind === "activity" && e.text.includes("Start-Process"),
+          ).length === 6,
+    );
+    expect(rt.task(t.id).status).toBe("running");
+    expect(warnings(rt, t.id)).toHaveLength(0);
+    await rt.interrupt(t.id);
+  });
+});
+describe("plano no modo Planejar", () => {
+  it("Claude: o plano vai para o painel como .md e aprovar muda o modo", async () => {
+    const rt = await runtime(["claude"]);
+    const shown: string[] = [];
+    (rt as any).emit = (e: any) => e.type === "plan" && shown.push(e.taskId);
+    const t = await rt.createTask({ title: "Plano", agent: "claude" });
+    rt.updateTask(t.id, { mode: "plan" });
+    await rt.send(t.id, "PLAN");
+    await eventually(() => rt.task(t.id).status === "waiting");
+    const plan = rt.task(t.id).plan!;
+    expect(plan.text).toContain("# Plano de teste");
+    expect(plan.text).toContain("- passo dois");
+    expect(plan.path).toMatch(/codebit-plano-\d+\.md$/);
+    expect(await readFile(plan.path, "utf8")).toBe(plan.text);
+    expect(shown).toEqual([t.id]);
+    // The chat keeps a short card, not the raw tool input.
+    const card = rt.store.entries(t.id).find((e) => e.kind === "request")!;
+    expect(card.request).toMatchObject({
+      title: "Plano pronto para revisão",
+      detail: "",
+      plan: true,
+    });
+    rt.respond(t.id, card.id, { decision: "accept" });
+    expect(rt.task(t.id).mode).toBe("bypass");
+    await idle(rt, t.id);
+    await rt.send(t.id, "MODE");
+    await idle(rt, t.id);
+    expect(JSON.parse(lastReply(rt, t.id).text).permissionMode).toBe(
+      "bypassPermissions",
+    );
+  });
+  it("Claude: setMode muda o modo da sessão aberta", async () => {
+    const events: AgentEvent[] = [];
+    const session = new ClaudeSession(
+      installation("claude"),
+      { ...task(await temp(), "claude"), mode: "plan" },
+      {},
+      (e) => events.push(e),
+    );
+    cleanups.push(() => session.close());
+    await session.setMode("execute");
+    await session.send("MODE", []);
+    await eventually(() => events.some((e) => e.type === "done"));
+    const text = events
+      .filter((e) => e.type === "text")
+      .map((e: any) => e.text)
+      .join("");
+    expect(JSON.parse(text).permissionMode).toBe("manual");
+  });
+  it("Codex: a resposta no modo Planejar e o item de plano viram o plano", async () => {
+    const rt = await runtime(["codex"]);
+    const t = await rt.createTask({ title: "Plano", agent: "codex" });
+    rt.updateTask(t.id, { mode: "plan" });
+    await rt.send(t.id, "Planeje");
+    await idle(rt, t.id);
+    await eventually(() => !!rt.task(t.id).plan);
+    const plan = rt.task(t.id).plan!;
+    expect(plan.text).toBe("Olá, ação concluída.");
+    expect(plan.path).toBe(join(rt.store.root, "plans", `${t.id}.md`));
+    expect(await readFile(plan.path, "utf8")).toBe("Olá, ação concluída.");
+    // Outside plan mode the reply is not a plan, but a native plan item is.
+    rt.updateTask(t.id, { mode: "execute" });
+    await rt.send(t.id, "PLANITEM");
+    await idle(rt, t.id);
+    await eventually(() => rt.task(t.id).plan!.text.includes("Plano do Codex"));
   });
 });
 describe("contexto, skills e comandos", () => {

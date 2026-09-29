@@ -185,7 +185,11 @@ export class CodexSession implements AgentSession {
         this.emit({ type: "text", text: "\n\n" });
       if (i?.type === "commandExecution") {
         this.commands.add(i.id);
-        this.emit({ type: "activity", text: `Terminal · ${i.command}` });
+        this.emit({
+          type: "activity",
+          text: `Terminal · ${i.command}`,
+          id: i.id,
+        });
       }
       if (i?.type === "collabAgentToolCall")
         this.emit({
@@ -198,11 +202,28 @@ export class CodexSession implements AgentSession {
           type: "activity",
           text: `Alterar arquivos · ${files.join(", ")}`,
           files,
+          id: i.id,
         });
       }
       if (i?.type === "mcpToolCall")
-        this.emit({ type: "activity", text: `MCP · ${i.server}/${i.tool}` });
+        this.emit({
+          type: "activity",
+          text: `MCP · ${i.server}/${i.tool}`,
+          id: i.id,
+          key: `MCP · ${i.server}/${i.tool} ${JSON.stringify(i.arguments ?? {})}`,
+        });
     }
+    if (
+      msg.method === "item/completed" &&
+      ["commandExecution", "fileChange", "mcpToolCall"].includes(p.item?.type)
+    )
+      this.emit({
+        type: "outcome",
+        ok:
+          p.item.status === "completed" &&
+          (p.item.exitCode == null || p.item.exitCode === 0),
+        id: p.item.id,
+      });
     if (
       msg.method === "item/completed" &&
       p.item?.type === "agentMessage" &&
@@ -210,6 +231,12 @@ export class CodexSession implements AgentSession {
       p.item.text
     )
       this.emit({ type: "text", text: p.item.text });
+    if (
+      msg.method === "item/completed" &&
+      p.item?.type === "plan" &&
+      p.item.text
+    )
+      this.emit({ type: "plan", text: p.item.text });
     // Images Codex creates with its own tool are published in the chat.
     if (
       msg.method === "item/completed" &&

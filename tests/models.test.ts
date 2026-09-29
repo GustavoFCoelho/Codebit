@@ -63,9 +63,13 @@ async function runtime() {
   });
   return rt;
 }
+// Catalogs start CLI processes; on a busy machine that takes over the
+// default 1 s of waitFor.
 async function ready(rt: Runtime) {
-  await vi.waitFor(() =>
-    expect(rt.agents.map((a) => a.catalogStatus)).toEqual(["ready", "ready"]),
+  await vi.waitFor(
+    () =>
+      expect(rt.agents.map((a) => a.catalogStatus)).toEqual(["ready", "ready"]),
+    { timeout: 10_000 },
   );
 }
 

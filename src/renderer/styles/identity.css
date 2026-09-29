@@ -1,0 +1,89 @@
+/* Agent marks, motion and wide-screen tweaks. */
+.agent-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 17px;
+  height: 17px;
+  border-radius: var(--radius-sm);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  background: var(--codex-bg);
+  color: var(--green);
+}
+.agent-mark.md {
+  width: 26px;
+  height: 26px;
+  font-size: 13px;
+  border-radius: var(--radius);
+}
+.agent-mark.claude {
+  background: var(--claude-bg);
+  color: var(--claude);
+}
+.agent-mark.devin {
+  background: var(--devin-bg);
+  color: var(--devin);
+}
+.badge.agent-badge {
+  gap: 5px;
+  padding-left: 3px;
+}
+.badge.agent-badge .agent-mark {
+  width: 15px;
+  height: 15px;
+}
+.log-message .log-author .agent-mark {
+  width: 14px;
+  height: 14px;
+  font-size: 9px;
+}
+.log-activity .activity-icon {
+  width: 16px;
+  height: 16px;
+  align-self: center;
+}
+.status-dot.pulse {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+@keyframes slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+}
+.quota-popover,
+.command-palette {
+  animation: pop-in 0.12s ease-out;
+}
+.inspector {
+  animation: slide-in 0.16s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+@media (max-width: 1350px) {
+  .settings-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .subagents-defaults .subagent-fields {
+    grid-template-columns: 1fr 1fr;
+  }
+}

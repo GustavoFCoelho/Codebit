@@ -38,6 +38,17 @@ export async function createWorktree(cwd: string, target: string, id: string) {
         "Não foi possível criar a worktree. O repositório precisa ter ao menos um commit.",
     );
 }
+// The branch stays in the repository, with any commits made in the worktree.
+export async function removeWorktree(repo: string, target: string) {
+  const r = await capture(
+    "git",
+    ["worktree", "remove", "--force", target],
+    repo,
+    30000,
+  );
+  if (r.code !== 0)
+    throw new Error(r.stderr || "Não foi possível remover a worktree.");
+}
 export async function files(cwd: string, sub = "") {
   const root = await within(cwd, sub);
   const entries = await readdir(root, { withFileTypes: true });

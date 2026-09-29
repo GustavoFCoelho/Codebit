@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   ChevronRight,
+  Copy,
   Download,
   ExternalLink,
   File,
@@ -22,9 +23,12 @@ import HtmlWorker from "monaco-editor/language/html/html.worker.js?worker";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { api, artifactUrl, fileName, fileUrl } from "./api";
+import { MarkdownLink, markdownUrl } from "./mentions";
 import type { Artifact, Task } from "../shared/types";
-import { imageProviderNames } from "../shared/types";
+import { agentNames, imageProviderNames } from "../shared/types";
 (self as any).MonacoEnvironment = {
   getWorker: (_: string, label: string) =>
     label === "typescript" || label === "javascript"
@@ -38,10 +42,46 @@ import { imageProviderNames } from "../shared/types";
             : new EditorWorker(),
 };
 loader.config({ monaco });
+// Git diffs: colored lines and one fold per file.
+monaco.languages.register({ id: "codebit-diff" });
+monaco.languages.setMonarchTokensProvider("codebit-diff", {
+  tokenizer: {
+    root: [
+      [/diff --git.*$/, "diff-header"],
+      [
+        /(index|new file mode|deleted file mode|similarity index|rename from|rename to|old mode|new mode|Binary files).*$/,
+        "diff-meta",
+      ],
+      [/(\+\+\+|---)( .*)?$/, "diff-file"],
+      [/@@.*$/, "diff-hunk"],
+      [/\+.*$/, "diff-add"],
+      [/-.*$/, "diff-del"],
+      [/.*$/, ""],
+    ],
+  },
+});
+monaco.languages.registerFoldingRangeProvider("codebit-diff", {
+  provideFoldingRanges(model) {
+    const starts: number[] = [];
+    for (let i = 1; i <= model.getLineCount(); i++)
+      if (model.getLineContent(i).startsWith("diff --git ")) starts.push(i);
+    return starts.map((start, i) => ({
+      start,
+      end: (starts[i + 1] ?? model.getLineCount() + 1) - 1,
+    }));
+  },
+});
 monaco.editor.defineTheme("codebit", {
   base: "vs-dark",
   inherit: true,
-  rules: [],
+  rules: [
+    { token: "diff-add", foreground: "8fdcae" },
+    { token: "diff-del", foreground: "f0a39b" },
+    { token: "diff-hunk", foreground: "8fb4d8" },
+    { token: "diff-header", foreground: "e2e7e9", fontStyle: "bold" },
+    { token: "diff-file", foreground: "b4bfc7" },
+    { token: "diff-meta", foreground: "7e8b96" },
+  ],
   colors: {
     "editor.background": "#14191d",
     "editor.foreground": "#d6dddf",
@@ -50,6 +90,75 @@ monaco.editor.defineTheme("codebit", {
     "editor.selectionBackground": "#294338",
   },
 });
+// Files of a git diff with their line counts, in diff order.
+function diffFiles(diff: string) {
+  const files: {
+    path: string;
+    line: number;
+    added: number;
+    removed: number;
+  }[] = [];
+  diff.split("\n").forEach((text, i) => {
+    if (text.startsWith("diff --git ")) {
+      files.push({
+        path: text.split(" b/").pop() ?? text.slice(11),
+        line: i + 1,
+        added: 0,
+        removed: 0,
+      });
+      return;
+    }
+    const file = files.at(-1);
+    if (!file) return;
+    if (text.startsWith("+") && !text.startsWith("+++")) file.added++;
+    else if (text.startsWith("-") && !text.startsWith("---")) file.removed++;
+  });
+  return files;
+}
+// "git status --short" lines: the change code and the path.
+function statusFiles(status: string) {
+  return status
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => ({
+      code: line.slice(0, 2).trim(),
+      path: line.slice(3).split(" -> ").pop()!.replace(/^"|"$/g, ""),
+    }));
+}
+const statusCodes: Record<string, string> = {
+  M: "Modificado",
+  A: "Adicionado",
+  D: "Removido",
+  R: "Renomeado",
+  "??": "Novo",
+};
+// Whole-line backgrounds for added and removed lines.
+function decorateDiff(
+  editor: monaco.editor.IStandaloneCodeEditor,
+  previous?: monaco.editor.IEditorDecorationsCollection,
+) {
+  previous?.clear();
+  const model = editor.getModel();
+  if (!model) return undefined;
+  const decorations: monaco.editor.IModelDeltaDecoration[] = [];
+  for (let i = 1; i <= model.getLineCount(); i++) {
+    const text = model.getLineContent(i);
+    const className =
+      text.startsWith("+") && !text.startsWith("+++")
+        ? "diff-line-add"
+        : text.startsWith("-") && !text.startsWith("---")
+          ? "diff-line-del"
+          : text.startsWith("diff --git ")
+            ? "diff-line-file"
+            : "";
+    if (className)
+      decorations.push({
+        range: new monaco.Range(i, 1, i, 1),
+        options: { isWholeLine: true, className },
+      });
+  }
+  return editor.createDecorationsCollection(decorations);
+}
 export function Inspector({
   task,
   artifacts,
@@ -57,6 +166,7 @@ export function Inspector({
   setSelectedArtifact,
   openedImage,
   setOpenedImage,
+  planRequest,
   tab,
   setTab,
   patch,
@@ -71,6 +181,8 @@ export function Inspector({
   // An image file mentioned in the chat, shown instead of the gallery.
   openedImage?: string;
   setOpenedImage: (path?: string) => void;
+  // The plan approval still waiting in the chat, if any.
+  planRequest?: string;
   tab: string;
   setTab: (tab: string) => void;
   patch: (p: Partial<Task>) => Promise<void>;
@@ -85,6 +197,10 @@ export function Inspector({
     truncated: false,
   });
   const [items, setItems] = useState<any[]>([]);
+  const [loadingFiles, setLoadingFiles] = useState(true);
+  const diffEditor = useRef<monaco.editor.IStandaloneCodeEditor>(null);
+  const diffDecorations =
+    useRef<monaco.editor.IEditorDecorationsCollection>(undefined);
   const [folder, setFolder] = useState("");
   const [opened, setOpened] = useState<{ path: string; text: string }>();
   const [terminalUsed, setTerminalUsed] = useState(false);
@@ -93,8 +209,35 @@ export function Inspector({
   const image =
     artifacts.find((a) => a.id === selectedArtifact) || artifacts.at(-1);
   async function refreshFiles() {
-    setItems(await api("workspace.files", { id: task.id, path: folder }));
+    setLoadingFiles(true);
+    try {
+      setItems(await api("workspace.files", { id: task.id, path: folder }));
+    } finally {
+      setLoadingFiles(false);
+    }
   }
+  async function openFile(path: string) {
+    setOpened({
+      path,
+      text: await api("workspace.read", { id: task.id, path }),
+    });
+  }
+  const changed = useMemo(() => {
+    const sections = diffFiles(diff.diff);
+    return statusFiles(diff.status).map((f) => ({
+      ...f,
+      section: sections.find(
+        (s) => s.path === f.path || s.path.endsWith("/" + f.path),
+      ),
+    }));
+  }, [diff.diff, diff.status]);
+  useEffect(() => {
+    if (diffEditor.current)
+      diffDecorations.current = decorateDiff(
+        diffEditor.current,
+        diffDecorations.current,
+      );
+  }, [diff.diff]);
   async function refreshDiff() {
     setDiff(await api("workspace.changes", { id: task.id }));
   }
@@ -115,7 +258,7 @@ export function Inspector({
   return (
     <aside className="inspector">
       <div className="panel-tabs">
-        {["Alterações", "Arquivos", "Terminal", "Imagens"].map((t) => (
+        {["Alterações", "Arquivos", "Terminal", "Imagens", "Plano"].map((t) => (
           <button
             key={t}
             className={tab === t ? "selected" : ""}
@@ -158,12 +301,63 @@ export function Inspector({
             </div>
           ) : (
             <>
-              <pre className="git-status">{diff.status}</pre>
+              <div
+                className="changed-files"
+                role="list"
+                aria-label="Arquivos alterados"
+              >
+                {changed.map((f) => (
+                  <button
+                    key={f.path}
+                    role="listitem"
+                    className="changed-file"
+                    title={
+                      f.section
+                        ? `Ir para ${f.path} no diff`
+                        : `Abrir ${f.path}`
+                    }
+                    onClick={() =>
+                      void run(async () => {
+                        if (f.section && diffEditor.current) {
+                          diffEditor.current.revealLineNearTop(f.section.line);
+                          diffEditor.current.setPosition({
+                            lineNumber: f.section.line,
+                            column: 1,
+                          });
+                        } else {
+                          setTab("Arquivos");
+                          await openFile(f.path);
+                        }
+                      })
+                    }
+                  >
+                    <span
+                      className={`change-code code-${f.code === "??" ? "new" : f.code.charAt(0)}`}
+                      title={
+                        statusCodes[f.code] ?? statusCodes[f.code.charAt(0)]
+                      }
+                    >
+                      {f.code === "??" ? "N" : f.code.charAt(0)}
+                    </span>
+                    <span className="truncate">{f.path}</span>
+                    {f.section && (
+                      <span className="change-count">
+                        <span className="added">+{f.section.added}</span>
+                        <span className="removed">−{f.section.removed}</span>
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
               {diff.diff ? (
                 <Editor
                   theme="codebit"
-                  language="diff"
+                  language="codebit-diff"
                   value={diff.diff}
+                  onMount={(editor) => {
+                    diffEditor.current = editor;
+                    diffDecorations.current = decorateDiff(editor);
+                  }}
                   options={{
                     readOnly: true,
                     automaticLayout: true,
@@ -171,8 +365,11 @@ export function Inspector({
                     fontSize: 12,
                     wordWrap: "on",
                     lineNumbers: "off",
+                    folding: true,
+                    showFoldingControls: "always",
+                    lineDecorationsWidth: 6,
                     scrollBeyondLastLine: false,
-                    padding: { top: 12 },
+                    padding: { top: 8 },
                     renderLineHighlight: "none",
                   }}
                 />
@@ -246,14 +443,7 @@ export function Inspector({
                   onClick={() =>
                     void run(async () => {
                       if (item.directory) setFolder(item.path);
-                      else
-                        setOpened({
-                          path: item.path,
-                          text: await api("workspace.read", {
-                            id: task.id,
-                            path: item.path,
-                          }),
-                        });
+                      else await openFile(item.path);
                     })
                   }
                 >
@@ -262,8 +452,15 @@ export function Inspector({
                   {item.directory && <ChevronRight size={13} />}
                 </button>
               ))}
-              {!items.length && (
-                <p className="help padded">Esta pasta está vazia.</p>
+              {loadingFiles && !items.length ? (
+                <p className="help padded" role="status">
+                  <LoaderCircle size={13} className="spin" /> Carregando
+                  arquivos…
+                </p>
+              ) : (
+                !items.length && (
+                  <p className="help padded">Esta pasta está vazia.</p>
+                )
               )}
             </>
           )}
@@ -297,6 +494,127 @@ export function Inspector({
             visible={tab === "Terminal"}
             run={run}
           />
+        </div>
+      )}
+      {tab === "Plano" && (
+        <div className="plan-panel">
+          {task.plan ? (
+            <>
+              <div className="panel-heading">
+                <div className="plan-title">
+                  <strong title={task.plan.path}>
+                    {fileName(task.plan.path)}
+                  </strong>
+                  <span>
+                    {agentNames[task.plan.agent]} ·{" "}
+                    {new Date(task.plan.at).toLocaleString("pt-BR", {
+                      dateStyle: "short",
+                      timeStyle: "short",
+                    })}
+                  </span>
+                </div>
+              </div>
+              <div className="row-actions plan-actions">
+                <button
+                  className="quiet compact"
+                  onClick={() =>
+                    void run(() =>
+                      api("file.open", { id: task.id, path: task.plan!.path }),
+                    )
+                  }
+                >
+                  <ExternalLink size={13} />
+                  Abrir .md
+                </button>
+                <button
+                  className="quiet compact"
+                  onClick={() =>
+                    void run(() =>
+                      api("file.reveal", {
+                        id: task.id,
+                        path: task.plan!.path,
+                      }),
+                    )
+                  }
+                >
+                  <FolderOpen size={13} />
+                  Mostrar na pasta
+                </button>
+                <button
+                  className="quiet compact"
+                  onClick={() =>
+                    void run(() =>
+                      navigator.clipboard.writeText(task.plan!.text),
+                    )
+                  }
+                >
+                  <Copy size={13} />
+                  Copiar
+                </button>
+              </div>
+              {planRequest && (
+                <div className="plan-decision">
+                  <span>O agente espera sua decisão sobre este plano.</span>
+                  <button
+                    className="quiet compact"
+                    onClick={() =>
+                      void run(() =>
+                        api("task.respond", {
+                          id: task.id,
+                          entryId: planRequest,
+                          value: { decision: "decline" },
+                        }),
+                      )
+                    }
+                  >
+                    Continuar planejando
+                  </button>
+                  <button
+                    className="primary compact"
+                    onClick={() =>
+                      void run(() =>
+                        api("task.respond", {
+                          id: task.id,
+                          entryId: planRequest,
+                          value: { decision: "accept" },
+                        }),
+                      )
+                    }
+                  >
+                    Aprovar e executar
+                  </button>
+                </div>
+              )}
+              <div className="markdown plan-doc">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  urlTransform={markdownUrl}
+                  components={{
+                    a: ({ href, children }) => (
+                      <MarkdownLink
+                        href={href}
+                        base={{ id: task.id }}
+                        run={run}
+                      >
+                        {children}
+                      </MarkdownLink>
+                    ),
+                  }}
+                >
+                  {task.plan.text}
+                </ReactMarkdown>
+              </div>
+            </>
+          ) : (
+            <div className="panel-empty">
+              <File size={28} />
+              <p>Nenhum plano ainda.</p>
+              <small>
+                No modo Planejar, o plano proposto pelo agente aparece aqui,
+                formatado, e fica salvo como .md.
+              </small>
+            </div>
+          )}
         </div>
       )}
       {tab === "Imagens" && (

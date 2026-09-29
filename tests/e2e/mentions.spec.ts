@@ -14,6 +14,12 @@ test("imagens mencionadas no chat abrem no painel lateral", async () => {
   await writeFile(image, Buffer.from(png, "base64"));
   // PNG bytes under another extension must still be refused.
   await writeFile(join(folder, "segredo.txt"), Buffer.from(png, "base64"));
+  // Files an agent links to, written as Codex writes them.
+  for (const dir of ["work", "docs", "tools"]) await mkdir(join(folder, dir));
+  const scene = join(folder, "work", "cena_v004.blend");
+  await writeFile(scene, "blend");
+  await writeFile(join(folder, "docs", "nota.md"), "# Nota");
+  await writeFile(join(folder, "tools", "rodar.bat"), "echo oi");
   const store = new Store(join(root, "data"));
   const now = new Date().toISOString();
   const task: Task = {
@@ -46,6 +52,11 @@ test("imagens mencionadas no chat abrem no painel lateral", async () => {
   entry("assistant", "Gerei `img/tela.png`.\n\n![prévia](img/tela.png)", {
     agent: "codex",
   });
+  entry(
+    "assistant",
+    `[Cena Blender v004](${scene.replaceAll("\\", "/")}) · [Registro](docs/nota.md) · [Script](tools/rodar.bat) · [Sumido](nao/existe.md) · [Site](https://example.com)`,
+    { agent: "codex" },
+  );
   store.close();
   const env: Record<string, string> = {
     ...Object.fromEntries(
@@ -84,7 +95,7 @@ test("imagens mencionadas no chat abrem no painel lateral", async () => {
       page.getByText("Imagens da tarefa", { exact: true }),
     ).toBeVisible();
     // Inline code in the reply, relative to the task folder.
-    await page.locator(".entry-assistant .file-link").click();
+    await page.getByRole("link", { name: "img/tela.png" }).click();
     await expect(path).toHaveText("img/tela.png");
     await expect.poll(() => loaded(".inspector .inspector-image")).toBe(1);
     // The attached image.
@@ -101,6 +112,69 @@ test("imagens mencionadas no chat abrem no painel lateral", async () => {
       task.id,
     );
     expect(refused).toBe("recusado");
+    // Other local files open with their default app: record instead of
+    // launching Blender, and capture the native context menu.
+    await app.evaluate(({ shell, Menu }) => {
+      const g = globalThis as any;
+      g.opened = [];
+      shell.openPath = async (p: string) => {
+        g.opened.push(p);
+        return "";
+      };
+      Menu.buildFromTemplate = ((items: any[]) => {
+        g.menu = items;
+        return { popup() {} };
+      }) as any;
+    });
+    const opened = () => app.evaluate(() => (globalThis as any).opened);
+    const link = (name: string) => page.getByRole("link", { name });
+    await link("Cena Blender v004").click();
+    await expect.poll(opened).toEqual([scene]);
+    await link("Registro").click();
+    await expect.poll(opened).toEqual([scene, join(folder, "docs", "nota.md")]);
+    // Programs and scripts never open from a link.
+    await link("Script").click();
+    await expect(
+      page.getByText(/Por segurança, programas e scripts/),
+    ).toBeVisible();
+    await link("Sumido").click();
+    await expect(page.getByText(/Arquivo não encontrado/)).toBeVisible();
+    expect(await opened()).toHaveLength(2);
+    // Right click: open, show in folder and copy the path.
+    const menu = () =>
+      app.evaluate(() =>
+        (globalThis as any).menu.map((i: any) => [i.label, i.enabled]),
+      );
+    await link("Cena Blender v004").click({ button: "right" });
+    await expect.poll(menu).toEqual([
+      ["Abrir no app padrão", true],
+      ["Mostrar na pasta", undefined],
+      [undefined, undefined],
+      ["Copiar caminho", undefined],
+    ]);
+    // The user's clipboard is restored afterwards.
+    const copied = await app.evaluate(async ({ clipboard }) => {
+      const before = await clipboard.readText();
+      await clipboard.writeText("");
+      (globalThis as any).menu
+        .find((i: any) => i.label === "Copiar caminho")
+        .click();
+      let text = "";
+      for (let i = 0; i < 20 && !text; i++) {
+        await new Promise((r) => setTimeout(r, 50));
+        text = await clipboard.readText();
+      }
+      await clipboard.writeText(before);
+      return text;
+    });
+    expect(copied).toBe(scene);
+    await link("Script").click({ button: "right" });
+    await expect.poll(menu).toContainEqual(["Abrir no app padrão", false]);
+    await link("Site").click({ button: "right" });
+    await expect.poll(menu).toEqual([
+      ["Abrir no navegador", true],
+      ["Copiar endereço", undefined],
+    ]);
   } finally {
     await app.close();
   }

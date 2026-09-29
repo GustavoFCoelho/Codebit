@@ -22,16 +22,16 @@ import {
   Paperclip,
   ArrowUp,
   Square,
-  Check,
+  Trash2,
   X,
   Minus,
   Maximize2,
   Archive,
+  ArchiveRestore,
   PanelRightClose,
   PanelRightOpen,
   ArrowRightLeft,
   Image as ImageIcon,
-  Terminal as TerminalIcon,
   Pencil,
   LoaderCircle,
   ShieldCheck,
@@ -48,6 +48,8 @@ import {
   EyeOff,
   Gauge,
   LayoutGrid,
+  ListTodo,
+  ArrowLeft,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -72,21 +74,34 @@ import {
   appVersion,
   defaultSubagents,
   imageProviderNames,
+  subagentsFor,
 } from "../shared/types";
 import { api, artifactUrl, fileName, fileUrl, readBase64 } from "./api";
-import { ContextMeter, RequestCard, statusName } from "./parts";
+import {
+  ActivityIcon,
+  AgentMark,
+  ContextMeter,
+  RequestCard,
+  SectionLabel,
+  statusName,
+  statusNames,
+  SubagentOptionsForm,
+} from "./parts";
 import { effortLabel } from "../shared/models";
 import { SettingsView } from "./Settings";
 import { PromptList, PromptModal, QuickPanel } from "./Prompts";
 import {
   isImagePath,
   linkedImage,
+  linkMenu,
   LinkedText,
+  MarkdownLink,
   markdownUrl,
   remarkImagePaths,
 } from "./mentions";
 import { Inspector } from "./Inspector";
 import { Board, taskMime } from "./Board";
+import { WorkBoard } from "./Work";
 type Modal = "new" | "handoff" | "rename" | "model" | null;
 const MemoInspector = memo(Inspector);
 // Same function identity across renders, always calling the latest version.
@@ -101,8 +116,10 @@ export default function App() {
     localStorage.getItem("codebit.task") || "",
   );
   const [view, setView] = useState<
-    "workspace" | "settings" | "extensions" | "board"
+    "workspace" | "settings" | "extensions" | "board" | "work"
   >("workspace");
+  // The project whose task board is open.
+  const [workProject, setWorkProject] = useState("");
   const viewRef = useRef(view);
   viewRef.current = view;
   const [board, setBoard] = useState<BoardCard[]>([]);
@@ -117,7 +134,21 @@ export default function App() {
   const [title, setTitle] = useState("");
   const [projectId, setProjectId] = useState("");
   const [newAgent, setNewAgent] = useState<AgentId>("codex");
-  const [subagentsOpen, setSubagentsOpen] = useState(false);
+  // The task being renamed, and the one waiting for delete confirmation.
+  const [renameId, setRenameId] = useState<string>();
+  const [deleting, setDeleting] = useState<Task>();
+  const [removeFolder, setRemoveFolder] = useState(false);
+  // The composer popover open: agent and model, images or sub-agents.
+  const [pop, setPop] = useState<"agent" | "images" | "subagents" | null>(null);
+  // Sidebar sections the user collapsed, kept between sessions.
+  const [collapsed, setCollapsed] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem("codebit.collapsed") || "[]");
+    } catch {
+      return [];
+    }
+  });
+  const searchInput = useRef<HTMLInputElement>(null);
   const [hideContext, setHideContext] = useState(
     localStorage.getItem("codebit.hideContext") === "1",
   );
@@ -195,6 +226,11 @@ export default function App() {
     void run(refresh);
     return window.codebit.onEvent((event) => {
       if (event.type === "refresh") void run(refresh);
+      // A new plan opens in the side panel of the task on screen.
+      if (event.type === "plan" && event.taskId === selectedRef.current) {
+        setTab("Plano");
+        setPanel(true);
+      }
       if (event.type === "open-task") {
         setSelected(event.taskId);
         setView("workspace");
@@ -218,7 +254,7 @@ export default function App() {
     setImageProgress(imageProgressByTask.current.get(selected) || "");
     setSelectedArtifact(undefined);
     setOpenedImage(undefined);
-    setSubagentsOpen(false);
+    setPop(null);
     localStorage.setItem("codebit.task", selected);
     void run(refresh);
   }, [selected]);
@@ -230,6 +266,75 @@ export default function App() {
     setSelected(id);
     setView("workspace");
   });
+  function startRename(t: Task) {
+    setRenameId(t.id);
+    setTitle(t.title);
+    setModal("rename");
+  }
+  function startDelete(t: Task) {
+    setRemoveFolder(false);
+    setDeleting(t);
+  }
+  async function deleteTask(t: Task) {
+    await api("task.delete", { id: t.id, folder: removeFolder });
+    setDeleting(undefined);
+    if (selectedRef.current === t.id) setSelected("");
+  }
+  // Sidebar actions, from the row buttons or the right-click menu.
+  const taskAction = useStable((t: Task, action?: string) => {
+    if (action === "open") openTask(t.id);
+    if (action === "rename") startRename(t);
+    if (action === "archive")
+      void run(() =>
+        api("task.update", { id: t.id, patch: { archived: !t.archived } }),
+      );
+    if (action === "delete") startDelete(t);
+  });
+  // A search shows every match, even in collapsed sections.
+  const isOpen = (key: string) => !!search || !collapsed.includes(key);
+  function toggleSection(key: string) {
+    const next = collapsed.includes(key)
+      ? collapsed.filter((k) => k !== key)
+      : [...collapsed, key];
+    setCollapsed(next);
+    localStorage.setItem("codebit.collapsed", JSON.stringify(next));
+  }
+  // Popovers close on a click outside them or with Escape.
+  useEffect(() => {
+    if (!pop) return;
+    const click = (e: MouseEvent) => {
+      if (!(e.target as Element).closest?.(".chip-wrap")) setPop(null);
+    };
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPop(null);
+    };
+    document.addEventListener("mousedown", click);
+    document.addEventListener("keydown", key);
+    return () => {
+      document.removeEventListener("mousedown", click);
+      document.removeEventListener("keydown", key);
+    };
+  }, [pop]);
+  // Ctrl+K searches, Ctrl+N starts a task, Ctrl+. stops the open one.
+  const shortcut = useStable((e: KeyboardEvent) => {
+    if (!e.ctrlKey || e.altKey || e.shiftKey || e.metaKey) return;
+    const key = e.key.toLowerCase();
+    if (key === "k") {
+      e.preventDefault();
+      searchInput.current?.focus();
+      searchInput.current?.select();
+    } else if (key === "n") {
+      e.preventDefault();
+      newTask();
+    } else if (key === "." && task && (active || task.background)) {
+      e.preventDefault();
+      void run(() => api("task.interrupt", { id: task.id }));
+    }
+  });
+  useEffect(() => {
+    window.addEventListener("keydown", shortcut);
+    return () => window.removeEventListener("keydown", shortcut);
+  }, []);
   // Saved prompts borrow the open task's agent and model, never its chat.
   function runPrompt(prompt: SavedPrompt) {
     void run(async () => {
@@ -277,14 +382,40 @@ export default function App() {
   const active = task && ["running", "waiting", "queued"].includes(task.status);
   // A session kept open for background work keeps its settings.
   const locked = !!active || !!task?.background;
-  const subagents = task?.subagents ?? defaultSubagents;
-  const subagentInfo = snapshot?.agents.find((a) => a.id === subagents.agent);
-  const subagentModel = subagentInfo?.models.find(
-    (m) => m.id === subagents.model,
-  );
+  // The chat's own sub-agents, or the default from the settings.
+  const subagents = task
+    ? subagentsFor(task, snapshot?.settings ?? {})
+    : defaultSubagents;
+  const synced = !!snapshot?.settings.syncSubagents;
   const selectedInfo = snapshot?.agents.find((a) => a.id === task?.agent);
   const selectedModel = selectedInfo?.models.find((m) => m.id === task?.model);
   const efforts = selectedModel?.efforts || [];
+  // What the composer chips show.
+  // The chips stay short; their titles and popovers carry the rest.
+  const agentSummary = task
+    ? [
+        agentNames[task.agent],
+        selectedModel?.name ?? task.model,
+        task.effort ? effortLabel(task.effort) : "",
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "";
+  const imageModelName = task
+    ? imageModels.find(
+        (m) =>
+          m.id === task.images.model &&
+          (m.workflow || "sdxl-text") === task.images.workflow,
+      )?.name || task.images.model
+    : "";
+  const imageSummary = task
+    ? imageModelName ||
+      `${imageProviderNames[task.images.provider]} · sem modelo`
+    : "";
+  // An approval or question still waiting, pointed to above the composer.
+  const pendingRequest = entries.findLast(
+    (e) => e.kind === "request" && !e.resolved,
+  );
   // "Ocultar contexto" keeps the conversation and drops tool runs and
   // approvals already answered.
   const visibleEntries = useMemo(
@@ -383,6 +514,14 @@ export default function App() {
   const onImageLoad = useStable(() => {
     if (stickBottom.current) scrollToEnd();
   });
+  const showPlan = useStable(() => {
+    setTab("Plano");
+    setPanel(true);
+  });
+  // The plan approval still waiting, if any, for the buttons in the panel.
+  const planRequest = entries.findLast(
+    (e) => e.kind === "request" && e.request?.plan && !e.resolved,
+  )?.id;
   const openImage = useStable((path: string) => {
     setOpenedImage(path);
     setTab("Imagens");
@@ -462,7 +601,11 @@ export default function App() {
       setSelected(t.id);
       setView("workspace");
     }
-    if (modal === "rename") await patch({ title: title.trim() });
+    if (modal === "rename" && renameId)
+      await api("task.update", {
+        id: renameId,
+        patch: { title: title.trim() },
+      });
     if (modal === "model") await patch({ model: title.trim() });
     if (modal === "handoff" && task) {
       const result = await api<{ task: Task; draft: string }>("task.handoff", {
@@ -480,23 +623,33 @@ export default function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <Code2 size={30} />
+          <Code2 size={24} />
           <span>Codebit</span>
-          <span className="version">LOCAL</span>
         </div>
-        <button className="primary new-task" onClick={() => newTask()}>
-          <Plus size={19} />
+        <button
+          className="primary new-task"
+          title="Nova tarefa (Ctrl+N)"
+          onClick={() => newTask()}
+        >
+          <Plus size={17} />
           Nova tarefa
         </button>
         <label className="search">
-          <Search size={16} />
+          <Search size={15} />
           <input
+            ref={searchInput}
             aria-label="Buscar tarefas"
             placeholder="Buscar"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                setSearch("");
+                e.currentTarget.blur();
+              }
+            }}
           />
-          <kbd>⌕</kbd>
+          <kbd>Ctrl K</kbd>
         </label>
         <button
           className={`board-link ${view === "board" ? "active-link" : ""}`}
@@ -516,15 +669,32 @@ export default function App() {
           })()}
         </button>
         <nav className="project-list">
+          {showArchived && (
+            <div className="archived-note" role="status">
+              <Archive size={13} />
+              Tarefas arquivadas
+              <button
+                className="text-button"
+                onClick={() => setShowArchived(false)}
+              >
+                Voltar às ativas
+              </button>
+            </div>
+          )}
           <PromptList
             prompts={snapshot?.prompts ?? []}
             projectId={task?.projectId ?? ""}
+            open={isOpen("prompts")}
+            onToggle={() => toggleSection("prompts")}
             onRun={runPrompt}
             onEdit={setPromptForm}
             onNew={() => setPromptForm("new")}
           />
-          <div className="section-label">
-            <span>CONVERSAS</span>
+          <SectionLabel
+            label="CONVERSAS"
+            open={isOpen("conversas")}
+            onToggle={() => toggleSection("conversas")}
+          >
             <button
               className="icon"
               title="Nova conversa sem projeto"
@@ -533,28 +703,28 @@ export default function App() {
             >
               <Plus size={15} />
             </button>
-          </div>
-          <div className="project conversations">
-            {snapshot?.tasks
-              .filter(
-                (t) =>
-                  !t.projectId &&
-                  t.archived === showArchived &&
-                  t.title.toLowerCase().includes(search.toLowerCase()),
-              )
-              .map((t) => (
-                <TaskItem
-                  key={t.id}
-                  task={t}
-                  selected={t.id === selected && view === "workspace"}
-                  icon={<MessageSquare size={15} />}
-                  onSelect={() => {
-                    setSelected(t.id);
-                    setView("workspace");
-                  }}
-                />
-              ))}
-          </div>
+          </SectionLabel>
+          {isOpen("conversas") && (
+            <div className="project conversations">
+              {snapshot?.tasks
+                .filter(
+                  (t) =>
+                    !t.projectId &&
+                    !t.workItemId &&
+                    t.archived === showArchived &&
+                    t.title.toLowerCase().includes(search.toLowerCase()),
+                )
+                .map((t) => (
+                  <TaskItem
+                    key={t.id}
+                    task={t}
+                    selected={t.id === selected && view === "workspace"}
+                    onSelect={() => openTask(t.id)}
+                    onAction={taskAction}
+                  />
+                ))}
+            </div>
+          )}
           <div className="section-label">
             <span>PROJETOS</span>
             <button
@@ -574,9 +744,20 @@ export default function App() {
           {snapshot?.projects.map((p) => (
             <div className="project" key={p.id}>
               <div className="project-title">
-                <ChevronDown size={14} />
-                <Folder size={17} />
-                <span>{p.name}</span>
+                <button
+                  className="project-toggle"
+                  aria-expanded={isOpen(`project:${p.id}`)}
+                  title={isOpen(`project:${p.id}`) ? "Recolher" : "Expandir"}
+                  onClick={() => toggleSection(`project:${p.id}`)}
+                >
+                  {isOpen(`project:${p.id}`) ? (
+                    <ChevronDown size={14} />
+                  ) : (
+                    <ChevronRight size={14} />
+                  )}
+                  <Folder size={16} />
+                  <span>{p.name}</span>
+                </button>
                 <button
                   className="icon on-hover"
                   title="Nova tarefa neste projeto"
@@ -585,50 +766,111 @@ export default function App() {
                   <Plus size={14} />
                 </button>
               </div>
-              {snapshot.tasks
-                .filter(
-                  (t) =>
-                    t.projectId === p.id &&
-                    t.archived === showArchived &&
-                    t.title.toLowerCase().includes(search.toLowerCase()),
-                )
-                .map((t) => (
-                  <TaskItem
-                    key={t.id}
-                    task={t}
-                    selected={t.id === selected && view === "workspace"}
-                    icon={<File size={15} />}
-                    onSelect={() => {
-                      setSelected(t.id);
-                      setView("workspace");
-                    }}
-                  />
-                ))}
+              {isOpen(`project:${p.id}`) && (
+                <button
+                  className={`work-link ${(view === "work" && workProject === p.id) || (view === "workspace" && task?.workItemId && task.projectId === p.id) ? "active-link" : ""}`}
+                  title="Quadro de tarefas do projeto"
+                  aria-label={`Tarefas de ${p.name}`}
+                  onClick={() => {
+                    setWorkProject(p.id);
+                    setView("work");
+                  }}
+                >
+                  <ListTodo size={15} />
+                  <span>Tarefas</span>
+                  {p.work?.enabled && (
+                    <span
+                      className="status-dot pulse"
+                      title="Modo tarefas ligado"
+                    />
+                  )}
+                  {(() => {
+                    const pending = snapshot.work.filter(
+                      (i) => i.projectId === p.id && i.state === "pending",
+                    ).length;
+                    return pending ? (
+                      <span
+                        className="badge attention"
+                        title="Recomendações esperando aprovação"
+                      >
+                        {pending}
+                      </span>
+                    ) : null;
+                  })()}
+                </button>
+              )}
+              {isOpen(`project:${p.id}`) &&
+                snapshot.tasks
+                  .filter(
+                    (t) =>
+                      t.projectId === p.id &&
+                      !t.workItemId &&
+                      t.archived === showArchived &&
+                      t.title.toLowerCase().includes(search.toLowerCase()),
+                  )
+                  .map((t) => (
+                    <TaskItem
+                      key={t.id}
+                      task={t}
+                      selected={t.id === selected && view === "workspace"}
+                      onSelect={() => openTask(t.id)}
+                      onAction={taskAction}
+                    />
+                  ))}
             </div>
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <button
-            className={showArchived ? "active-link" : ""}
-            onClick={() => setShowArchived(!showArchived)}
-          >
-            <Archive size={17} />
-            {showArchived ? "Mostrar tarefas ativas" : "Arquivadas"}
-          </button>
-          <button
-            className={view === "extensions" ? "active-link" : ""}
-            onClick={() => setView("extensions")}
-          >
-            <Layers size={18} />
-            Skills e MCP
-          </button>
-          <button
-            className={view === "settings" ? "active-link" : ""}
-            onClick={() => setView("settings")}
-          >
-            <SettingsIcon size={18} />
-            Configurações
-          </button>
+          {snapshot?.source &&
+            (snapshot.source.building ||
+              snapshot.source.error ||
+              snapshot.source.interface ||
+              snapshot.source.core) && (
+              <div
+                className={`update-pill ${snapshot.source.core || snapshot.source.interface || snapshot.source.building ? "" : "error"}`}
+                role="status"
+              >
+                {snapshot.source.core ? (
+                  snapshot.source.waiting ? (
+                    <>
+                      <LoaderCircle size={13} className="spin" />
+                      <span>Reinicia quando as tarefas terminarem</span>
+                      <button
+                        className="text-button"
+                        onClick={() => void run(() => api("source.cancel"))}
+                      >
+                        Cancelar
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      title="Fecha e reabre o Codebit com o código novo, esperando as tarefas terminarem. As conversas continuam na mesma sessão dos agentes."
+                      onClick={() => void run(() => api("source.restart"))}
+                    >
+                      <RefreshCw size={14} />
+                      App atualizado · Reiniciar
+                    </button>
+                  )
+                ) : snapshot.source.interface ? (
+                  <button
+                    title="Recarrega a janela com a interface nova; os agentes continuam rodando."
+                    onClick={() => void run(() => api("source.reload"))}
+                  >
+                    <RefreshCw size={14} />
+                    Interface atualizada · Recarregar
+                  </button>
+                ) : snapshot.source.building ? (
+                  <>
+                    <LoaderCircle size={13} className="spin" />
+                    <span>Preparando o código novo…</span>
+                  </>
+                ) : (
+                  <span title={snapshot.source.error}>
+                    Código com erro · a versão atual continua
+                  </span>
+                )}
+              </div>
+            )}
           {snapshot?.update?.available && (
             <div className="update-pill" role="status">
               {snapshot.update.status === "idle" ? (
@@ -659,9 +901,38 @@ export default function App() {
               )}
             </div>
           )}
-          <div className="local-label">
-            <span className="status-dot" />
-            Seu workspace local<span>v{appVersion}</span>
+          <div className="sidebar-footer">
+            <span className="local-label" title={`Codebit v${appVersion}`}>
+              <span className="status-dot" />
+              Seu workspace local
+            </span>
+            <button
+              className={`icon ${showArchived ? "active-link" : ""}`}
+              title={showArchived ? "Mostrar tarefas ativas" : "Arquivadas"}
+              aria-label={
+                showArchived ? "Mostrar tarefas ativas" : "Arquivadas"
+              }
+              aria-pressed={showArchived}
+              onClick={() => setShowArchived(!showArchived)}
+            >
+              <Archive size={16} />
+            </button>
+            <button
+              className={`icon ${view === "extensions" ? "active-link" : ""}`}
+              title="Skills e MCP"
+              aria-label="Skills e MCP"
+              onClick={() => setView("extensions")}
+            >
+              <Layers size={16} />
+            </button>
+            <button
+              className={`icon ${view === "settings" ? "active-link" : ""}`}
+              title="Configurações"
+              aria-label="Configurações"
+              onClick={() => setView("settings")}
+            >
+              <SettingsIcon size={16} />
+            </button>
           </div>
         </div>
       </aside>
@@ -670,26 +941,40 @@ export default function App() {
           <div className="title-context">
             {view === "workspace" && task ? (
               <>
+                {task.workItemId && (
+                  <button
+                    className="icon back-to-board"
+                    title="Voltar ao quadro de tarefas"
+                    aria-label="Voltar ao quadro de tarefas"
+                    onClick={() => {
+                      setWorkProject(task.projectId);
+                      setView("work");
+                    }}
+                  >
+                    <ArrowLeft size={16} />
+                  </button>
+                )}
                 <h1
-                  onDoubleClick={() => {
-                    setTitle(task.title);
-                    setModal("rename");
-                  }}
+                  title="Clique duas vezes para renomear"
+                  onDoubleClick={() => startRename(task)}
                 >
                   {task.title}
                 </h1>
-                <span>
+                <span className="title-meta">
                   {project ? (
                     <>
+                      <Folder size={12} />
                       {project.name}
-                      <span className="slash">/</span>
-                      {task.worktree ? "worktree isolada" : "pasta original"}
                     </>
                   ) : (
                     "Conversa sem projeto"
                   )}
+                  {task.worktree && <span className="badge">worktree</span>}
+                  {task.workItemId && (
+                    <span className="badge">tarefa do quadro</span>
+                  )}
                   {task.parentId && (
-                    <span className="linked"> · tarefa vinculada</span>
+                    <span className="badge">tarefa vinculada</span>
                   )}
                 </span>
               </>
@@ -697,11 +982,11 @@ export default function App() {
               <span className="title-subtle">
                 {view === "board"
                   ? "Modo Multitarefa"
-                  : view === "workspace"
-                    ? "Seu próximo projeto começa aqui"
-                    : view === "settings"
-                      ? "Configurações"
-                      : "Extensões do workspace"}
+                  : view === "work"
+                    ? "Quadro de tarefas"
+                    : view === "workspace"
+                      ? "Seu próximo projeto começa aqui"
+                      : "Configurações"}
               </span>
             )}
           </div>
@@ -747,10 +1032,7 @@ export default function App() {
                 <button
                   className="icon"
                   title="Renomear tarefa"
-                  onClick={() => {
-                    setTitle(task.title);
-                    setModal("rename");
-                  }}
+                  onClick={() => startRename(task)}
                   disabled={locked}
                 >
                   <Pencil size={15} />
@@ -758,12 +1040,32 @@ export default function App() {
                 <button
                   className="icon"
                   title={task.archived ? "Restaurar tarefa" : "Arquivar tarefa"}
+                  aria-label={
+                    task.archived ? "Restaurar tarefa" : "Arquivar tarefa"
+                  }
                   onClick={() =>
                     void run(() => patch({ archived: !task.archived }))
                   }
                   disabled={locked}
                 >
-                  <Archive size={16} />
+                  {task.archived ? (
+                    <ArchiveRestore size={16} />
+                  ) : (
+                    <Archive size={16} />
+                  )}
+                </button>
+                <button
+                  className="icon danger-icon"
+                  title={
+                    locked
+                      ? "Interrompa a tarefa antes de excluí-la"
+                      : "Excluir tarefa"
+                  }
+                  aria-label="Excluir tarefa"
+                  onClick={() => startDelete(task)}
+                  disabled={locked}
+                >
+                  <Trash2 size={15} />
                 </button>
                 <button
                   className="icon"
@@ -800,7 +1102,15 @@ export default function App() {
             </div>
           </div>
         </header>
-        {view === "board" && snapshot ? (
+        {view === "work" &&
+        snapshot?.projects.some((p) => p.id === workProject) ? (
+          <WorkBoard
+            project={snapshot.projects.find((p) => p.id === workProject)!}
+            snapshot={snapshot}
+            run={run}
+            onOpen={openTask}
+          />
+        ) : view === "board" && snapshot ? (
           <Board
             cards={board}
             snapshot={snapshot}
@@ -945,6 +1255,7 @@ export default function App() {
                     onImage={onImage}
                     onImageLoad={onImageLoad}
                     onOpenImage={openImage}
+                    onShowPlan={showPlan}
                   />
                 ))}
                 {task.status === "running" && (
@@ -987,6 +1298,23 @@ export default function App() {
                 <div ref={bottom} />
               </div>
               <div className="composer-wrap">
+                {pendingRequest && (
+                  <button
+                    className="pending-strip"
+                    onClick={() =>
+                      document
+                        .getElementById(`entry-${pendingRequest.id}`)
+                        ?.scrollIntoView({ block: "center" })
+                    }
+                  >
+                    <TriangleAlert size={14} />
+                    <span className="truncate">
+                      O agente espera sua decisão:{" "}
+                      <strong>{pendingRequest.request?.title}</strong>
+                    </span>
+                    <span className="pending-go">Ver</span>
+                  </button>
+                )}
                 <QueuePanel task={task} run={run} notify={setError} />
                 {task.images.inputImage && (
                   <div className="input-image-tag">
@@ -1005,6 +1333,15 @@ export default function App() {
                   <div className="attachment-row">
                     {attachments.map((a) => (
                       <span className="attachment" key={a}>
+                        {isImagePath(a) ? (
+                          <img
+                            className="attachment-thumb"
+                            src={fileUrl(task.id, a)}
+                            alt=""
+                          />
+                        ) : (
+                          <Paperclip size={12} />
+                        )}
                         {fileName(a)}
                         {/\.(png|jpe?g|webp)$/i.test(a) && (
                           <button
@@ -1017,6 +1354,7 @@ export default function App() {
                         )}
                         <button
                           className="icon"
+                          title="Remover anexo"
                           onClick={() =>
                             setAttachments(attachments.filter((x) => x !== a))
                           }
@@ -1096,10 +1434,11 @@ export default function App() {
                       }
                     }}
                   />
-                  <div className="composer-buttons">
+                  <div className="composer-bar">
                     <button
                       className="icon"
                       title="Anexar arquivos"
+                      aria-label="Anexar arquivos"
                       onClick={() =>
                         void run(async () => {
                           const a = await api<string[]>("attachments.add", {
@@ -1109,49 +1448,444 @@ export default function App() {
                         })
                       }
                     >
-                      <Paperclip size={20} />
+                      <Paperclip size={17} />
                     </button>
-                    <span className="composer-hint">
-                      {active ? "Enter adiciona à fila" : "Enter para enviar"} ·
-                      Shift + Enter para nova linha
-                    </span>
-                    <button
-                      className="quiet compact"
-                      disabled={!draft.trim() || !!imageProgress}
-                      title="Gerar imagem diretamente com o modelo selecionado"
-                      onClick={() => void run(generateImage)}
-                    >
-                      <ImageIcon size={15} />
-                      Gerar imagem
-                    </button>
+                    <div className="chip-wrap">
+                      <button
+                        className={`chip ${pop === "agent" ? "open" : ""}`}
+                        aria-label="Agente e modelo"
+                        aria-expanded={pop === "agent"}
+                        title={`${agentSummary}${task.model ? "" : " · modelo padrão do CLI"}`}
+                        onClick={() => setPop(pop === "agent" ? null : "agent")}
+                      >
+                        <AgentMark agent={task.agent} />
+                        <span className="truncate">{agentSummary}</span>
+                        {selectedInfo?.catalogStatus === "loading" ? (
+                          <LoaderCircle size={12} className="spin" />
+                        ) : (
+                          <ChevronDown size={12} />
+                        )}
+                      </button>
+                      {pop === "agent" && (
+                        <div
+                          className="popover"
+                          role="dialog"
+                          aria-label="Agente e modelo"
+                        >
+                          <strong className="popover-title">
+                            Agente e modelo
+                          </strong>
+                          <label>
+                            Agente
+                            <select
+                              aria-label="Agente"
+                              className="agent-select"
+                              disabled={locked}
+                              value={task.agent}
+                              onChange={(e) =>
+                                void run(() =>
+                                  patch({ agent: e.target.value as AgentId }),
+                                )
+                              }
+                            >
+                              {agentIds.map((id) => (
+                                <option
+                                  key={id}
+                                  value={id}
+                                  disabled={
+                                    !snapshot?.agents.find((a) => a.id === id)
+                                      ?.selected
+                                  }
+                                >
+                                  {agentNames[id]}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label>
+                            Modelo
+                            <span className="field-row">
+                              <select
+                                aria-label="Modelo do agente"
+                                title={
+                                  selectedModel?.description ||
+                                  "Selecione um modelo disponível no CLI"
+                                }
+                                disabled={locked}
+                                value={task.model}
+                                onChange={(e) => {
+                                  if (e.target.value === "__manual") {
+                                    setPop(null);
+                                    setTitle(task.model);
+                                    setModal("model");
+                                  } else
+                                    void run(() =>
+                                      patch({ model: e.target.value }),
+                                    );
+                                }}
+                              >
+                                <option value="">Padrão do CLI</option>
+                                {selectedInfo?.catalogStatus === "loading" && (
+                                  <option disabled>Carregando modelos…</option>
+                                )}
+                                {selectedInfo?.catalogStatus === "error" && (
+                                  <option disabled>
+                                    Catálogo indisponível · atualize ↻
+                                  </option>
+                                )}
+                                {selectedInfo?.models.map((m) => (
+                                  <option
+                                    key={m.id}
+                                    value={m.id}
+                                    title={m.description}
+                                  >
+                                    {m.name}
+                                    {m.resolvedModel
+                                      ? ` · ${m.resolvedModel}`
+                                      : ""}
+                                  </option>
+                                ))}
+                                {task.model &&
+                                  !selectedInfo?.models.some(
+                                    (m) => m.id === task.model,
+                                  ) && (
+                                    <option value={task.model}>
+                                      {task.model} · manual
+                                    </option>
+                                  )}
+                                <option value="__manual">
+                                  Informar modelo…
+                                </option>
+                              </select>
+                              <button
+                                className="icon"
+                                aria-label="Atualizar modelos do agente"
+                                title={
+                                  selectedInfo?.catalogError ||
+                                  "Atualizar modelos disponíveis"
+                                }
+                                disabled={
+                                  locked ||
+                                  !selectedInfo?.selected ||
+                                  selectedInfo.catalogStatus === "loading"
+                                }
+                                onClick={() =>
+                                  void run(() =>
+                                    api("auth", { agent: task.agent }),
+                                  )
+                                }
+                              >
+                                <RefreshCw
+                                  size={13}
+                                  className={
+                                    selectedInfo?.catalogStatus === "loading"
+                                      ? "spin"
+                                      : undefined
+                                  }
+                                />
+                              </button>
+                            </span>
+                          </label>
+                          <label>
+                            Esforço
+                            <select
+                              aria-label="Esforço do agente"
+                              title={
+                                !task.model
+                                  ? "Selecione um modelo para escolher o esforço"
+                                  : !efforts.length
+                                    ? "O CLI não informou níveis de esforço para este modelo"
+                                    : "Nível de raciocínio usado nas próximas mensagens"
+                              }
+                              disabled={
+                                locked ||
+                                !efforts.length ||
+                                selectedInfo?.catalogStatus === "loading"
+                              }
+                              value={task.effort || ""}
+                              onChange={(e) =>
+                                void run(() =>
+                                  patch({ effort: e.target.value }),
+                                )
+                              }
+                            >
+                              <option value="">
+                                {!task.model
+                                  ? "Escolha um modelo"
+                                  : !efforts.length
+                                    ? "Padrão do CLI"
+                                    : selectedModel?.defaultEffort
+                                      ? `Padrão · ${effortLabel(selectedModel.defaultEffort)}`
+                                      : "Padrão do CLI"}
+                              </option>
+                              {efforts.map((effort) => (
+                                <option key={effort} value={effort}>
+                                  {effortLabel(effort)} · {effort}
+                                </option>
+                              ))}
+                              {task.effort &&
+                                !efforts.includes(task.effort) && (
+                                  <option value={task.effort}>
+                                    {effortLabel(task.effort)} · indisponível
+                                  </option>
+                                )}
+                            </select>
+                          </label>
+                          <p className="help">
+                            {locked
+                              ? "Bloqueado enquanto o agente trabalha."
+                              : "Trocar de agente mantém esta conversa; o novo agente recebe o que perdeu."}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                    <div className="chip-wrap">
+                      <button
+                        className={`chip compactable ${pop === "images" ? "open" : ""}`}
+                        aria-label="Configurar imagens"
+                        aria-expanded={pop === "images"}
+                        title={`Imagens: ${imageProviderNames[task.images.provider]} · ${imageSummary}`}
+                        onClick={() =>
+                          setPop(pop === "images" ? null : "images")
+                        }
+                      >
+                        {imageProgress ? (
+                          <LoaderCircle size={13} className="spin" />
+                        ) : (
+                          <ImageIcon size={13} />
+                        )}
+                        <span className="truncate">{imageSummary}</span>
+                        <ChevronDown size={12} />
+                      </button>
+                      {pop === "images" && (
+                        <div
+                          className="popover"
+                          role="dialog"
+                          aria-label="Imagens"
+                        >
+                          <strong className="popover-title">Imagens</strong>
+                          <label>
+                            Provedor
+                            <select
+                              aria-label="Provedor de imagem"
+                              disabled={locked || !!imageProgress}
+                              value={task.images.provider}
+                              onChange={(e) =>
+                                void run(() =>
+                                  patch({
+                                    images: {
+                                      ...task.images,
+                                      provider: e.target.value as any,
+                                      model:
+                                        e.target.value === "codex"
+                                          ? "gpt-image"
+                                          : e.target.value === "openai"
+                                            ? "gpt-image-2.5-flare"
+                                            : "",
+                                      inputImage: undefined,
+                                      workflow: "sdxl-text",
+                                    },
+                                  }),
+                                )
+                              }
+                            >
+                              <option value="codex">Codex · Login local</option>
+                              <option value="openai">
+                                OpenAI · Chave da API
+                              </option>
+                              <option value="comfyui">ComfyUI · Local</option>
+                            </select>
+                          </label>
+                          <label>
+                            Modelo
+                            <select
+                              aria-label="Modelo de imagem"
+                              value={
+                                task.images.model + "|" + task.images.workflow
+                              }
+                              disabled={locked || !!imageProgress}
+                              onChange={(e) => {
+                                const [model, workflow] =
+                                  e.target.value.split("|");
+                                void run(() =>
+                                  patch({
+                                    images: {
+                                      ...task.images,
+                                      model,
+                                      workflow: workflow || "sdxl-text",
+                                    },
+                                  }),
+                                );
+                              }}
+                            >
+                              <option
+                                value={
+                                  task.images.model + "|" + task.images.workflow
+                                }
+                              >
+                                {imageModelName || "Selecionar modelo"}
+                              </option>
+                              {imageModels.map((m) => (
+                                <option
+                                  key={m.id + "|" + m.workflow}
+                                  value={
+                                    m.id + "|" + (m.workflow || "sdxl-text")
+                                  }
+                                  disabled={!m.available}
+                                >
+                                  {m.name}
+                                  {!m.available ? " · configurar" : ""}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <button
+                            className="primary compact"
+                            disabled={!draft.trim() || !!imageProgress}
+                            title="Gerar imagem diretamente com o modelo selecionado"
+                            onClick={() => {
+                              setPop(null);
+                              void run(generateImage);
+                            }}
+                          >
+                            <ImageIcon size={14} />
+                            Gerar imagem
+                          </button>
+                          <p className="help">
+                            {draft.trim()
+                              ? "Usa o texto da mensagem como descrição da imagem."
+                              : "Escreva a descrição da imagem na mensagem para gerar."}{" "}
+                            Dimensões e qualidade ficam na aba Imagens do
+                            painel.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                    <div className="chip-wrap">
+                      <button
+                        className={`chip compactable ${subagents.enabled ? "on" : ""} ${pop === "subagents" ? "open" : ""}`}
+                        aria-label="Configurar sub-agentes"
+                        aria-expanded={pop === "subagents"}
+                        title="Sub-agentes"
+                        onClick={() =>
+                          setPop(pop === "subagents" ? null : "subagents")
+                        }
+                      >
+                        <Users size={13} />
+                        <span className="truncate">
+                          {subagents.enabled
+                            ? `${agentNames[subagents.agent]} · ${subagents.max}`
+                            : "Desligados"}
+                        </span>
+                        <ChevronDown size={12} />
+                      </button>
+                      {pop === "subagents" && (
+                        <div
+                          className="popover subagents-popover"
+                          role="dialog"
+                          aria-label="Sub-agentes"
+                        >
+                          <strong className="popover-title">Sub-agentes</strong>
+                          {synced && (
+                            <p className="help subagents-synced">
+                              Esta conversa segue os sub-agentes padrão,
+                              aplicados a todas as conversas. Mude em
+                              Configurações → Comportamento → Sub-agentes
+                              padrão.
+                            </p>
+                          )}
+                          <SubagentOptionsForm
+                            value={subagents}
+                            disabled={synced || locked}
+                            agents={snapshot?.agents ?? []}
+                            defaultModels={snapshot?.settings.defaultModels}
+                            onChange={(value) =>
+                              void run(() => patchSubagents(value))
+                            }
+                          />
+                          <p className="help">
+                            {locked
+                              ? "Bloqueado enquanto o agente trabalha."
+                              : task.agent === "devin"
+                                ? "O Devin CLI ainda não usa ferramentas MCP do Codebit como agente principal. Escolha Codex ou Claude para delegar; o Devin funciona como sub-agente."
+                                : "O agente principal recebe a ferramenta run_subagents. Os sub-agentes trabalham na mesma pasta e seguem o modo da tarefa."}
+                          </p>
+                          {task.subagents && !synced && !locked && (
+                            <button
+                              className="text-button"
+                              title="Esta conversa passa a seguir os sub-agentes padrão das Configurações."
+                              onClick={() =>
+                                void run(() => patch({ subagents: null }))
+                              }
+                            >
+                              Voltar ao padrão
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    <span className="composer-spacer" />
+                    <div className="mode-toggle" role="group" aria-label="Modo">
+                      <button
+                        className={task.mode === "plan" ? "selected" : ""}
+                        aria-pressed={task.mode === "plan"}
+                        disabled={locked}
+                        title="O agente só lê e propõe um plano para você aprovar."
+                        onClick={() => void run(() => patch({ mode: "plan" }))}
+                      >
+                        Planejar
+                      </button>
+                      <button
+                        className={task.mode === "execute" ? "selected" : ""}
+                        aria-pressed={task.mode === "execute"}
+                        disabled={locked}
+                        title="O agente pede permissão antes de comandos e alterações sensíveis."
+                        onClick={() =>
+                          void run(() => patch({ mode: "execute" }))
+                        }
+                      >
+                        Executar
+                      </button>
+                      <button
+                        className={`bypass ${task.mode === "bypass" ? "selected" : ""}`}
+                        aria-pressed={task.mode === "bypass"}
+                        disabled={locked}
+                        title="Executa comandos e altera arquivos sem pedir permissão. Use apenas em projetos em que você confia."
+                        onClick={() =>
+                          void run(() => patch({ mode: "bypass" }))
+                        }
+                      >
+                        Bypass
+                      </button>
+                    </div>
                     {active && (
                       <button
                         className="send queue"
-                        title="Adicionar à fila"
+                        title="Adicionar à fila (Enter)"
                         aria-label="Adicionar à fila"
                         disabled={
                           submitting || (!draft.trim() && !attachments.length)
                         }
                         onClick={() => void run(submit)}
                       >
-                        <ListPlus size={19} />
+                        <ListPlus size={18} />
                       </button>
                     )}
                     {active ? (
                       <button
                         className="send stop"
-                        title="Interromper"
+                        title="Interromper (Ctrl+.)"
                         aria-label="Interromper"
                         onClick={() =>
                           void run(() => api("task.interrupt", { id: task.id }))
                         }
                       >
-                        <Square size={16} />
+                        <Square size={15} />
                       </button>
                     ) : (
                       <button
                         className="send"
-                        title="Enviar mensagem"
+                        title="Enviar (Enter) · Shift+Enter para nova linha"
                         aria-label="Enviar mensagem"
                         disabled={
                           submitting ||
@@ -1160,390 +1894,9 @@ export default function App() {
                         }
                         onClick={() => void run(submit)}
                       >
-                        <ArrowUp size={21} />
+                        <ArrowUp size={19} />
                       </button>
                     )}
-                  </div>
-                </div>
-                <div className="composer-toolbar">
-                  <div className="selector-group">
-                    <span className="tiny-label">
-                      Agente · modelo
-                      {selectedInfo?.catalogStatus === "loading" &&
-                        " · carregando…"}
-                    </span>
-                    <div className="selector-row">
-                      <select
-                        aria-label="Agente"
-                        className="agent-select"
-                        title="Trocar de agente mantém esta conversa"
-                        disabled={locked}
-                        value={task.agent}
-                        onChange={(e) =>
-                          void run(() =>
-                            patch({ agent: e.target.value as AgentId }),
-                          )
-                        }
-                      >
-                        {agentIds.map((id) => (
-                          <option
-                            key={id}
-                            value={id}
-                            disabled={
-                              !snapshot?.agents.find((a) => a.id === id)
-                                ?.selected
-                            }
-                          >
-                            {agentNames[id]}
-                          </option>
-                        ))}
-                      </select>
-                      <select
-                        aria-label="Modelo do agente"
-                        title={
-                          selectedModel?.description ||
-                          "Selecione um modelo disponível no CLI"
-                        }
-                        disabled={locked}
-                        value={task.model}
-                        onChange={(e) => {
-                          if (e.target.value === "__manual") {
-                            setTitle(task.model);
-                            setModal("model");
-                          } else
-                            void run(() => patch({ model: e.target.value }));
-                        }}
-                      >
-                        <option value="">Padrão do CLI</option>
-                        {selectedInfo?.catalogStatus === "loading" && (
-                          <option disabled>Carregando modelos…</option>
-                        )}
-                        {selectedInfo?.catalogStatus === "error" && (
-                          <option disabled>
-                            Catálogo indisponível · atualize ↻
-                          </option>
-                        )}
-                        {selectedInfo?.models.map((m) => (
-                          <option key={m.id} value={m.id} title={m.description}>
-                            {m.name}
-                            {m.resolvedModel ? ` · ${m.resolvedModel}` : ""}
-                          </option>
-                        ))}
-                        {task.model &&
-                          !selectedInfo?.models.some(
-                            (m) => m.id === task.model,
-                          ) && (
-                            <option value={task.model}>
-                              {task.model} · manual
-                            </option>
-                          )}
-                        <option value="__manual">Informar modelo…</option>
-                      </select>
-                      <button
-                        className="catalog-refresh icon-button"
-                        aria-label="Atualizar modelos do agente"
-                        title={
-                          selectedInfo?.catalogError ||
-                          "Atualizar modelos disponíveis"
-                        }
-                        disabled={
-                          locked ||
-                          !selectedInfo?.selected ||
-                          selectedInfo.catalogStatus === "loading"
-                        }
-                        onClick={() =>
-                          void run(() => api("auth", { agent: task.agent }))
-                        }
-                      >
-                        <RefreshCw
-                          size={13}
-                          className={
-                            selectedInfo?.catalogStatus === "loading"
-                              ? "spin"
-                              : undefined
-                          }
-                        />
-                      </button>
-                    </div>
-                  </div>
-                  <div className="selector-group effort-selector">
-                    <span className="tiny-label">Esforço</span>
-                    <div className="selector-row">
-                      <select
-                        aria-label="Esforço do agente"
-                        title={
-                          !task.model
-                            ? "Selecione um modelo para escolher o esforço"
-                            : !efforts.length
-                              ? "O CLI não informou níveis de esforço para este modelo"
-                              : "Nível de raciocínio usado nas próximas mensagens"
-                        }
-                        disabled={
-                          locked ||
-                          !efforts.length ||
-                          selectedInfo?.catalogStatus === "loading"
-                        }
-                        value={task.effort || ""}
-                        onChange={(e) =>
-                          void run(() => patch({ effort: e.target.value }))
-                        }
-                      >
-                        <option value="">
-                          {!task.model
-                            ? "Escolha um modelo"
-                            : !efforts.length
-                              ? "Padrão do CLI"
-                              : selectedModel?.defaultEffort
-                                ? `Padrão · ${effortLabel(selectedModel.defaultEffort)}`
-                                : "Padrão do CLI"}
-                        </option>
-                        {efforts.map((effort) => (
-                          <option key={effort} value={effort}>
-                            {effortLabel(effort)} · {effort}
-                          </option>
-                        ))}
-                        {task.effort && !efforts.includes(task.effort) && (
-                          <option value={task.effort}>
-                            {effortLabel(task.effort)} · indisponível
-                          </option>
-                        )}
-                      </select>
-                    </div>
-                  </div>
-                  <div className="selector-group images-selector">
-                    <span className="tiny-label">Imagens</span>
-                    <div className="selector-row">
-                      <select
-                        aria-label="Provedor de imagem"
-                        disabled={locked || !!imageProgress}
-                        value={task.images.provider}
-                        onChange={(e) =>
-                          void run(() =>
-                            patch({
-                              images: {
-                                ...task.images,
-                                provider: e.target.value as any,
-                                model:
-                                  e.target.value === "codex"
-                                    ? "gpt-image"
-                                    : e.target.value === "openai"
-                                      ? "gpt-image-2.5-flare"
-                                      : "",
-                                inputImage: undefined,
-                                workflow: "sdxl-text",
-                              },
-                            }),
-                          )
-                        }
-                      >
-                        <option value="codex">Codex · Login local</option>
-                        <option value="openai">OpenAI · Chave da API</option>
-                        <option value="comfyui">ComfyUI · Local</option>
-                      </select>
-                      <select
-                        aria-label="Modelo de imagem"
-                        value={task.images.model + "|" + task.images.workflow}
-                        disabled={locked || !!imageProgress}
-                        onChange={(e) => {
-                          const [model, workflow] = e.target.value.split("|");
-                          void run(() =>
-                            patch({
-                              images: {
-                                ...task.images,
-                                model,
-                                workflow: workflow || "sdxl-text",
-                              },
-                            }),
-                          );
-                        }}
-                      >
-                        <option
-                          value={task.images.model + "|" + task.images.workflow}
-                        >
-                          {imageModels.find(
-                            (m) =>
-                              m.id === task.images.model &&
-                              (m.workflow || "sdxl-text") ===
-                                task.images.workflow,
-                          )?.name ||
-                            task.images.model ||
-                            "Selecionar modelo"}
-                        </option>
-                        {imageModels.map((m) => (
-                          <option
-                            key={m.id + "|" + m.workflow}
-                            value={m.id + "|" + (m.workflow || "sdxl-text")}
-                            disabled={!m.available}
-                          >
-                            {m.name}
-                            {!m.available ? " · configurar" : ""}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                  <div className="selector-group subagents-selector">
-                    <span className="tiny-label">Sub-agentes</span>
-                    <div className="selector-row">
-                      <button
-                        className={`subagents-toggle ${subagents.enabled ? "on" : ""}`}
-                        aria-label="Configurar sub-agentes"
-                        aria-expanded={subagentsOpen}
-                        disabled={locked}
-                        onClick={() => setSubagentsOpen(!subagentsOpen)}
-                      >
-                        <Users size={14} />
-                        {subagents.enabled
-                          ? `${agentNames[subagents.agent]} · ${subagents.max}`
-                          : "Desligados"}
-                      </button>
-                    </div>
-                    {subagentsOpen && !active && (
-                      <div
-                        className="subagents-popover"
-                        role="dialog"
-                        aria-label="Sub-agentes"
-                      >
-                        <label className="checkbox">
-                          <input
-                            type="checkbox"
-                            checked={subagents.enabled}
-                            onChange={(e) =>
-                              void run(() =>
-                                patchSubagents({ enabled: e.target.checked }),
-                              )
-                            }
-                          />
-                          Permitir que o agente delegue a sub-agentes
-                        </label>
-                        <label>
-                          CLI
-                          <select
-                            aria-label="CLI dos sub-agentes"
-                            value={subagents.agent}
-                            onChange={(e) => {
-                              const agent = e.target.value as AgentId;
-                              void run(() =>
-                                patchSubagents({
-                                  agent,
-                                  model:
-                                    snapshot?.settings.defaultModels[agent] ??
-                                    "",
-                                  effort: "",
-                                }),
-                              );
-                            }}
-                          >
-                            {agentIds.map((id) => (
-                              <option
-                                key={id}
-                                value={id}
-                                disabled={
-                                  !snapshot?.agents.find((a) => a.id === id)
-                                    ?.selected
-                                }
-                              >
-                                {agentNames[id]}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <label>
-                          Modelo
-                          <select
-                            aria-label="Modelo dos sub-agentes"
-                            value={subagents.model}
-                            onChange={(e) =>
-                              void run(() =>
-                                patchSubagents({
-                                  model: e.target.value,
-                                  effort: "",
-                                }),
-                              )
-                            }
-                          >
-                            <option value="">Padrão do CLI</option>
-                            {subagentInfo?.models.map((m) => (
-                              <option key={m.id} value={m.id}>
-                                {m.name}
-                              </option>
-                            ))}
-                            {subagents.model && !subagentModel && (
-                              <option value={subagents.model}>
-                                {subagents.model} · manual
-                              </option>
-                            )}
-                          </select>
-                        </label>
-                        {!!subagentModel?.efforts?.length && (
-                          <label>
-                            Esforço
-                            <select
-                              aria-label="Esforço dos sub-agentes"
-                              value={subagents.effort}
-                              onChange={(e) =>
-                                void run(() =>
-                                  patchSubagents({ effort: e.target.value }),
-                                )
-                              }
-                            >
-                              <option value="">Padrão do modelo</option>
-                              {subagentModel.efforts.map((effort) => (
-                                <option key={effort} value={effort}>
-                                  {effortLabel(effort)}
-                                </option>
-                              ))}
-                            </select>
-                          </label>
-                        )}
-                        <label>
-                          Simultâneos
-                          <input
-                            aria-label="Quantidade de sub-agentes"
-                            type="number"
-                            min={1}
-                            max={8}
-                            value={subagents.max}
-                            onChange={(e) => {
-                              const max = Math.min(
-                                8,
-                                Math.max(1, Math.round(+e.target.value || 1)),
-                              );
-                              void run(() => patchSubagents({ max }));
-                            }}
-                          />
-                        </label>
-                        <p className="help">
-                          {task.agent === "devin"
-                            ? "O Devin CLI ainda não usa ferramentas MCP do Codebit como agente principal. Escolha Codex ou Claude para delegar; o Devin funciona como sub-agente."
-                            : "O agente principal recebe a ferramenta run_subagents. Os sub-agentes trabalham na mesma pasta e seguem o modo da tarefa."}
-                        </p>
-                      </div>
-                    )}
-                  </div>
-                  <div className="mode-toggle">
-                    <button
-                      className={task.mode === "plan" ? "selected" : ""}
-                      disabled={locked}
-                      onClick={() => void run(() => patch({ mode: "plan" }))}
-                    >
-                      Planejar
-                    </button>
-                    <button
-                      className={task.mode === "execute" ? "selected" : ""}
-                      disabled={locked}
-                      onClick={() => void run(() => patch({ mode: "execute" }))}
-                    >
-                      Executar
-                    </button>
-                    <button
-                      className={`bypass ${task.mode === "bypass" ? "selected" : ""}`}
-                      disabled={locked}
-                      title="Executa comandos e altera arquivos sem pedir permissão. Use apenas em projetos em que você confia."
-                      onClick={() => void run(() => patch({ mode: "bypass" }))}
-                    >
-                      Bypass
-                    </button>
                   </div>
                 </div>
               </div>
@@ -1555,6 +1908,7 @@ export default function App() {
                 selectedArtifact={selectedArtifact}
                 setSelectedArtifact={setSelectedArtifact}
                 openedImage={openedImage}
+                planRequest={planRequest}
                 setOpenedImage={setOpenedImage}
                 tab={tab}
                 setTab={setTab}
@@ -1631,6 +1985,81 @@ export default function App() {
           onClose={() => setPromptForm(undefined)}
           run={run}
         />
+      )}
+      {deleting && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setDeleting(undefined);
+          }}
+        >
+          <form
+            className="modal"
+            role="dialog"
+            aria-label="Excluir tarefa"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void run(() => deleteTask(deleting));
+            }}
+          >
+            <div className="modal-header">
+              <h2>Excluir “{deleting.title}”?</h2>
+              <button
+                type="button"
+                className="icon"
+                aria-label="Fechar"
+                onClick={() => setDeleting(undefined)}
+              >
+                <X size={19} />
+              </button>
+            </div>
+            <p className="help">
+              Apaga o histórico da conversa, os anexos copiados para ela, as
+              imagens geradas nela e o plano salvo. Não dá para desfazer; para
+              guardar uma imagem, exporte antes. Se só quiser tirá-la da lista,
+              use Arquivar.
+            </p>
+            <p className="help">
+              {deleting.projectId
+                ? "Os arquivos do projeto não são alterados."
+                : "Conversas sem projeto trabalham numa pasta própria do Codebit."}
+            </p>
+            {deleting.worktree && (
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={removeFolder}
+                  onChange={(e) => setRemoveFolder(e.target.checked)}
+                />
+                Remover também a worktree da tarefa (alterações não commitadas
+                nela serão perdidas; o branch continua no repositório)
+              </label>
+            )}
+            {!deleting.projectId && (
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={removeFolder}
+                  onChange={(e) => setRemoveFolder(e.target.checked)}
+                />
+                Apagar também a pasta da conversa, com os arquivos criados nela
+              </label>
+            )}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="quiet"
+                onClick={() => setDeleting(undefined)}
+              >
+                Cancelar
+              </button>
+              <button className="primary danger-button" type="submit" autoFocus>
+                <Trash2 size={15} />
+                Excluir
+              </button>
+            </div>
+          </form>
+        </div>
       )}
       {modal && (
         <div
@@ -1978,6 +2407,7 @@ const EntryView = memo(
     onImage,
     onImageLoad,
     onOpenImage,
+    onShowPlan,
   }: {
     entry: Entry;
     agent: AgentId;
@@ -1988,13 +2418,14 @@ const EntryView = memo(
     onImageLoad: () => void;
     // Opens an image file mentioned in the chat in the side panel.
     onOpenImage: (path: string) => void;
+    onShowPlan: () => void;
   }) {
     return (
-      <div className={`entry entry-${e.kind}`}>
+      <div className={`entry entry-${e.kind}`} id={`entry-${e.id}`}>
         {["user", "assistant"].includes(e.kind) && (
           <>
             <div
-              className={`avatar ${e.kind === "assistant" ? "agent-avatar" : ""}`}
+              className={`avatar ${e.kind === "assistant" ? `agent-avatar ${e.agent ?? agent}` : ""}`}
             >
               {e.kind === "user" ? (
                 "V"
@@ -2021,26 +2452,16 @@ const EntryView = memo(
                   remarkPlugins={[remarkGfm, remarkImagePaths]}
                   urlTransform={markdownUrl}
                   components={{
-                    a: ({ href, children }) => {
-                      const image = linkedImage(href);
-                      return (
-                        <a
-                          href="#"
-                          className={image ? "file-link" : undefined}
-                          title={image ? "Abrir no painel lateral" : href}
-                          onClick={(ev) => {
-                            ev.preventDefault();
-                            if (image) onOpenImage(image);
-                            else if (href)
-                              void run(() =>
-                                api("external.open", { url: href }),
-                              );
-                          }}
-                        >
-                          {children}
-                        </a>
-                      );
-                    },
+                    a: ({ href, children }) => (
+                      <MarkdownLink
+                        href={href}
+                        base={{ id: taskId }}
+                        run={run}
+                        onOpenImage={onOpenImage}
+                      >
+                        {children}
+                      </MarkdownLink>
+                    ),
                     // Local images show in the chat through Codebit.
                     img: ({ src, alt }) => {
                       const path =
@@ -2073,6 +2494,10 @@ const EntryView = memo(
                       ev.preventDefault();
                       onOpenImage(a);
                     }}
+                    onContextMenu={(ev) => {
+                      ev.preventDefault();
+                      void run(() => linkMenu({ id: taskId }, a, true));
+                    }}
                   >
                     <ImageIcon size={12} />
                     {fileName(a)}
@@ -2089,11 +2514,15 @@ const EntryView = memo(
         )}
         {e.kind === "activity" && (
           <>
-            <span className="activity-icon">
-              <Check size={12} />
-            </span>
+            <ActivityIcon text={e.text} ok={e.ok} />
             <span>
-              <LinkedText text={e.text} onOpen={onOpenImage} />
+              <LinkedText
+                text={e.text}
+                onOpen={onOpenImage}
+                onMenu={(path) =>
+                  void run(() => linkMenu({ id: taskId }, path, true))
+                }
+              />
             </span>
           </>
         )}
@@ -2101,8 +2530,8 @@ const EntryView = memo(
           <div className="warning-card" role="status">
             <TriangleAlert size={18} />
             <div>
-              <strong>Conflito com outra conversa</strong>
-              <p>{e.text}</p>
+              <strong>{e.title ?? "Conflito com outra conversa"}</strong>
+              <p>{e.text.charAt(0).toUpperCase() + e.text.slice(1)}</p>
             </div>
           </div>
         )}
@@ -2110,13 +2539,18 @@ const EntryView = memo(
           <div className="error-card">
             <CircleAlert size={18} />
             <div>
-              <strong>A execução precisa de atenção</strong>
+              <strong>{errorTitle(e.text)}</strong>
               <p>{e.text}</p>
             </div>
           </div>
         )}
         {e.kind === "request" && e.request && (
-          <RequestCard entry={e} taskId={taskId} run={run} />
+          <RequestCard
+            entry={e}
+            taskId={taskId}
+            run={run}
+            onShowPlan={onShowPlan}
+          />
         )}
         {e.kind === "image" &&
           (() => {
@@ -2164,11 +2598,25 @@ const EntryView = memo(
     a.entry.id === b.entry.id &&
     a.entry.text === b.entry.text &&
     a.entry.resolved === b.entry.resolved &&
+    a.entry.ok === b.entry.ok &&
     a.entry.agent === b.entry.agent &&
     a.agent === b.agent &&
     a.taskId === b.taskId &&
     a.artifact?.id === b.artifact?.id,
 );
+// A known cause as the error card title; otherwise a general one.
+function errorTitle(text: string) {
+  if (/cota|quota|rate limit|usage limit|limite de uso/i.test(text))
+    return "Limite de uso atingido";
+  if (/ENOTFOUND|resolve host|ECONNREFUSED|ECONNRESET|sem conexão/i.test(text))
+    return "Falha de rede";
+  if (/tempo esgotado|timed out|timeout/i.test(text)) return "Tempo esgotado";
+  if (/CLI não encontrado|ENOENT|not recognized/i.test(text))
+    return "CLI não encontrado";
+  if (/not logged|unauthori[sz]ed|login necessário/i.test(text))
+    return "Login necessário";
+  return "A execução precisa de atenção";
+}
 function AgentSelect({
   value,
   onChange,
@@ -2324,34 +2772,92 @@ function QueuePanel({
     </div>
   );
 }
+// How long ago, short enough for the sidebar.
+function ago(iso: string) {
+  const minutes = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (minutes < 1) return "agora";
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h`;
+  const days = Math.floor(hours / 24);
+  return days < 30
+    ? `${days} d`
+    : new Date(iso).toLocaleDateString("pt-BR", {
+        day: "2-digit",
+        month: "short",
+      });
+}
 function TaskItem({
   task,
   selected,
-  icon,
   onSelect,
+  onAction,
 }: {
   task: Task;
   selected: boolean;
-  icon: ReactNode;
   onSelect: () => void;
+  onAction: (task: Task, action?: string) => void;
 }) {
+  const busy = ["running", "waiting", "queued"].includes(task.status);
+  const flagged = busy || ["failed", "interrupted"].includes(task.status);
+  const locked = busy || !!task.background;
   return (
-    <button
-      className={`task-item ${selected ? "selected" : ""}`}
-      onClick={onSelect}
-      draggable
-      onDragStart={(e) => {
-        e.dataTransfer.setData(taskMime, task.id);
-        e.dataTransfer.effectAllowed = "copy";
+    <div
+      className="task-row"
+      onContextMenu={(e) => {
+        e.preventDefault();
+        void api<string | undefined>("task.menu", { id: task.id }).then(
+          (action) => onAction(task, action),
+        );
       }}
     >
-      {icon}
-      <span>{task.title}</span>
-      {["running", "waiting", "queued"].includes(task.status) && (
-        <span
-          className={`status-dot ${task.status === "waiting" ? "amber" : ""}`}
-        />
+      <button
+        className={`task-item ${selected ? "selected" : ""}`}
+        title={`${task.title} · ${agentNames[task.agent]} · ${statusNames[task.status]}`}
+        onClick={onSelect}
+        draggable
+        onDragStart={(e) => {
+          e.dataTransfer.setData(taskMime, task.id);
+          e.dataTransfer.effectAllowed = "copy";
+        }}
+      >
+        <AgentMark agent={task.agent} />
+        <span className="task-title">{task.title}</span>
+        {flagged ? (
+          <span
+            className={`status-dot ${task.status === "waiting" ? "amber" : task.status === "failed" ? "red" : task.status === "interrupted" ? "muted-dot" : "pulse"}`}
+            aria-hidden
+          />
+        ) : (
+          <time className="task-time" aria-hidden>
+            {ago(task.updatedAt)}
+          </time>
+        )}
+      </button>
+      {!locked && (
+        <span className="task-actions">
+          <button
+            className="icon"
+            title={task.archived ? "Restaurar" : "Arquivar"}
+            aria-label={task.archived ? "Restaurar" : "Arquivar"}
+            onClick={() => onAction(task, "archive")}
+          >
+            {task.archived ? (
+              <ArchiveRestore size={14} />
+            ) : (
+              <Archive size={14} />
+            )}
+          </button>
+          <button
+            className="icon danger-icon"
+            title="Excluir"
+            aria-label="Excluir"
+            onClick={() => onAction(task, "delete")}
+          >
+            <Trash2 size={14} />
+          </button>
+        </span>
       )}
-    </button>
+    </div>
   );
 }

@@ -5,8 +5,10 @@ import {
   copyFile,
   stat,
   readFile,
+  rm,
   writeFile,
 } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join, basename, relative, resolve } from "node:path";
 import type {
   AgentCommand,
@@ -29,7 +31,16 @@ import type {
   SubagentOptions,
   Task,
 } from "../shared/types";
-import { agentNames, defaultImages } from "../shared/types";
+import {
+  agentNames,
+  defaultImages,
+  defaultLoopGuard,
+  socialNetworkNames,
+  subagentsFor,
+} from "../shared/types";
+import type { SocialPreview, WorkItem, WorkSettings } from "../shared/types";
+import { defaultWork, workStatus } from "../shared/types";
+import type { SocialService } from "./social";
 import { Store } from "./store";
 import { discover, checkAuth, readVersion } from "./discovery";
 import { CodexSession } from "./agents/codex";
@@ -37,9 +48,10 @@ import { ClaudeSession } from "./agents/claude";
 import { DevinSession } from "./agents/devin";
 import { probeCommands, probeModels } from "./agents/catalog";
 import { probeQuota } from "./agents/quota";
-import { createWorktree, isGit } from "./workspace";
+import { createWorktree, isGit, removeWorktree } from "./workspace";
 import { codexImageModel, ImageService } from "./images";
 import { mcpFor } from "./extensions";
+import { LoopGuard } from "./guard";
 import type { BridgeKind } from "./bridge";
 const sessionTypes = {
   codex: CodexSession,
@@ -49,6 +61,13 @@ const sessionTypes = {
 export class Runtime {
   agents: AgentInfo[] = [];
   images: ImageService;
+  // Social networks of the projects; set by the app, absent in some tests.
+  social?: SocialService;
+  // Posts waiting for the user's approval, by their chat request id.
+  private socialRequests = new Map<
+    string,
+    { taskId: string; resolve: (ok: boolean) => void }
+  >();
   private sessions = new Map<string, AgentSession>();
   // Subagent approvals shown in the parent chat, by their chat request id.
   private subRequests = new Map<
@@ -68,6 +87,8 @@ export class Runtime {
     { at: number; list: Promise<AgentCommand[]> }
   >();
   private assistantIds = new Map<string, string>();
+  // Activity rows by tool call, so the call's outcome marks its row.
+  private calls = new Map<string, Map<string, string>>();
   // Tasks whose turn ended while background work kept the session open.
   private parked = new Set<string>();
   // Last chat that changed each file (by absolute path) and when each run
@@ -75,20 +96,35 @@ export class Runtime {
   private edits = new Map<string, { taskId: string; at: number }>();
   private runStarts = new Map<string, number>();
   private warned = new Set<string>();
+  // One per run: reset by each message from the user.
+  private guards = new Map<string, LoopGuard>();
   private quick = new Map<
     string,
-    { run: QuickRun; session?: AgentSession; timer?: NodeJS.Timeout }
+    {
+      run: QuickRun;
+      session?: AgentSession;
+      timer?: NodeJS.Timeout;
+      guard?: LoopGuard;
+    }
   >();
   // How long a parked session with no background work left waits for the
   // agent's report before closing.
   quietMs = 3000;
   private notifyTimer?: NodeJS.Timeout;
   private disposed = false;
+  // Board starts run one after another per project, so none starts twice.
+  private dispatching = new Map<string, Promise<unknown>>();
+  // Board tasks that failed in a row, per project; two pause the mode.
+  private workFailures = new Map<string, number>();
   private detection?: Promise<AgentInfo[]>;
   private versionCheck = 0;
   private catalogLoads = new WeakMap<AgentInfo, Promise<AgentInfo>>();
   private catalogAbort = new AbortController();
-  bridgeConfig: (taskId: string, kind: BridgeKind) => any = () => ({});
+  bridgeConfig: (
+    taskId: string,
+    kind: BridgeKind,
+    env?: Record<string, string>,
+  ) => any = () => ({});
   revokeBridge: (taskId: string) => void = () => {};
   // Asks for the user's attention: a Windows notification while the window
   // is in the background.
@@ -261,6 +297,8 @@ export class Runtime {
     parentId?: string;
     // An existing folder, for a saved prompt's run kept as a conversation.
     cwd?: string;
+    // The board task this internal session works on.
+    workItemId?: string;
   }) {
     const p = input.projectId
       ? this.store.get<Project>("project", input.projectId)
@@ -292,10 +330,28 @@ export class Runtime {
       updatedAt: now,
       images: { ...defaultImages },
       parentId: input.parentId,
+      workItemId: input.workItemId,
     };
     this.store.put("task", task);
     this.refresh();
     return task;
+  }
+  private trackCall(taskId: string, call: string | undefined, entryId: string) {
+    if (!call) return;
+    const calls = this.calls.get(taskId) ?? new Map<string, string>();
+    this.calls.set(taskId, calls);
+    calls.set(call, entryId);
+  }
+  // Marks the activity row of a finished tool call as a success or failure.
+  private settleCall(taskId: string, call: string | undefined, ok: boolean) {
+    const entryId = call && this.calls.get(taskId)?.get(call);
+    if (!entryId) return;
+    this.calls.get(taskId)!.delete(call);
+    try {
+      const entry = this.store.get<Entry>("entry", entryId);
+      this.store.put("entry", { ...entry, ok });
+      this.refresh(taskId);
+    } catch {}
   }
   entry(
     taskId: string,
@@ -474,6 +530,7 @@ export class Runtime {
         () => false,
       );
       if (steered) {
+        this.resetGuard(taskId);
         this.assistantIds.delete(taskId);
         this.entry(taskId, "user", item.text, {
           attachments: item.attachments,
@@ -540,8 +597,14 @@ export class Runtime {
     // Tasks run right away, including several chats in the same folder.
     const task = this.updateTask(taskId, { status: "running" });
     this.runStarts.set(taskId, Date.now());
+    this.resetGuard(taskId);
     void this.run(task, { text, attachments }).catch((e) => {
-      if (this.disposed) return;
+      // Stopped and deleted meanwhile: nothing left to report on.
+      if (
+        this.disposed ||
+        !this.store.all<Task>("task").some((t) => t.id === taskId)
+      )
+        return;
       const status = this.task(taskId).status;
       if (status === "running" || status === "waiting") {
         this.entry(taskId, "error", e.message);
@@ -565,6 +628,12 @@ export class Runtime {
     if (task.contextPending) {
       text = this.missedContext(task) + text;
       this.updateTask(task.id, { contextPending: false });
+    }
+    // The agent learns why its last run was stopped, so it does not go back
+    // to the same attempt on its own.
+    if (task.guardNote) {
+      text = `[Codebit] Sua execução anterior foi interrompida automaticamente porque ${task.guardNote}. Não repita essa ação por conta própria; siga o que o usuário disser abaixo.\n\n${text}`;
+      this.updateTask(task.id, { guardNote: undefined });
     }
     await session.send(text, job.attachments);
     if (live) return;
@@ -593,8 +662,19 @@ export class Runtime {
         : task;
     const mcp = mcpFor(task.agent, this.store.settings().mcp, {
       codebit_images: this.bridgeConfig(task.id, "images"),
-      ...(task.subagents?.enabled
+      ...(subagentsFor(task, this.store.settings()).enabled
         ? { codebit_agents: this.bridgeConfig(task.id, "agents") }
+        : {}),
+      ...(task.projectId && this.social?.accounts(task.projectId).length
+        ? { codebit_social: this.bridgeConfig(task.id, "social") }
+        : {}),
+      // Every session of a project reaches its task board.
+      ...(task.projectId
+        ? {
+            codebit_tasks: this.bridgeConfig(task.id, "tasks", {
+              CODEBIT_TASK_ROLE: task.workItemId ? "board" : "chat",
+            }),
+          }
         : {}),
     });
     const session = this.createSession(installation, sessionTask, mcp, (e) =>
@@ -677,6 +757,10 @@ export class Runtime {
       );
       return;
     }
+    if (event.type === "plan") {
+      void this.savePlan(taskId, event.text, event.path);
+      return;
+    }
     if (event.type === "background") {
       this.updateTask(taskId, { background: event.count || undefined });
       if (!event.count && this.parked.has(taskId)) this.closeWhenQuiet(taskId);
@@ -713,8 +797,18 @@ export class Runtime {
         }, 60);
     } else if (event.type === "activity") {
       this.assistantIds.delete(taskId);
-      this.entry(taskId, "activity", event.text);
+      const row = this.entry(taskId, "activity", event.text);
+      this.trackCall(taskId, event.id, row.id);
       this.trackEdits(taskId, event.files);
+      this.stopIfStuck(
+        taskId,
+        this.guards
+          .get(taskId)
+          ?.action(event.key ?? event.text, event.text, !!event.files?.length),
+      );
+    } else if (event.type === "outcome") {
+      this.settleCall(taskId, event.id, event.ok);
+      this.stopIfStuck(taskId, this.guards.get(taskId)?.outcome(event.ok));
     } else if (event.type === "request") {
       this.entry(taskId, "request", event.request.title, {
         request: event.request,
@@ -725,9 +819,37 @@ export class Runtime {
       this.entry(taskId, "error", event.text);
       this.finish(taskId, "failed");
     } else if (event.type === "done") {
-      if (this.task(taskId).background) this.park(taskId);
+      // Codex and Devin answer plan mode in the chat: that answer is the
+      // plan. Claude hands its plan over with ExitPlanMode instead.
+      const t = this.task(taskId);
+      const reply = this.assistantIds.get(taskId);
+      if (t.mode === "plan" && t.agent !== "claude" && reply) {
+        const text = this.store.get<Entry>("entry", reply).text;
+        if (text.trim()) void this.savePlan(taskId, text);
+      }
+      if (t.background) this.park(taskId);
       else this.finish(taskId, "idle");
     }
+  }
+  // The plan becomes a .md document shown in the side panel. Claude writes
+  // its own file; other agents' plans are saved in Codebit's data folder.
+  private async savePlan(taskId: string, text: string, path?: string) {
+    let file = path && existsSync(path) ? path : "";
+    if (!file) {
+      file = join(this.store.root, "plans", `${taskId}.md`);
+      await mkdir(join(this.store.root, "plans"), { recursive: true });
+      await writeFile(file, text);
+    }
+    if (this.disposed) return;
+    this.updateTask(taskId, {
+      plan: {
+        text,
+        path: file,
+        agent: this.task(taskId).agent,
+        at: new Date().toISOString(),
+      },
+    });
+    this.emit({ type: "plan", taskId });
   }
   // Two chats conflict when both change a file while their runs overlap:
   // the other one changed it during this run, or during its own run that is
@@ -758,14 +880,53 @@ export class Runtime {
         taskId,
         "warning",
         `A conversa “${other.title}” também alterou ${name} nesta pasta. Revise as mudanças antes de continuar.`,
+        { title: "Conflito com outra conversa" },
       );
       this.entry(
         other.id,
         "warning",
         `A conversa “${t.title}” também alterou ${name}, que esta conversa mudou. Revise as mudanças antes de continuar.`,
+        { title: "Conflito com outra conversa" },
       );
       this.notify(taskId, `Conflito: “${other.title}” também alterou ${name}.`);
     }
+  }
+  private newGuard() {
+    const limits = this.store.settings().loopGuard ?? defaultLoopGuard;
+    return limits.enabled ? new LoopGuard(limits) : undefined;
+  }
+  private resetGuard(taskId: string) {
+    const guard = this.newGuard();
+    if (guard) this.guards.set(taskId, guard);
+    else this.guards.delete(taskId);
+  }
+  // The agent keeps trying something that does not work: stop the run and
+  // hand the decision to the user.
+  private stopIfStuck(taskId: string, reason?: string) {
+    if (!reason || !this.guards.delete(taskId)) return;
+    const t = this.updateTask(taskId, { guardNote: reason });
+    this.entry(
+      taskId,
+      "warning",
+      `Parei o ${agentNames[t.agent]}: ${reason}. Ele não vai tentar de novo por conta própria. Veja o que aconteceu e diga como prefere seguir.`,
+      { title: "Ação interrompida pelo Codebit" },
+    );
+    this.notify(taskId, "Parei o agente: uma ação se repetia sem sucesso.");
+    void this.interrupt(taskId);
+  }
+  private stopStuckQuick(id: string, reason: string) {
+    const q = this.quick.get(id);
+    if (!q?.session) return;
+    this.attention({
+      title: q.run.name,
+      body: "Parei o prompt: uma ação se repetia sem sucesso.",
+    });
+    void q.session.interrupt().catch(() => {});
+    this.endQuick(
+      id,
+      "interrupted",
+      `O Codebit parou o prompt porque ${reason}.`,
+    );
   }
   private notify(taskId: string, body: string) {
     this.attention({ title: this.task(taskId).title, body, taskId });
@@ -790,6 +951,16 @@ export class Runtime {
     const entry = this.store.get<Entry>("entry", entryId);
     if (entry.taskId !== taskId || entry.resolved || !entry.request)
       throw new Error("Solicitação inválida.");
+    // A post waiting for approval: the answer goes back to the tool call.
+    const social = this.socialRequests.get(entry.request.id);
+    if (social) {
+      this.socialRequests.delete(entry.request.id);
+      entry.resolved = true;
+      this.store.put("entry", entry);
+      this.updateTask(taskId, { status: "running" });
+      social.resolve(value?.decision === "accept");
+      return;
+    }
     const sub = this.subRequests.get(entry.request.id);
     const session = sub?.session ?? this.sessions.get(taskId);
     if (!session || !this.sessions.has(taskId))
@@ -799,6 +970,14 @@ export class Runtime {
     entry.resolved = true;
     this.store.put("entry", entry);
     this.updateTask(taskId, { status: "running" });
+    // An approved plan is carried out in the mode new tasks use, so the chat
+    // and the next messages stop saying "Planejar".
+    if (entry.request.plan && value.decision === "accept") {
+      const preferred = this.store.settings().defaultMode ?? "bypass";
+      const mode = preferred === "plan" ? "execute" : preferred;
+      this.updateTask(taskId, { mode });
+      void session.setMode?.(mode).catch(() => {});
+    }
   }
   private finish(id: string, status: Task["status"]) {
     const session = this.sessions.get(id);
@@ -809,18 +988,83 @@ export class Runtime {
     this.subagents.delete(id);
     this.slots.delete(id);
     this.assistantIds.delete(id);
+    this.calls.delete(id);
     this.revokeBridge(id);
+    for (const [key, pending] of this.socialRequests)
+      if (pending.taskId === id) {
+        this.socialRequests.delete(key);
+        pending.resolve(false);
+      }
     for (const e of this.store.entries(id))
       if (e.kind === "request" && !e.resolved)
         this.store.put("entry", { ...e, resolved: true });
     this.updateTask(id, { status, background: undefined });
     // After a failure or interruption the queue waits for the user.
     if (status === "idle") this.sendNext(id);
+    const board = this.task(id).workItemId ? this.task(id) : undefined;
     // A queued message that went out keeps the task working: no notice yet.
-    if (status === "failed") this.notify(id, "A execução falhou.");
+    if (status === "failed")
+      this.notify(
+        id,
+        board
+          ? `A tarefa do quadro falhou: ${board.title}`
+          : "A execução falhou.",
+      );
     if (status === "idle" && this.task(id).status === "idle")
-      this.notify(id, `${agentNames[this.task(id).agent]} terminou.`);
+      this.notify(
+        id,
+        board
+          ? `Tarefa do quadro concluída: ${board.title}`
+          : `${agentNames[this.task(id).agent]} terminou.`,
+      );
+    if (board) this.workFinished(board.projectId, status);
     void this.checkVersions().catch(() => {});
+  }
+  // Removes a task with what Codebit keeps for it: history, images,
+  // attachment copies and its saved plan. The project folder is never
+  // touched; the task's own folder or worktree only when asked.
+  async deleteTask(id: string, removeFolder = false) {
+    const task = this.task(id);
+    if (
+      ["running", "waiting", "queued"].includes(task.status) ||
+      task.background ||
+      this.sessions.has(id)
+    )
+      throw new Error("Interrompa a tarefa antes de excluí-la.");
+    const root = this.store.root;
+    const paths = [
+      join(root, "attachments", id),
+      join(root, "artifacts", id),
+      join(root, "plans", `${id}.md`),
+    ];
+    if (removeFolder && task.worktree) {
+      const project = this.store
+        .all<Project>("project")
+        .find((p) => p.id === task.projectId);
+      if (project) await removeWorktree(project.path, task.cwd);
+    } else if (
+      removeFolder &&
+      !task.projectId &&
+      resolve(task.cwd) === join(root, "scratch", id)
+    )
+      paths.push(task.cwd);
+    this.images.cancel(id);
+    // A board task goes with its internal session.
+    if (task.workItemId) this.store.delete("work", task.workItemId);
+    for (const e of this.store.entries(id)) this.store.delete("entry", e.id);
+    for (const a of this.store.artifacts(id))
+      this.store.delete("artifact", a.id);
+    this.store.delete("task", id);
+    this.guards.delete(id);
+    this.calls.delete(id);
+    this.assistantIds.delete(id);
+    this.revokeBridge(id);
+    await Promise.all(
+      paths.map((p) =>
+        rm(p, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
+      ),
+    );
+    this.refresh();
   }
   async interrupt(id: string) {
     const s = this.sessions.get(id);
@@ -890,6 +1134,516 @@ export class Runtime {
     this.store.put("artifact", artifact);
     this.entry(taskId, "image", prompt, { artifactId: artifact.id });
     return artifact;
+  }
+  // The project's task board.
+  workItems(projectId: string) {
+    return this.store
+      .all<WorkItem>("work")
+      .filter((i) => i.projectId === projectId)
+      .sort((a, b) => a.order - b.order);
+  }
+  private workItem(id: string) {
+    return this.store.get<WorkItem>("work", id);
+  }
+  private saveWork(item: WorkItem) {
+    this.store.put("work", { ...item, updatedAt: new Date().toISOString() });
+    this.refresh();
+  }
+  private busyTask(taskId?: string) {
+    if (!taskId) return false;
+    try {
+      const t = this.task(taskId);
+      return (
+        ["running", "waiting", "queued"].includes(t.status) || !!t.background
+      );
+    } catch {
+      return false;
+    }
+  }
+  private nextOrder(projectId: string, first = false) {
+    const orders = this.workItems(projectId).map((i) => i.order);
+    return first ? Math.min(0, ...orders) - 1 : Math.max(0, ...orders) + 1;
+  }
+  // The user's tasks wait to start; the AI's wait for approval.
+  addWork(
+    projectId: string,
+    input: { title: string; description?: string },
+    meta: {
+      origin?: "user" | "ai";
+      sourceId?: string;
+      chatId?: string;
+    } = {},
+  ) {
+    const origin = meta.origin ?? "user";
+    const project = this.store.get<Project>("project", projectId);
+    const title = input.title.trim();
+    if (!title) throw new Error("Dê um título à tarefa.");
+    const now = new Date().toISOString();
+    const item: WorkItem = {
+      id: randomUUID(),
+      projectId: project.id,
+      title: title.slice(0, 200),
+      description: (input.description ?? "").trim().slice(0, 20000),
+      origin,
+      state: origin === "ai" ? "pending" : "todo",
+      order: this.nextOrder(project.id),
+      sourceId: meta.sourceId,
+      chatId: meta.chatId,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.store.put("work", item);
+    this.refresh();
+    if (item.state === "todo") void this.dispatchWork(project.id);
+    return item;
+  }
+  editWork(id: string, patch: { title?: string; description?: string }) {
+    const item = this.workItem(id);
+    const title = patch.title?.trim();
+    if (patch.title !== undefined && !title)
+      throw new Error("Dê um título à tarefa.");
+    this.saveWork({
+      ...item,
+      title: title?.slice(0, 200) ?? item.title,
+      description:
+        patch.description?.trim().slice(0, 20000) ?? item.description,
+    });
+    return this.workItem(id);
+  }
+  approveWork(id: string) {
+    const item = this.workItem(id);
+    if (item.state !== "pending") return item;
+    this.saveWork({
+      ...item,
+      state: "todo",
+      order: this.nextOrder(item.projectId),
+      approvedAt: new Date().toISOString(),
+    });
+    void this.dispatchWork(item.projectId);
+    return this.workItem(id);
+  }
+  // Moves a waiting task up or down the line.
+  moveWork(id: string, direction: -1 | 1) {
+    const item = this.workItem(id);
+    const line = this.workItems(item.projectId).filter(
+      (i) => i.state === item.state,
+    );
+    const at = line.findIndex((i) => i.id === id);
+    const other = line[at + direction];
+    if (!other) return;
+    this.store.put("work", { ...item, order: other.order });
+    this.saveWork({ ...other, order: item.order });
+  }
+  async deleteWork(id: string) {
+    const item = this.workItem(id);
+    if (this.busyTask(item.taskId))
+      throw new Error("Interrompa a tarefa antes de excluí-la.");
+    if (
+      item.taskId &&
+      this.store.all<Task>("task").some((t) => t.id === item.taskId)
+    )
+      await this.deleteTask(item.taskId);
+    this.store.delete("work", id);
+    this.refresh();
+  }
+  // Back to the front of the line; it resumes in the same session.
+  retryWork(id: string) {
+    const item = this.workItem(id);
+    if (this.busyTask(item.taskId))
+      throw new Error("Esta tarefa já está em andamento.");
+    this.saveWork({
+      ...item,
+      state: "todo",
+      order: this.nextOrder(item.projectId, true),
+    });
+    void this.dispatchWork(item.projectId);
+    return this.workItem(id);
+  }
+  // Changes only the given settings, so quick successive changes add up.
+  setWork(projectId: string, patch: Partial<WorkSettings>) {
+    const project = this.store.get<Project>("project", projectId);
+    const work = { ...(project.work ?? defaultWork), ...patch };
+    if (work.enabled && !project.trusted)
+      throw new Error("Confie no projeto antes de ligar o modo tarefas.");
+    const settings: WorkSettings = {
+      ...work,
+      max: Math.min(4, Math.max(1, Math.round(work.max) || 1)),
+    };
+    this.store.put("project", { ...project, work: settings });
+    if (settings.enabled && !project.work?.enabled)
+      this.workFailures.delete(projectId);
+    this.refresh();
+    if (settings.enabled) void this.dispatchWork(projectId);
+    return settings;
+  }
+  // Starts a task now, even with the mode off.
+  startWork(id: string) {
+    const item = this.workItem(id);
+    return this.chain(item.projectId, () => this.launchWork(id));
+  }
+  dispatchAll() {
+    for (const p of this.store.all<Project>("project"))
+      if (p.work?.enabled) void this.dispatchWork(p.id);
+  }
+  // With the mode on, fills the free places with the next tasks in line.
+  dispatchWork(projectId: string) {
+    return this.chain(projectId, async () => {
+      const project = this.store
+        .all<Project>("project")
+        .find((p) => p.id === projectId);
+      const work = project?.work;
+      if (this.disposed || !project?.trusted || !work?.enabled) return;
+      const items = this.workItems(projectId);
+      let free = work.max - items.filter((i) => this.busyTask(i.taskId)).length;
+      for (const item of items.filter((i) => i.state === "todo")) {
+        if (free-- <= 0) break;
+        await this.launchWork(item.id);
+      }
+    });
+  }
+  private chain<T>(projectId: string, work: () => Promise<T>): Promise<T> {
+    const next = (this.dispatching.get(projectId) ?? Promise.resolve()).then(
+      work,
+      work,
+    );
+    this.dispatching.set(
+      projectId,
+      next.catch(() => {}),
+    );
+    return next;
+  }
+  private async launchWork(id: string) {
+    const item = this.workItem(id);
+    if (item.state === "pending")
+      throw new Error("Aprove a recomendação antes de executá-la.");
+    if (this.busyTask(item.taskId))
+      throw new Error("Esta tarefa já está em andamento.");
+    const project = this.store.get<Project>("project", item.projectId);
+    if (!project.trusted)
+      throw new Error("Confie no projeto antes de executar tarefas nele.");
+    const work = project.work ?? defaultWork;
+    const existing = this.store
+      .all<Task>("task")
+      .find((t) => t.id === item.taskId);
+    let task = existing;
+    if (!task) {
+      task = await this.createTask({
+        projectId: project.id,
+        title: item.title,
+        agent: work.agent,
+        workItemId: item.id,
+      });
+      const settings = { model: work.model || task.model, mode: work.mode };
+      try {
+        task = this.updateTask(task.id, { ...settings, effort: work.effort });
+      } catch {
+        task = this.updateTask(task.id, settings);
+      }
+    }
+    this.saveWork({ ...item, state: "started", taskId: task.id });
+    const text = existing
+      ? "Retome esta tarefa do quadro de onde parou. Se ela já estiver concluída, confirme com um resumo curto do que foi feito."
+      : [
+          `Tarefa do quadro do projeto ${project.name}: ${item.title}`,
+          item.description,
+          "Trabalhe nesta tarefa até concluí-la. Ao terminar, responda com um resumo curto do que foi feito e de como conferir.",
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+    try {
+      await this.send(task.id, text);
+    } catch (e) {
+      // The reason stays in the session; the mode stops so the next tasks
+      // do not fail the same way.
+      this.entry(task.id, "error", (e as Error).message);
+      this.updateTask(task.id, { status: "failed" });
+      this.pauseWork(
+        project.id,
+        `não foi possível iniciar "${item.title}": ${(e as Error).message}`,
+      );
+      throw e;
+    }
+  }
+  private workFinished(projectId: string, status: Task["status"]) {
+    const failures =
+      status === "failed" ? (this.workFailures.get(projectId) ?? 0) + 1 : 0;
+    this.workFailures.set(projectId, failures);
+    if (failures >= 2)
+      this.pauseWork(projectId, "duas tarefas seguidas falharam");
+    else void this.dispatchWork(projectId);
+  }
+  private pauseWork(projectId: string, reason: string) {
+    const project = this.store.get<Project>("project", projectId);
+    if (!project.work?.enabled) return;
+    this.store.put("project", {
+      ...project,
+      work: { ...project.work, enabled: false },
+    });
+    this.workFailures.delete(projectId);
+    this.refresh();
+    this.attention?.({
+      title: "Modo tarefas pausado",
+      body: `${project.name}: ${reason}. Confira e ligue de novo no quadro.`,
+    });
+  }
+  // codebit_tasks, the channel from a project's sessions to its board. What
+  // the user asked for goes to "todo"; the agent's own ideas wait for
+  // approval, like the follow-ups of board sessions.
+  tasksTool(
+    taskId: string,
+    call: {
+      tool: string;
+      args?: {
+        tasks?: { title: string; description?: string }[];
+        requested_by_user?: boolean;
+      };
+    },
+  ) {
+    const task = this.task(taskId);
+    if (!task.projectId)
+      throw new Error(
+        "Esta conversa não tem projeto; o quadro de tarefas é de cada projeto.",
+      );
+    const reply = (text: string) => ({ content: [{ type: "text", text }] });
+    const items = this.workItems(task.projectId);
+    if (call.tool === "list_tasks") {
+      const tasks = new Map(this.store.all<Task>("task").map((t) => [t.id, t]));
+      return reply(
+        JSON.stringify(
+          items.slice(-100).map((i) => ({
+            title: i.title,
+            status: workStatus(i, i.taskId ? tasks.get(i.taskId) : undefined),
+            origin: i.origin,
+            description: i.description.slice(0, 300),
+          })),
+        ),
+      );
+    }
+    const list = call.args?.tasks ?? [];
+    const requested = call.args?.requested_by_user === true;
+    const pending = items.filter((i) => i.state === "pending").length;
+    if (!requested && pending + list.length > 50)
+      throw new Error(
+        "Já há muitas sugestões esperando aprovação neste projeto. Não sugira mais agora.",
+      );
+    const created = list.map((t) =>
+      this.addWork(task.projectId, t, {
+        origin: requested ? "user" : "ai",
+        sourceId: task.workItemId,
+        chatId: task.workItemId ? undefined : task.id,
+      }),
+    );
+    const titles = created.map((c) => c.title).join("; ");
+    const count =
+      created.length === 1 ? "1 tarefa" : `${created.length} tarefas`;
+    this.entry(
+      taskId,
+      "activity",
+      requested
+        ? `Quadro · ${count} em A fazer: ${titles}`
+        : `Quadro · ${count} ${created.length === 1 ? "sugerida, pendente" : "sugeridas, pendentes"} de aprovação: ${titles}`,
+    );
+    return reply(
+      requested
+        ? `Adicionadas ao quadro, em "A fazer": ${titles}.${this.store.get<Project>("project", task.projectId).work?.enabled ? " O modo tarefas está ligado: agentes vão começar nelas pela fila." : " O modo tarefas está desligado: elas esperam até o usuário ligar ou executar."} Não trabalhe nelas nesta conversa.`
+        : `Registradas como sugestões, pendentes de aprovação do usuário: ${titles}. Não trabalhe nelas agora.`,
+    );
+  }
+  // The codebit_social tools. Every post shows its exact preview in the chat
+  // and waits for the user, even in Bypass.
+  async socialTool(taskId: string, call: { tool: string; args: any }) {
+    const task = this.task(taskId);
+    const accounts =
+      task.projectId && this.social ? this.social.accounts(task.projectId) : [];
+    const reply = (value: unknown) => ({
+      content: [
+        {
+          type: "text",
+          text: typeof value === "string" ? value : JSON.stringify(value),
+        },
+      ],
+    });
+    if (call.tool === "social_accounts")
+      return reply(
+        accounts.map((a) => ({
+          network: a.network,
+          account: a.name,
+          type: a.accountType,
+          accessUntil: a.expiresAt,
+          problem: a.error,
+        })),
+      );
+    if (!this.social || !accounts.length)
+      throw new Error(
+        "Este projeto não tem redes sociais conectadas. Conecte em Configurações → Redes sociais.",
+      );
+    if (task.mode === "plan")
+      throw new Error("Publicar está desabilitado no modo Planejar.");
+    const args = call.args ?? {};
+    const network = call.tool === "patreon_publish" ? "patreon" : "instagram";
+    const account = this.social.account(task.projectId, network);
+    if (!account)
+      throw new Error(
+        `Conecte uma conta do ${socialNetworkNames[network]} a este projeto em Configurações → Redes sociais.`,
+      );
+    const images = await this.socialImages(
+      task,
+      args.images ?? [],
+      network === "instagram" ? ["png", "jpg", "jpeg"] : undefined,
+    );
+    const postId = randomUUID();
+    if (network === "instagram") {
+      const kind = args.kind === "story" ? "story" : "feed";
+      const caption = String(args.caption ?? "");
+      if (
+        !images.length ||
+        images.length > 10 ||
+        (kind === "story" && images.length > 1)
+      )
+        throw new Error(
+          kind === "story"
+            ? "Um story leva exatamente uma imagem."
+            : "Um post do Instagram leva de 1 a 10 imagens.",
+        );
+      if (caption.length > 2200)
+        throw new Error("A legenda passa de 2.200 caracteres.");
+      const prepared = await this.social.prepareInstagram(postId, images, kind);
+      const accepted = await this.askToPublish(taskId, {
+        network,
+        account: account.name,
+        images: prepared,
+        text: kind === "story" ? "" : caption,
+        kind:
+          kind === "story" ? "Story" : images.length > 1 ? "Carrossel" : "Feed",
+      });
+      if (!accepted)
+        return reply(
+          "O usuário recusou a publicação. Não publique de outra forma; pergunte o que ele quer ajustar.",
+        );
+      this.entry(
+        taskId,
+        "activity",
+        `Instagram · publicando em ${account.name}…`,
+      );
+      const result = await this.social.publishInstagram(account, {
+        images: prepared,
+        caption,
+        kind,
+        altText: args.alt_text ? String(args.alt_text) : undefined,
+        aiGenerated: args.ai_generated === true,
+      });
+      this.social.record({
+        id: postId,
+        projectId: task.projectId,
+        taskId,
+        network,
+        accountId: account.id,
+        url: result.url,
+        mediaId: result.mediaId,
+        text: caption,
+        images: prepared,
+      });
+      this.entry(
+        taskId,
+        "activity",
+        `Instagram · publicado · ${result.url ?? result.mediaId}`,
+      );
+      return reply({
+        published: true,
+        url: result.url,
+        mediaId: result.mediaId,
+      });
+    }
+    const title = String(args.title ?? "").trim();
+    const text = String(args.text ?? "").trim();
+    const audience = String(args.audience ?? "").trim();
+    if (!title || !text || !audience)
+      throw new Error(
+        "Informe title, text e audience (public, members, paid ou o nome exato de um nível).",
+      );
+    const audienceName =
+      {
+        public: "Público",
+        members: "Todos os membros",
+        paid: "Só membros pagantes",
+      }[audience.toLowerCase()] ?? audience;
+    const accepted = await this.askToPublish(taskId, {
+      network,
+      account: account.name,
+      images,
+      title,
+      text,
+      audience: audienceName,
+    });
+    if (!accepted)
+      return reply(
+        "O usuário recusou a publicação. Não publique de outra forma; pergunte o que ele quer ajustar.",
+      );
+    this.entry(
+      taskId,
+      "activity",
+      `Patreon · preenchendo o editor em ${account.name}…`,
+    );
+    const result = await this.social.publishPatreon(account, {
+      title,
+      text,
+      images,
+      audience,
+    });
+    this.social.record({
+      id: postId,
+      projectId: task.projectId,
+      taskId,
+      network,
+      accountId: account.id,
+      url: result.url,
+      title,
+      text,
+      images,
+    });
+    this.entry(taskId, "activity", `Patreon · publicado · ${result.url}`);
+    return reply({ published: true, url: result.url });
+  }
+  // Images by Codebit image id or by path, absolute or from the task folder.
+  private async socialImages(task: Task, items: unknown[], types?: string[]) {
+    if (!Array.isArray(items) || items.length > 10)
+      throw new Error("Envie no máximo 10 imagens.");
+    const artifacts = this.store.artifacts(task.id);
+    return Promise.all(
+      items.map(async (item) => {
+        const ref = String(item);
+        const path =
+          artifacts.find((a) => a.id === ref)?.path ?? resolve(task.cwd, ref);
+        const ext = path.split(".").pop()?.toLowerCase() ?? "";
+        const allowed = types ?? ["png", "jpg", "jpeg", "gif", "webp"];
+        if (!allowed.includes(ext))
+          throw new Error(
+            `Formato não aceito (${ref}). Use ${allowed.join(", ").toUpperCase()}.`,
+          );
+        if (!(await stat(path).catch(() => null))?.isFile())
+          throw new Error(`Imagem não encontrada: ${ref}`);
+        return path;
+      }),
+    );
+  }
+  private askToPublish(taskId: string, preview: SocialPreview) {
+    const id = "social-" + randomUUID();
+    const title = `Publicar no ${socialNetworkNames[preview.network]}`;
+    this.entry(taskId, "request", title, {
+      request: {
+        id,
+        kind: "approval",
+        title,
+        detail: "",
+        choices: ["decline", "accept"],
+        social: preview,
+      },
+    });
+    this.updateTask(taskId, { status: "waiting" });
+    this.notify(taskId, `Aguardando você: ${title}`);
+    return new Promise<boolean>((resolve) =>
+      this.socialRequests.set(id, { taskId, resolve }),
+    );
   }
   async imageTool(
     taskId: string,
@@ -1010,8 +1764,8 @@ export class Runtime {
     args: { tasks: { title?: string; prompt: string }[] },
   ) {
     const parent = this.task(taskId);
-    const options = parent.subagents;
-    if (!options?.enabled)
+    const options = subagentsFor(parent, this.store.settings());
+    if (!options.enabled)
       throw new Error("Os sub-agentes estão desligados nesta tarefa.");
     const installation = this.agents.find(
       (a) => a.id === options.agent,
@@ -1101,11 +1855,35 @@ export class Runtime {
       };
       const cancel = () => done(new Error("A tarefa principal foi encerrada."));
       running.add(cancel);
+      // A stuck sub-agent is stopped and the main agent is told to ask the
+      // user instead of trying again.
+      const guard = this.newGuard();
+      const stuck = (reason?: string) => {
+        if (!reason || !running.has(cancel)) return;
+        this.entry(parent.id, "warning", `${label}: ${reason}.`, {
+          title: "Sub-agente interrompido pelo Codebit",
+        });
+        this.notify(
+          parent.id,
+          `Parei ${label}: uma ação se repetia sem sucesso.`,
+        );
+        void session.interrupt().catch(() => {});
+        done(
+          new Error(
+            `O Codebit interrompeu este sub-agente porque ${reason}. Não tente de novo nem crie outro sub-agente para a mesma ação: pare e explique o problema ao usuário.`,
+          ),
+        );
+      };
       const session = this.createSession(installation, task, {}, (e) => {
         if (e.type === "text") text += e.text;
         else if (e.type === "activity") {
-          this.entry(parent.id, "activity", `${label} · ${e.text}`);
+          const row = this.entry(parent.id, "activity", `${label} · ${e.text}`);
+          this.trackCall(parent.id, e.id && `${label}#${e.id}`, row.id);
           this.trackEdits(parent.id, e.files);
+          stuck(guard?.action(e.key ?? e.text, e.text, !!e.files?.length));
+        } else if (e.type === "outcome") {
+          this.settleCall(parent.id, e.id && `${label}#${e.id}`, e.ok);
+          stuck(guard?.outcome(e.ok));
         } else if (e.type === "request") {
           const id = "sub-" + randomUUID();
           this.subRequests.set(id, { session, id: e.request.id });
@@ -1211,7 +1989,10 @@ export class Runtime {
       updatedAt: now,
       images: { ...defaultImages },
     };
-    const q: { run: QuickRun; session?: AgentSession } = { run };
+    const q: { run: QuickRun; session?: AgentSession; guard?: LoopGuard } = {
+      run,
+      guard: this.newGuard(),
+    };
     this.quick.set(run.id, q);
     q.session = this.createSession(installation, task, mcp, (e) =>
       this.quickEvent(run.id, e),
@@ -1227,8 +2008,19 @@ export class Runtime {
     if (!q?.session || this.disposed) return;
     const run = q.run;
     if (e.type === "text") run.reply += e.text;
-    else if (e.type === "activity") run.activity.push(e.text);
-    else if (e.type === "native") run.nativeId = e.id;
+    else if (e.type === "activity") {
+      run.activity.push(e.text);
+      const reason = q.guard?.action(
+        e.key ?? e.text,
+        e.text,
+        !!e.files?.length,
+      );
+      if (reason) return this.stopStuckQuick(id, reason);
+    } else if (e.type === "outcome") {
+      const reason = q.guard?.outcome(e.ok);
+      if (reason) return this.stopStuckQuick(id, reason);
+      return;
+    } else if (e.type === "native") run.nativeId = e.id;
     else if (e.type === "quota") this.mergeQuota(run.agent, e.windows);
     else if (
       e.type === "request" &&

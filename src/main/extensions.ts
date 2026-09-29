@@ -68,11 +68,25 @@ export async function nativeMcp(cwd?: string) {
   }
   return rows;
 }
+// Agents that insist on something that does not work waste the plan and can
+// loop forever; Codebit also stops them (see guard.ts).
+export const stopWhenStuck =
+  " Se uma ação não der o resultado esperado depois de duas tentativas (por exemplo, um download que não chega ou um comando que falha do mesmo jeito), não insista nem repita: pare e explique o problema ao usuário para decidirem juntos.";
 export function codebitInstructions(mcp: Record<string, any>, guidelines = "") {
   return (
-    "Você está no Codebit. Responda em português do Brasil. Use o MCP codebit_images para gerar ou editar imagens; ele utiliza o provedor e modelo escolhidos na tarefa." +
+    "Você está no Codebit. Responda em português do Brasil." +
+    stopWhenStuck +
+    " Use o MCP codebit_images para gerar ou editar imagens; ele utiliza o provedor e modelo escolhidos na tarefa." +
     (mcp.codebit_agents
       ? " Para dividir trabalho, use run_subagents do MCP codebit_agents: cada item roda em um sub-agente separado, na mesma pasta. Dê a cada um uma parte independente e evite que editem os mesmos arquivos."
+      : "") +
+    (mcp.codebit_tasks?.env?.CODEBIT_TASK_ROLE === "board"
+      ? " Esta conversa trabalha numa tarefa do quadro do projeto. Ao terminar, se perceber trabalho de continuação que mereça outra tarefa (um bug encontrado, uma melhoria, uma pendência), use add_tasks do MCP codebit_tasks, com título e descrição completa de cada uma. Elas ficam pendentes da aprovação do usuário: não trabalhe nelas agora."
+      : mcp.codebit_tasks
+        ? " Este projeto tem um quadro de tarefas no Codebit, que o MCP codebit_tasks alcança. Quando o usuário pedir para criar tarefas, registrar pendências ou deixar trabalho para depois no quadro, use add_tasks com requested_by_user: true; elas vão para a fila. Ideias suas vão sem esse campo e ficam pendentes da aprovação dele. Use list_tasks para ver o quadro e não duplicar. Não execute nesta conversa o que foi para o quadro."
+        : "") +
+    (mcp.codebit_social
+      ? " Para publicar nas redes sociais deste projeto, use o MCP codebit_social (social_accounts, instagram_publish, patreon_publish). Cada publicação mostra a prévia exata e espera a aprovação do usuário; nunca publique por outro meio, como scripts, navegador ou APIs chamadas por você."
       : "") +
     guidelinesText(guidelines)
   );
@@ -98,8 +112,17 @@ export function mcpFor(
     (c) => c.enabled && (c.agent === agent || c.agent === "both"),
   )) {
     const name = "codebit_" + c.name.replace(/[^\w-]/g, "_");
-    if (["codebit_images", "codebit_agents"].includes(name))
-      throw new Error("Os nomes images e agents são reservados.");
+    if (
+      [
+        "codebit_images",
+        "codebit_agents",
+        "codebit_social",
+        "codebit_tasks",
+      ].includes(name)
+    )
+      throw new Error(
+        "Os nomes images, agents, social e tasks são reservados.",
+      );
     if (c.transport === "stdio")
       servers[name] = {
         command: c.command,

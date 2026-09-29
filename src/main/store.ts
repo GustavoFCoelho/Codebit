@@ -6,6 +6,7 @@ import type {
   Entry,
   Project,
   SavedPrompt,
+  WorkItem,
   Settings,
   Task,
 } from "../shared/types";
@@ -112,6 +113,7 @@ export class Store {
       prompts: this.all<SavedPrompt>("prompt").sort((a, b) =>
         a.name.localeCompare(b.name, "pt-BR"),
       ),
+      work: this.all<WorkItem>("work").sort((a, b) => a.order - b.order),
     };
   }
   close() {

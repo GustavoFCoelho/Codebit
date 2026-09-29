@@ -1,5 +1,5 @@
 // Shown in the UI and sent to the CLIs. Bump with package.json; a test checks both.
-export const appVersion = "0.2.5";
+export const appVersion = "0.2.7";
 export type AgentId = "codex" | "claude" | "devin";
 export const agentIds: AgentId[] = ["codex", "claude", "devin"];
 export const agentNames: Record<AgentId, string> = {
@@ -90,6 +90,66 @@ export interface Project {
   path: string;
   git: boolean;
   trusted: boolean;
+  // The project's task board: off by default.
+  work?: WorkSettings;
+}
+// Task board mode: when on, agents start on the board's tasks by themselves.
+export interface WorkSettings {
+  enabled: boolean;
+  agent: AgentId;
+  model: string;
+  effort: string;
+  mode: "execute" | "bypass";
+  // Tasks worked on at the same time, in the project folder.
+  max: number;
+}
+export const defaultWork: WorkSettings = {
+  enabled: false,
+  agent: "codex",
+  model: "",
+  effort: "",
+  mode: "bypass",
+  max: 1,
+};
+// A task on a project's board. The user's and the approved ones wait in
+// "todo"; the AI's recommendations stay "pending" until approved.
+export interface WorkItem {
+  id: string;
+  projectId: string;
+  title: string;
+  description: string;
+  origin: "user" | "ai";
+  state: "pending" | "todo" | "started";
+  // The internal session working on it, kept out of the sidebar.
+  taskId?: string;
+  // Position among the tasks waiting to start.
+  order: number;
+  // The board task whose session recommended this one.
+  sourceId?: string;
+  // The project conversation that added it through codebit_tasks.
+  chatId?: string;
+  createdAt: string;
+  updatedAt: string;
+  approvedAt?: string;
+}
+export type WorkStatus =
+  | "pending"
+  | "todo"
+  | "running"
+  | "waiting"
+  | "done"
+  | "failed"
+  | "interrupted";
+// Where a board task stands, from its session.
+export function workStatus(item: WorkItem, task?: Task): WorkStatus {
+  if (item.state !== "started") return item.state;
+  if (!task) return "interrupted";
+  if (task.status === "waiting") return "waiting";
+  if (["running", "queued"].includes(task.status) || task.background)
+    return "running";
+  if (task.status === "failed") return "failed";
+  if (task.status === "interrupted") return "interrupted";
+  return "done";
 }
 export interface ImageOptions {
   provider: ImageProviderId;
@@ -135,8 +195,15 @@ export interface Task {
   boardAt?: string;
   // Background commands and sub-agents of the open session, if any.
   background?: number;
-  subagents?: SubagentOptions;
+  // Why Codebit stopped the last run; told to the agent with the next message.
+  guardNote?: string;
+  // The latest plan proposed in plan mode, kept as a .md file.
+  plan?: { text: string; path: string; agent: AgentId; at: string };
+  // Own sub-agent options; null in an update returns to the default.
+  subagents?: SubagentOptions | null;
   parentId?: string;
+  // Internal session of a board task: not listed with the conversations.
+  workItemId?: string;
   archived: boolean;
   createdAt: string;
   updatedAt: string;
@@ -156,6 +223,57 @@ export interface RequestPrompt {
   choices?: string[];
   // The tool asking, when the CLI says (Claude: ExitPlanMode, Bash…).
   tool?: string;
+  // Approval to leave plan mode; the plan itself is in the side panel.
+  plan?: boolean;
+  // A social media post waiting for the user: exactly what goes out.
+  social?: SocialPreview;
+}
+export type SocialNetwork = "instagram" | "patreon";
+export const socialNetworkNames: Record<SocialNetwork, string> = {
+  instagram: "Instagram",
+  patreon: "Patreon",
+};
+// A social account connected to one project. Tokens live apart, encrypted.
+export interface SocialAccount {
+  id: string;
+  projectId: string;
+  network: SocialNetwork;
+  // @username on Instagram, the user name on Patreon.
+  name: string;
+  // Instagram: the professional account's id and type.
+  userId?: string;
+  accountType?: string;
+  // Instagram tokens last 60 days; Codebit renews them before that.
+  expiresAt?: string;
+  refreshedAt?: string;
+  createdAt: string;
+  // The last renewal or check that failed, shown in Settings.
+  error?: string;
+}
+export interface SocialPreview {
+  network: SocialNetwork;
+  account: string;
+  // Files exactly as they will be published (Instagram: converted JPEGs).
+  images: string[];
+  text: string;
+  title?: string;
+  // Instagram: feed or story. Patreon: who can see the post.
+  kind?: string;
+  audience?: string;
+}
+export interface SocialPost {
+  id: string;
+  projectId: string;
+  taskId?: string;
+  network: SocialNetwork;
+  accountId: string;
+  url?: string;
+  mediaId?: string;
+  text: string;
+  title?: string;
+  images: string[];
+  createdAt: string;
+  deletedAt?: string;
 }
 export interface Entry {
   id: string;
@@ -175,6 +293,10 @@ export interface Entry {
   attachments?: string[];
   resolved?: boolean;
   agent?: AgentId;
+  // Heading of a warning card (conflict when unset, as in older entries).
+  title?: string;
+  // Result of the tool call behind an activity row, once it is known.
+  ok?: boolean;
 }
 // A quick request kept in the sidebar and run apart from the conversations.
 export interface SavedPrompt {
@@ -255,6 +377,11 @@ export interface Settings {
   notifications?: boolean;
   // Mode of new tasks; Bypass when unset.
   defaultMode?: Task["mode"];
+  // Stops agents that keep repeating an action that is not working.
+  loopGuard?: LoopGuardSettings;
+  // Sub-agents of chats without their own; with syncSubagents, of every chat.
+  defaultSubagents?: SubagentOptions;
+  syncSubagents?: boolean;
   // Folder with new builds; the running portable's folder when unset.
   updateFolder?: string;
   hasOpenAIKey?: boolean;
@@ -268,6 +395,18 @@ export interface ImageModel extends Model {
   workflow?: string;
   kind?: "generate" | "edit";
 }
+export interface LoopGuardSettings {
+  enabled: boolean;
+  // The same action with no file edited in between.
+  repeats: number;
+  // Failed tool calls in a row.
+  failures: number;
+}
+export const defaultLoopGuard: LoopGuardSettings = {
+  enabled: true,
+  repeats: 4,
+  failures: 6,
+};
 // Self update from a folder of portable builds.
 export interface UpdateState {
   current: string;
@@ -277,18 +416,44 @@ export interface UpdateState {
   status: "idle" | "waiting" | "applying";
   error?: string;
 }
+// Running from the project folder instead of a packaged build.
+export interface SourceState {
+  root?: string;
+  building: boolean;
+  error?: string;
+  // Built since this window (interface) or process (core) loaded.
+  interface: boolean;
+  core: boolean;
+  builtAt?: string;
+  // The user asked to restart and something is still running.
+  waiting?: boolean;
+}
 export interface Snapshot {
   projects: Project[];
   tasks: Task[];
   prompts: SavedPrompt[];
+  work: WorkItem[];
   update?: UpdateState;
+  source?: SourceState;
   settings: Settings;
   agents: AgentInfo[];
 }
 export type AgentEvent =
   | { type: "text"; text: string }
-  // Files lists what an edit tool changed, to spot conflicting chats.
-  | { type: "activity"; text: string; files?: string[] }
+  // Files lists what an edit tool changed, to spot conflicting chats; key
+  // identifies the action with its full input, to spot an agent repeating it.
+  // id: the tool call, so its outcome marks the same row.
+  | {
+      type: "activity";
+      text: string;
+      files?: string[];
+      key?: string;
+      id?: string;
+    }
+  // Whether a tool call (command, edit, MCP tool) worked.
+  | { type: "outcome"; ok: boolean; id?: string }
+  // A plan proposed in plan mode (Claude's ExitPlanMode, a Codex plan item).
+  | { type: "plan"; text: string; path?: string }
   | { type: "request"; request: RequestPrompt }
   | { type: "native"; id: string }
   | { type: "usage"; used: number; size?: number }
@@ -308,6 +473,8 @@ export interface AgentSession {
   send(text: string, attachments: string[]): Promise<void>;
   // Adds a message to the response in progress, when the CLI supports it.
   steer?(text: string, attachments: string[]): Promise<void>;
+  // Changes the permission mode of the running session (after a plan).
+  setMode?(mode: Task["mode"]): Promise<void>;
   respond(id: string, value: any): void;
   interrupt(): Promise<void>;
   close(): void;
@@ -319,6 +486,8 @@ export type AppEvent =
   | { type: "image-progress"; taskId: string; message: string }
   // A notification was clicked: show this task.
   | { type: "open-task"; taskId: string }
+  // A task got a new plan: show it in the side panel.
+  | { type: "plan"; taskId: string }
   | { type: "quick"; run: QuickRun }
   | { type: "quick-removed"; id: string };
 export interface DesktopAPI {
@@ -332,6 +501,15 @@ export const defaultSubagents: SubagentOptions = {
   effort: "",
   max: 2,
 };
+// The sub-agents a chat uses: the default from Settings when it is applied to
+// every chat, otherwise the chat's own, falling back to that default.
+export function subagentsFor(
+  task: Pick<Task, "subagents">,
+  settings: Pick<Settings, "defaultSubagents" | "syncSubagents">,
+) {
+  const fallback = settings.defaultSubagents ?? defaultSubagents;
+  return settings.syncSubagents ? fallback : (task.subagents ?? fallback);
+}
 export const defaultImages: ImageOptions = {
   provider: "codex",
   model: "gpt-image",

@@ -16,7 +16,8 @@ import {
 import type { Project, QuickRun, SavedPrompt, Task } from "../shared/types";
 import { agentNames } from "../shared/types";
 import { api } from "./api";
-import { RequestCard } from "./parts";
+import { RequestCard, SectionLabel } from "./parts";
+import { MarkdownLink, markdownUrl } from "./mentions";
 // Saved prompts: quick requests in the sidebar, run apart from the chats.
 const modeNames: Record<Task["mode"], string> = {
   plan: "Só leitura",
@@ -34,12 +35,16 @@ const runStatus: Record<QuickRun["status"], string> = {
 export function PromptList({
   prompts,
   projectId,
+  open,
+  onToggle,
   onRun,
   onEdit,
   onNew,
 }: {
   prompts: SavedPrompt[];
   projectId: string;
+  open: boolean;
+  onToggle: () => void;
   onRun: (prompt: SavedPrompt) => void;
   onEdit: (prompt: SavedPrompt) => void;
   onNew: () => void;
@@ -49,8 +54,7 @@ export function PromptList({
   );
   return (
     <>
-      <div className="section-label">
-        <span>PROMPTS</span>
+      <SectionLabel label="PROMPTS" open={open} onToggle={onToggle}>
         <button
           className="icon"
           title="Novo prompt salvo"
@@ -59,8 +63,8 @@ export function PromptList({
         >
           <Plus size={15} />
         </button>
-      </div>
-      <div className="project prompts">
+      </SectionLabel>
+      <div className="project prompts" hidden={!open}>
         {visible.map((p) => (
           <div className="prompt-item" key={p.id}>
             <button
@@ -313,18 +317,18 @@ export const QuickPanel = memo(function QuickPanel({
           <div className="markdown">
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
+              urlTransform={markdownUrl}
               components={{
+                // Local files open with their default app, relative to the
+                // folder the prompt ran in.
                 a: ({ href, children }) => (
-                  <a
-                    href="#"
-                    onClick={(ev) => {
-                      ev.preventDefault();
-                      if (href)
-                        void run(() => api("external.open", { url: href }));
-                    }}
+                  <MarkdownLink
+                    href={href}
+                    base={{ cwd: current.cwd }}
+                    run={run}
                   >
                     {children}
-                  </a>
+                  </MarkdownLink>
                 ),
               }}
             >

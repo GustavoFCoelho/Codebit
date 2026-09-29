@@ -2,6 +2,7 @@ import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Channel } from "./agents/protocol";
+import { CodexImageReply, imageDiagnosticText } from "./codex-image-reply";
 import type {
   Artifact,
   ImageModel,
@@ -399,10 +400,26 @@ export class ImageService {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        reply.close();
         signal.removeEventListener("abort", cancel);
         channel.close();
-        if (error) reject(error);
-        else resolve(bytes!);
+        if (!error) return resolve(bytes!);
+        const detail = imageDiagnosticText(error.message);
+        const folder = join(this.root, "logs", "image-generations");
+        const path = join(folder, randomUUID() + ".json");
+        void mkdir(folder, { recursive: true })
+          .then(() =>
+            writeFile(path, JSON.stringify(reply.diagnostic(detail), null, 2)),
+          )
+          .then(
+            () => reject(new Error(`${detail}\nDiagnóstico: ${path}`)),
+            () =>
+              reject(
+                new Error(
+                  `${detail}\nNão foi possível salvar o diagnóstico local.`,
+                ),
+              ),
+          );
       };
       const cancel = () =>
         done(
@@ -411,9 +428,21 @@ export class ImageService {
           ),
         );
       const timer = setTimeout(
-        () => done(new Error("Tempo esgotado aguardando a imagem do Codex.")),
+        () =>
+          done(
+            new Error(
+              reply.failureMessage(
+                "Tempo esgotado aguardando a imagem do Codex.",
+              ),
+            ),
+          ),
         600000,
       );
+      const reply = new CodexImageReply({
+        success: (bytes) => done(undefined, bytes),
+        failure: (error) => done(error),
+        progress: (text) => this.progress(taskId, text),
+      });
       const channel = new Channel(
         installation,
         ["app-server", "--listen", "stdio://"],
@@ -431,38 +460,9 @@ export class ImageService {
             });
             return;
           }
-          if (p.item?.type === "imageGeneration") {
-            const item = p.item;
-            if (msg.method === "item/started")
-              this.progress(taskId, "Codex · gerando imagem…");
-            else if (msg.method === "item/completed") {
-              if (item.failure?.type === "usageLimitExceeded")
-                done(
-                  new Error(
-                    "Limite de geração de imagens do Codex atingido. Tente novamente mais tarde.",
-                  ),
-                );
-              else if (item.result)
-                done(undefined, Buffer.from(item.result, "base64"));
-              else if (item.savedPath)
-                readFile(item.savedPath).then(
-                  (bytes) => done(undefined, bytes),
-                  (e) => done(e),
-                );
-              else done(new Error("O Codex não retornou uma imagem."));
-            }
-          }
-          if (msg.method === "turn/completed")
-            done(
-              new Error(
-                p.turn?.error?.message ||
-                  "O Codex encerrou sem gerar uma imagem. Verifique se sua conta tem acesso à geração de imagens.",
-              ),
-            );
-          if (msg.method === "error" && !p.willRetry)
-            done(new Error(p.error?.message || "Falha no Codex."));
+          reply.receive(msg);
         },
-        (e) => done(e),
+        (e) => done(new Error(reply.failureMessage(e.message))),
       );
       signal.addEventListener("abort", cancel, { once: true });
       if (signal.aborted) return cancel();
@@ -475,6 +475,7 @@ export class ImageService {
           sandbox: "read-only",
           developerInstructions: codexImageInstructions,
         });
+        reply.setThread(thread.id);
         const [width, height] = options.size.split("x").map(Number);
         const shape =
           width === height
@@ -495,7 +496,13 @@ export class ImageService {
           },
         ];
         if (inputPath) input.push({ type: "localImage", path: inputPath });
-        await channel.request("turn/start", { threadId: thread.id, input });
+        // The turn only calls the image tool: low effort spends less of the
+        // plan than the default from config.toml (often xhigh).
+        await channel.request("turn/start", {
+          threadId: thread.id,
+          input,
+          effort: "low",
+        });
       })().catch((e) => done(e));
     });
   }

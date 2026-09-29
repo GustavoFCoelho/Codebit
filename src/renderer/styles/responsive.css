@@ -1,0 +1,51 @@
+/* Narrower windows; last, so it overrides the rules above. */
+@media (max-width: 1250px) {
+  .app-shell {
+    grid-template-columns: 216px minmax(0, 1fr);
+  }
+  .settings-page {
+    grid-template-columns: 170px minmax(0, 1fr);
+  }
+  .settings-content {
+    padding: 24px 22px;
+  }
+  .provider-card {
+    padding: 16px;
+  }
+  .provider-top {
+    gap: 11px;
+    flex-wrap: wrap;
+  }
+  .provider-actions {
+    flex-direction: row;
+    width: 100%;
+    padding-left: 63px;
+  }
+  .provider-status {
+    margin-top: 17px;
+  }
+  .title-actions > .quiet > span {
+    display: none;
+  }
+  .workspace {
+    grid-template-columns: minmax(370px, 1fr) minmax(280px, 33%);
+  }
+  .messages {
+    padding: 20px 18px;
+  }
+  .entry-request,
+  .entry-image,
+  .entry-error,
+  .entry-warning {
+    margin-left: 0;
+  }
+  .mode-toggle button {
+    padding: 0 7px;
+  }
+  .statusbar {
+    gap: 9px;
+  }
+  .settings-inspector {
+    padding: 16px;
+  }
+}

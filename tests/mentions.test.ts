@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import {
   isImagePath,
   linkedImage,
+  linkedPath,
   markdownUrl,
   remarkImagePaths,
   splitImagePaths,
@@ -40,6 +41,29 @@ describe("imagens mencionadas no chat", () => {
     expect(isImagePath("https://site.com/a.png")).toBe(false);
     expect(isImagePath("C:\\a\\b.PNG")).toBe(true);
     expect(linkedImage("https://site.com")).toBeUndefined();
+  });
+  it("links para arquivos locais: formatos dos agentes, sem âncora de linha", () => {
+    expect(
+      linkedPath(
+        "D:/Agents/ArmorSmithER/work/fitting_v004/flesh_rakshasa_fitting_v004.blend",
+      ),
+    ).toBe(
+      "D:/Agents/ArmorSmithER/work/fitting_v004/flesh_rakshasa_fitting_v004.blend",
+    );
+    expect(linkedPath("/D:/Git/Codebit/src/main/index.ts#L12")).toBe(
+      "D:/Git/Codebit/src/main/index.ts",
+    );
+    expect(linkedPath("docs/relatorios/pendencias.md:30")).toBe(
+      "docs/relatorios/pendencias.md",
+    );
+    expect(linkedPath("D:%5Cout%5Cnotas.md")).toBe("D:\\out\\notas.md");
+    expect(linkedPath("file:///D:/a%20b/c.md")).toBe("file:///D:/a b/c.md");
+    for (const web of ["https://x.com/a.md", "mailto:a@b.com", "#resumo"])
+      expect(linkedPath(web)).toBeUndefined();
+    expect(linkedImage("D:/Agents/threequarter.png")).toBe(
+      "D:/Agents/threequarter.png",
+    );
+    expect(linkedImage("D:/Agents/cena.blend")).toBeUndefined();
   });
   it("no markdown, texto, código e imagens locais viram links para o painel", () => {
     const html = renderToStaticMarkup(

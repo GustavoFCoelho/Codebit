@@ -1,4 +1,6 @@
+import type { ReactNode } from "react";
 import { defaultUrlTransform } from "react-markdown";
+import { api } from "./api";
 // Image files mentioned in the chat (C:\…, /…, ~/…, ./… or a bare name)
 // become links that open in the side panel.
 const imageMention =
@@ -33,13 +35,25 @@ const decode = (url: string) => {
     return url;
   }
 };
-// The local image a markdown link or image points to, if any. Markdown
-// encodes destinations, so C:\out arrives as C:%5Cout.
-export function linkedImage(url?: string) {
-  if (!url) return undefined;
+// The local file a markdown link points to: absolute (D:/…, /D:/…),
+// file://, ~/… or relative to the task folder, without line anchors such as
+// #L12 or :12. Markdown encodes destinations, so C:\out arrives as C:%5Cout.
+// Undefined for web addresses and in-page anchors.
+export function linkedPath(url?: string) {
+  if (!url || url.startsWith("#")) return undefined;
   if (url.startsWith(openScheme)) return decode(url.slice(openScheme.length));
-  const path = decode(url);
-  return isImagePath(path) ? path : undefined;
+  const path = decode(url).trim();
+  if (/^file:/i.test(path)) return path;
+  if (/^[a-z][\w+.-]*:/i.test(path) && !/^[A-Za-z]:[\\/]/.test(path))
+    return undefined;
+  return path
+    .replace(/^\/(?=[A-Za-z]:[\\/])/, "")
+    .replace(/(?:#L\d+(?:-L?\d+)?|:\d+(?::\d+)?)$/, "");
+}
+// The local image a markdown link or image points to, if any.
+export function linkedImage(url?: string) {
+  const path = linkedPath(url);
+  return path && isImagePath(path) ? path : undefined;
 }
 // Keeps local paths, which the default transform would drop as unsafe.
 export const markdownUrl = (url: string) =>
@@ -71,13 +85,57 @@ export function remarkImagePaths() {
   };
   return (tree: any) => walk(tree);
 }
+// Where relative paths start: a task's folder, or a saved prompt run's.
+export type PathBase = { id: string } | { cwd: string };
+// Right click on any link: open, show in folder, copy path or address.
+export const linkMenu = (base: PathBase, target: string, local: boolean) =>
+  api("link.menu", { ...base, target, local });
+// A markdown link: images open in the side panel, other local files with
+// their default app, web addresses in the browser.
+export function MarkdownLink({
+  href,
+  children,
+  base,
+  run,
+  onOpenImage,
+}: {
+  href?: string;
+  children?: ReactNode;
+  base: PathBase;
+  run: any;
+  onOpenImage?: (path: string) => void;
+}) {
+  const path = linkedPath(href);
+  const image = path && onOpenImage && isImagePath(path) ? path : undefined;
+  return (
+    <a
+      href="#"
+      className={path ? "file-link" : undefined}
+      title={image ? `${image} · abre no painel lateral` : (path ?? href)}
+      onClick={(e) => {
+        e.preventDefault();
+        if (image) onOpenImage!(image);
+        else if (path) void run(() => api("file.open", { ...base, path }));
+        else if (href) void run(() => api("external.open", { url: href }));
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        if (path || href) void run(() => linkMenu(base, path ?? href!, !!path));
+      }}
+    >
+      {children}
+    </a>
+  );
+}
 // Plain text (tool activity) with image paths as links.
 export function LinkedText({
   text,
   onOpen,
+  onMenu,
 }: {
   text: string;
   onOpen: (path: string) => void;
+  onMenu?: (path: string) => void;
 }) {
   return (
     <>
@@ -93,6 +151,10 @@ export function LinkedText({
             onClick={(e) => {
               e.preventDefault();
               onOpen(p.path);
+            }}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              onMenu?.(p.path);
             }}
           >
             {p.path}

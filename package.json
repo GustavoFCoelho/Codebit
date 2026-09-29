@@ -1,6 +1,6 @@
 {
   "name": "codebit",
-  "version": "0.2.5",
+  "version": "0.2.7",
   "private": true,
   "description": "Workspace desktop para Codex, Claude, Devin e geração de imagens",
   "author": "Codebit",
@@ -15,6 +15,8 @@
     "check": "tsc --noEmit",
     "format": "prettier --write src tests scripts *.ts *.json *.html",
     "smoke:native": "node scripts/smoke-native.mjs",
+    "icon": "electron scripts/icon.mjs",
+    "shortcut": "node scripts/shortcut.mjs",
     "package": "npm run build && electron-builder --win portable --publish never"
   },
   "build": {
@@ -33,7 +35,8 @@
     "npmRebuild": false,
     "win": {
       "target": "portable",
-      "signAndEditExecutable": false
+      "icon": "build/icon.ico",
+      "signExecutable": false
     },
     "portable": {
       "artifactName": "Codebit-${version}-Windows.exe"

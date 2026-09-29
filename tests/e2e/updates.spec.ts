@@ -46,6 +46,7 @@ test("atualização: avisa da versão nova e troca ao clicar", async () => {
   await page
     .getByRole("button", { name: "Configurações", exact: true })
     .click();
+  await page.getByRole("button", { name: "Aplicativo", exact: true }).click();
   await expect(page.locator(".settings-page")).toContainText("v9.9.9");
   await expect(page.locator(".update-folder")).toHaveText(releases);
   // Nothing is running, so the click starts the new build and quits.

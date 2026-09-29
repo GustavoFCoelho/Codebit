@@ -1,14 +1,18 @@
 import {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   ipcMain,
+  Menu,
   net,
   Notification,
   protocol,
   safeStorage,
   shell,
+  type MenuItemConstructorOptions,
 } from "electron";
+import { existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -23,13 +27,21 @@ import { files, fileContent, changes } from "./workspace";
 import { skills, nativeMcp } from "./extensions";
 import { validateWorkflow } from "./images";
 import { Updater, waitForExit } from "./updater";
+import { buildProject, SourceMode } from "./source";
+import { SocialService } from "./social";
+import { prepareInstagramImage } from "./jpeg";
+import { Patreon } from "./patreon";
+import { findCloudflared, hostFiles } from "./tunnel";
+import { capture } from "./process";
 import { appVersion } from "../shared/types";
 import type {
   Artifact,
   AppEvent,
   Project,
   Settings,
+  SocialPost,
   Task,
+  WorkItem,
 } from "../shared/types";
 protocol.registerSchemesAsPrivileged([
   {
@@ -49,6 +61,9 @@ let store: Store;
 let runtime: Runtime;
 let bridge: ImageBridge;
 let updater: Updater;
+let source: SourceMode | undefined;
+let social: SocialService;
+let patreon: Patreon;
 let shuttingDown = false;
 const terminals = new Map<string, import("node-pty").IPty>();
 // Shown notifications, kept so a click still reaches its handler.
@@ -70,6 +85,13 @@ const imageOptions = z.object({
     .min(0)
     .max(2 ** 32 - 1),
   inputImage: z.string().max(2000).optional(),
+});
+const subagentOptions = z.object({
+  enabled: z.boolean(),
+  agent,
+  model: z.string().max(200),
+  effort: z.string().max(50),
+  max: z.number().int().min(1).max(8),
 });
 const settingsSchema = z.object({
   cliPaths: z.object({
@@ -101,6 +123,15 @@ const settingsSchema = z.object({
   notifications: z.boolean().optional(),
   defaultMode: z.enum(["plan", "execute", "bypass"]).optional(),
   updateFolder: z.string().max(1000).optional(),
+  defaultSubagents: subagentOptions.optional(),
+  syncSubagents: z.boolean().optional(),
+  loopGuard: z
+    .object({
+      enabled: z.boolean(),
+      repeats: z.number().int().min(2).max(50),
+      failures: z.number().int().min(2).max(50),
+    })
+    .optional(),
 });
 function emit(event: AppEvent) {
   if (win && !win.isDestroyed()) win.webContents.send("codebit:event", event);
@@ -142,6 +173,7 @@ function snapshot() {
     ...store.snapshot(),
     agents: runtime.agents,
     update: updater?.state,
+    source: source && { ...source.state, root: source.root },
     settings: {
       ...store.settings(),
       hasOpenAIKey: !!(
@@ -150,18 +182,39 @@ function snapshot() {
     },
   };
 }
-// An image the chat mentions: absolute, file://, ~/… or relative to the task
-// folder. Only images are served, so chat text cannot expose other files.
-function mentionedImage(taskId: string, raw: string) {
+// A path the chat mentions: absolute, file://, ~/… or relative to the task
+// folder (or, for a saved prompt run, the folder it ran in).
+const pathBase = (args: any) =>
+  args.id
+    ? runtime.task(id.parse(args.id)).cwd
+    : z.string().min(1).max(1000).parse(args.cwd);
+function mentionedPath(base: string, raw: string) {
   const text = raw.trim();
-  const path = /^file:/i.test(text)
+  return /^file:/i.test(text)
     ? fileURLToPath(text)
     : /^~[\\/]/.test(text)
       ? join(homedir(), text.slice(2))
-      : resolve(runtime.task(taskId).cwd, text);
+      : resolve(base, text);
+}
+// Only images are served to the window, so chat text cannot expose files.
+function mentionedImage(taskId: string, raw: string) {
+  const path = mentionedPath(runtime.task(taskId).cwd, raw);
   if (!/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(path))
     throw new Error("Só imagens podem ser abertas por aqui.");
   return path;
+}
+// Opening these from a link an agent wrote would run a program: executables,
+// scripts, shortcuts, installers and Office files with macros.
+const runnable =
+  /\.(exe|com|bat|cmd|ps1|psm1|psd1|vbs|vbe|js|jse|wsf|wsh|py|pyw|pyz|rb|pl|sh|bash|msi|msp|msix|appx|appxbundle|scr|pif|lnk|url|website|hta|cpl|reg|jar|appref-ms|application|gadget|msc|inf|scf|chm|hlp|settingcontent-ms|library-ms|search-ms|theme|themepack|diagcab|docm|dotm|xlsm|xltm|xlam|pptm|potm|ppam)$/i;
+async function openMentioned(path: string) {
+  if (runnable.test(path))
+    throw new Error(
+      "Por segurança, programas e scripts não abrem pelo chat. Clique com o botão direito no link e use Mostrar na pasta.",
+    );
+  if (!existsSync(path)) throw new Error(`Arquivo não encontrado: ${path}`);
+  const error = await shell.openPath(path);
+  if (error) throw new Error(error);
 }
 function inactive(taskId: string) {
   const task = runtime.task(taskId);
@@ -222,19 +275,13 @@ async function handle(method: string, args: any = {}) {
             agent: agent.optional(),
             archived: z.boolean().optional(),
             images: imageOptions.optional(),
-            subagents: z
-              .object({
-                enabled: z.boolean(),
-                agent,
-                model: z.string().max(200),
-                effort: z.string().max(50),
-                max: z.number().int().min(1).max(8),
-              })
-              .optional(),
+            subagents: subagentOptions.nullable().optional(),
           }),
         })
         .parse(args);
       inactive(input.id);
+      // null: the chat follows the default sub-agents again.
+      if (input.patch.subagents === null) input.patch.subagents = undefined;
       return runtime.updateTask(input.id, input.patch);
     }
     case "task.read": {
@@ -357,6 +404,190 @@ async function handle(method: string, args: any = {}) {
     case "task.commands": {
       const a = z.object({ id, refresh: z.boolean().optional() }).parse(args);
       return runtime.commands(a.id, a.refresh);
+    }
+    case "task.delete": {
+      const a = z.object({ id, folder: z.boolean().optional() }).parse(args);
+      inactive(a.id);
+      terminals.get(a.id)?.kill();
+      terminals.delete(a.id);
+      await runtime.deleteTask(a.id, !!a.folder);
+      return;
+    }
+    // Right click on a task in the sidebar; the renderer acts on the choice.
+    case "task.menu": {
+      const task = runtime.task(id.parse(args.id));
+      const busy =
+        ["running", "waiting", "queued"].includes(task.status) ||
+        !!task.background;
+      return await new Promise<string | undefined>((resolve) => {
+        const item = (
+          label: string,
+          action: string,
+          enabled = true,
+        ): MenuItemConstructorOptions => ({
+          label,
+          enabled,
+          click: () => resolve(action),
+        });
+        Menu.buildFromTemplate([
+          item("Abrir", "open"),
+          item("Renomear", "rename", !busy),
+          item(task.archived ? "Restaurar" : "Arquivar", "archive", !busy),
+          { type: "separator" },
+          item("Excluir…", "delete", !busy),
+        ]).popup({
+          window: win,
+          // A click comes before or right after the menu closes.
+          callback: () => setTimeout(() => resolve(undefined), 100),
+        });
+      });
+    }
+    case "work.add": {
+      const a = z
+        .object({
+          projectId: id,
+          title: z.string().min(1).max(200),
+          description: z.string().max(20000).optional(),
+        })
+        .parse(args);
+      return runtime.addWork(a.projectId, a);
+    }
+    case "work.edit": {
+      const a = z
+        .object({
+          id,
+          title: z.string().max(200).optional(),
+          description: z.string().max(20000).optional(),
+        })
+        .parse(args);
+      return runtime.editWork(a.id, a);
+    }
+    case "work.approve":
+      return runtime.approveWork(id.parse(args.id));
+    case "work.approveAll": {
+      const projectId = id.parse(args.projectId);
+      for (const item of runtime.workItems(projectId))
+        if (item.state === "pending") runtime.approveWork(item.id);
+      return;
+    }
+    case "work.move": {
+      const a = z
+        .object({ id, direction: z.union([z.literal(-1), z.literal(1)]) })
+        .parse(args);
+      runtime.moveWork(a.id, a.direction);
+      return;
+    }
+    case "work.delete": {
+      const itemId = id.parse(args.id);
+      const taskId = store.get<WorkItem>("work", itemId).taskId;
+      if (taskId) {
+        terminals.get(taskId)?.kill();
+        terminals.delete(taskId);
+      }
+      await runtime.deleteWork(itemId);
+      return;
+    }
+    case "work.start":
+      await runtime.startWork(id.parse(args.id));
+      return;
+    case "work.retry":
+      return runtime.retryWork(id.parse(args.id));
+    case "work.settings": {
+      const a = z
+        .object({
+          projectId: id,
+          settings: z
+            .object({
+              enabled: z.boolean(),
+              agent,
+              model: z.string().max(200),
+              effort: z.string().max(50),
+              mode: z.enum(["execute", "bypass"]),
+              max: z.number().int().min(1).max(4),
+            })
+            .partial(),
+        })
+        .parse(args);
+      return runtime.setWork(a.projectId, a.settings);
+    }
+    case "social.state": {
+      const projectId = id.parse(args.projectId);
+      return {
+        accounts: social.accounts(projectId),
+        posts: social.posts(projectId),
+        cloudflared: await findCloudflared(),
+      };
+    }
+    case "social.instagram": {
+      const a = z
+        .object({ projectId: id, token: z.string().min(1).max(4000) })
+        .parse(args);
+      store.get<Project>("project", a.projectId);
+      const account = await social.connectInstagram(a.projectId, a.token);
+      runtime.refresh();
+      return account;
+    }
+    case "social.patreon": {
+      const projectId = id.parse(args.projectId);
+      store.get<Project>("project", projectId);
+      const account = await social.connectPatreon(projectId);
+      runtime.refresh();
+      return account;
+    }
+    // Fills a test post in the Patreon editor without publishing it.
+    case "social.patreonTest": {
+      const projectId = id.parse(args.projectId);
+      if (!social.account(projectId, "patreon"))
+        throw new Error("Entre no Patreon antes de testar.");
+      await patreon.publish(
+        projectId,
+        {
+          title: "Teste do Codebit (não publicar)",
+          text: "Rascunho criado pelo teste de automação do Codebit.\n\nPode descartar.",
+          images: [join(__dirname, "../icon.png")],
+          audience: "public",
+        },
+        { dryRun: true },
+      );
+      return;
+    }
+    case "social.renew":
+      return social.renew(id.parse(args.id));
+    case "social.remove":
+      await social.remove(id.parse(args.id));
+      runtime.refresh();
+      return;
+    case "social.deletePost":
+      return social.deletePost(id.parse(args.id));
+    case "social.openPost": {
+      const post = store.get<SocialPost>("post", id.parse(args.id));
+      if (
+        post.url &&
+        /^https:[/][/](www[.])?(instagram|patreon)[.]com[/]/.test(post.url)
+      )
+        await shell.openExternal(post.url);
+      return;
+    }
+    case "social.installTunnel": {
+      const r = await capture(
+        "winget",
+        [
+          "install",
+          "--id",
+          "Cloudflare.cloudflared",
+          "--silent",
+          "--accept-source-agreements",
+          "--accept-package-agreements",
+        ],
+        undefined,
+        600_000,
+      );
+      const found = await findCloudflared();
+      if (!found)
+        throw new Error(
+          `O cloudflared não foi instalado: ${(r.stderr || r.stdout).slice(-300)}`,
+        );
+      return found;
     }
     case "task.handoffSummary":
       return runtime.handoffSummary(id.parse(args.id));
@@ -566,6 +797,14 @@ async function handle(method: string, args: any = {}) {
       if (!/^https?:\/\//.test(url)) throw new Error("Link não permitido.");
       return shell.openExternal(url);
     }
+    case "source.reload":
+      return source?.reloadInterface();
+    case "source.restart":
+      return source?.restart();
+    case "source.cancel":
+      return source?.cancel();
+    case "source.build":
+      return source?.build();
     case "update.check":
       return updater.check();
     case "update.apply":
@@ -583,19 +822,59 @@ async function handle(method: string, args: any = {}) {
     }
     case "folder.open":
       return shell.openPath(runtime.task(id.parse(args.id)).cwd);
-    case "file.open": {
-      const path = mentionedImage(
-        id.parse(args.id),
-        z.string().parse(args.path),
+    case "file.open":
+      return openMentioned(
+        mentionedPath(pathBase(args), z.string().max(4000).parse(args.path)),
       );
-      const error = await shell.openPath(path);
-      if (error) throw new Error(error);
+    case "file.reveal": {
+      const path = mentionedPath(
+        pathBase(args),
+        z.string().max(4000).parse(args.path),
+      );
+      if (!existsSync(path)) throw new Error(`Arquivo não encontrado: ${path}`);
+      return shell.showItemInFolder(path);
+    }
+    // Right click on a chat link: a native menu, since links have no address
+    // the window could show or copy.
+    case "link.menu": {
+      const target = z.string().min(1).max(4000).parse(args.target);
+      const path = args.local ? mentionedPath(pathBase(args), target) : "";
+      const fail = (e: Error) =>
+        dialog.showErrorBox("Não foi possível abrir", e.message);
+      const items: MenuItemConstructorOptions[] = path
+        ? [
+            {
+              label: "Abrir no app padrão",
+              enabled: !runnable.test(path),
+              click: () => void openMentioned(path).catch(fail),
+            },
+            {
+              label: "Mostrar na pasta",
+              click: () =>
+                existsSync(path)
+                  ? shell.showItemInFolder(path)
+                  : fail(new Error(`Arquivo não encontrado: ${path}`)),
+            },
+            { type: "separator" },
+            {
+              label: "Copiar caminho",
+              click: () => void clipboard.writeText(path),
+            },
+          ]
+        : [
+            {
+              label: "Abrir no navegador",
+              enabled: /^https?:\/\//i.test(target),
+              click: () => void shell.openExternal(target),
+            },
+            {
+              label: "Copiar endereço",
+              click: () => void clipboard.writeText(target),
+            },
+          ];
+      Menu.buildFromTemplate(items).popup({ window: win });
       return;
     }
-    case "file.reveal":
-      return shell.showItemInFolder(
-        mentionedImage(id.parse(args.id), z.string().parse(args.path)),
-      );
     case "window.minimize":
       win.minimize();
       return;
@@ -632,9 +911,46 @@ void (previous ? waitForExit(previous) : Promise.resolve()).then(() => {
       join(__dirname, "image-mcp.cjs"),
     );
     await bridge.start();
-    runtime.bridgeConfig = (id, kind) => bridge.config(id, kind);
+    runtime.bridgeConfig = (id, kind, env) => bridge.config(id, kind, env);
     runtime.revokeBridge = (id) => bridge.revoke(id);
     runtime.attention = notify;
+    social = new SocialService({
+      store,
+      encrypt: (value) => {
+        if (!safeStorage.isEncryptionAvailable())
+          throw new Error(
+            "O armazenamento seguro do Windows não está disponível.",
+          );
+        return safeStorage.encryptString(value).toString("base64");
+      },
+      decrypt: (value) =>
+        safeStorage.decryptString(Buffer.from(value, "base64")),
+      prepareImage: prepareInstagramImage,
+      host: async (paths) => {
+        // Tests serve the files locally, to a fake Instagram.
+        if (process.env.CODEBIT_SOCIAL_HOST === "local")
+          return hostFiles(paths, undefined);
+        const cloudflared = await findCloudflared();
+        if (!cloudflared)
+          throw new Error(
+            "Instale o cloudflared em Configurações → Redes sociais para publicar no Instagram.",
+          );
+        return hostFiles(paths, cloudflared.path);
+      },
+      patreon: (patreon = new Patreon(
+        () => win,
+        join(app.getPath("userData"), "social"),
+      )),
+    });
+    runtime.social = social;
+    // Instagram tokens are renewed weekly, well before their 60 days.
+    const renew = () =>
+      void social
+        .renewDue()
+        .then((changed) => changed && runtime.refresh())
+        .catch(() => {});
+    renew();
+    setInterval(renew, 6 * 3600 * 1000).unref();
     updater = new Updater(appVersion, {
       // The portable build knows the folder it was opened from.
       folder: () =>
@@ -648,23 +964,30 @@ void (previous ? waitForExit(previous) : Promise.resolve()).then(() => {
     if (process.platform === "win32") {
       app.setAppUserModelId(appId);
       // Windows drops notifications from apps it does not know; the portable
-      // build has no installer, so it registers its own name for the user.
-      execFile(
-        "reg",
-        [
-          "add",
-          "HKCU\\Software\\Classes\\AppUserModelId\\" + appId,
-          "/v",
-          "DisplayName",
-          "/t",
-          "REG_SZ",
-          "/d",
-          "Codebit",
-          "/f",
-        ],
-        { windowsHide: true },
-        () => {},
-      );
+      // build has no installer, so it registers its own name and icon for the
+      // user. The icon is copied out of the build, whose folder is temporary.
+      const icon = join(app.getPath("userData"), "icon.png");
+      await copyFile(join(__dirname, "../icon.png"), icon).catch(() => {});
+      for (const [name, value] of [
+        ["DisplayName", "Codebit"],
+        ["IconUri", icon],
+      ])
+        execFile(
+          "reg",
+          [
+            "add",
+            "HKCU\\Software\\Classes\\AppUserModelId\\" + appId,
+            "/v",
+            name,
+            "/t",
+            "REG_SZ",
+            "/d",
+            value,
+            "/f",
+          ],
+          { windowsHide: true },
+          () => {},
+        );
     }
     protocol.handle("codebit", async (request) => {
       try {
@@ -690,6 +1013,7 @@ void (previous ? waitForExit(previous) : Promise.resolve()).then(() => {
       }
     });
     win = new BrowserWindow({
+      icon: join(__dirname, "../icon.png"),
       width: 1536,
       height: 1000,
       minWidth: 1000,
@@ -729,10 +1053,45 @@ void (previous ? waitForExit(previous) : Promise.resolve()).then(() => {
     if (process.env.CODEBIT_DEV_URL)
       await win.loadURL(process.env.CODEBIT_DEV_URL);
     else await win.loadFile(join(__dirname, "../renderer/index.html"));
-    void runtime.detect().catch((e) => {
-      console.error("Falha na descoberta:", e.message);
-    });
+    // Projects with the task board on pick up their line once the CLIs
+    // are known.
+    void runtime
+      .detect()
+      .then(() => runtime.dispatchAll())
+      .catch((e) => {
+        console.error("Falha na descoberta:", e.message);
+      });
     updater.start();
+    // Opened from the project folder (npm start or the desktop shortcut):
+    // builds itself when src changes. Tests opt in with CODEBIT_SOURCE_ROOT.
+    const sourceRoot =
+      process.env.CODEBIT_SOURCE_ROOT ||
+      (!app.isPackaged && process.env.CODEBIT_TEST_MODE !== "1"
+        ? app.getAppPath()
+        : "");
+    if (sourceRoot) {
+      source = new SourceMode(sourceRoot, {
+        build: () => buildProject(sourceRoot),
+        busy: () => runtime.busy(),
+        reload: () => win.webContents.reload(),
+        restart: () => {
+          app.relaunch({
+            args: [
+              ...process.argv
+                .slice(1)
+                .filter((a) => !a.startsWith("--after-update=")),
+              `--after-update=${process.pid}`,
+            ],
+          });
+          app.quit();
+        },
+        changed: () => emit({ type: "refresh" }),
+      });
+      await source.start().catch((e) => {
+        console.error("Modo código indisponível:", e.message);
+        source = undefined;
+      });
+    }
   });
 });
 app.on("window-all-closed", () => app.quit());
@@ -740,6 +1099,7 @@ app.on("before-quit", () => {
   if (shuttingDown) return;
   shuttingDown = true;
   updater?.stop();
+  source?.stop();
   for (const t of terminals.values()) t.kill();
   runtime?.close();
   bridge?.close();

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ImageService } from "../src/main/images";
@@ -214,6 +214,39 @@ describe("imagens pelo Codex CLI", () => {
     await expect(
       service.generate("t", "NOIMAGE", defaultImages),
     ).rejects.toThrow("sem gerar uma imagem");
+  });
+  it("gera com esforço baixo, sem herdar o padrão do config.toml", async () => {
+    const service = await setup(undefined, codex);
+    const artifact = await service.generate("t", "EFFORT", defaultImages);
+    expect(artifact.provider).toBe("codex");
+  });
+  it("aguarda o motivo após imagem vazia e salva diagnóstico filtrado", async () => {
+    const service = await setup(undefined, codex);
+    const error = await service
+      .generate("t", "EMPTY_DETAIL", defaultImages)
+      .catch((e: Error) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      "Serviço temporariamente indisponível",
+    );
+    expect((error as Error).message).toContain("Diagnóstico:");
+    expect((error as Error).message).not.toContain("sk-test-private-token");
+    const folder = join(roots[0], "logs", "image-generations");
+    const files = await readdir(folder);
+    expect(files).toHaveLength(1);
+    const raw = await readFile(join(folder, files[0]), "utf8");
+    const diagnostic = JSON.parse(raw);
+    expect(diagnostic.emptyImage).toBe(true);
+    expect(
+      diagnostic.events.some((e: any) => e.method === "turn/completed"),
+    ).toBe(true);
+    expect(raw).not.toContain("PRIVATE_PROMPT_NOT_FOR_LOGS");
+    expect(raw).not.toContain("sk-test-private-token");
+    expect(raw).not.toContain(png.toString("base64"));
+    // The completed failure must release the per-task generation lock.
+    expect(
+      (await service.generate("t", "Um farol", defaultImages)).provider,
+    ).toBe("codex");
   });
   it("cancelar encerra a espera pelo Codex", async () => {
     const service = await setup(undefined, codex);

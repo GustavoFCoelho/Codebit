@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
 import { Channel } from "./protocol";
 import { nativeModels } from "./models";
-import { guidelinesText } from "../extensions";
+import { guidelinesText, stopWhenStuck } from "../extensions";
 import type {
   AgentEvent,
   AgentSession,
@@ -14,7 +14,8 @@ import { appVersion } from "../../shared/types";
 const modes = { plan: "plan", execute: "accept-edits", bypass: "bypass" };
 // Devin CLI 3000.10 starts MCP servers received over ACP but its MCP tools only
 // see servers from its own config files, so the Codebit tools are not offered.
-const instructions = "Você está no Codebit. Responda em português do Brasil.";
+const instructions =
+  "Você está no Codebit. Responda em português do Brasil." + stopWhenStuck;
 const imageTypes: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -137,12 +138,25 @@ export class DevinSession implements AgentSession {
     if (u.sessionUpdate === "tool_call")
       this.emit({
         type: "activity",
+        id: u.toolCallId,
         text: u.rawInput?.command
           ? `Terminal · ${u.rawInput.command}`
           : u.title || "Ferramenta",
         files: ["edit", "delete", "move"].includes(u.kind)
           ? (u.locations || []).map((l: any) => l.path).filter(Boolean)
           : undefined,
+        // The input without its free-text description, plus the paths it
+        // touches, identifies the action.
+        key: `${u.kind} ${JSON.stringify({ ...u.rawInput, description: undefined })} ${(u.locations || []).map((l: any) => l.path).join(",") || u.title || ""}`,
+      });
+    if (
+      u.sessionUpdate === "tool_call_update" &&
+      (u.status === "completed" || u.status === "failed")
+    )
+      this.emit({
+        type: "outcome",
+        ok: u.status === "completed",
+        id: u.toolCallId,
       });
     if (u.sessionUpdate === "usage_update" && typeof u.used === "number")
       this.emit({ type: "usage", used: u.used, size: u.size || undefined });

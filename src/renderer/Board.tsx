@@ -1,9 +1,7 @@
 import { memo, useLayoutEffect, useRef, useState } from "react";
 import {
   ArrowUp,
-  Check,
   CircleAlert,
-  Code2,
   LayoutGrid,
   ListOrdered,
   MessageSquare,
@@ -15,7 +13,13 @@ import remarkGfm from "remark-gfm";
 import type { AgentId, BoardCard, Model, Snapshot } from "../shared/types";
 import { agentIds, agentNames } from "../shared/types";
 import { api, artifactUrl } from "./api";
-import { ContextMeter, RequestCard, statusName } from "./parts";
+import {
+  ActivityIcon,
+  AgentMark,
+  ContextMeter,
+  RequestCard,
+  statusName,
+} from "./parts";
 export const taskMime = "application/x-codebit-task";
 const busy = ["running", "waiting", "queued"];
 // Several tasks side by side; tasks in different folders run in parallel.
@@ -32,7 +36,9 @@ export function Board({
 }) {
   const [over, setOver] = useState(false);
   const running = cards.filter((c) => busy.includes(c.task.status)).length;
-  const available = snapshot.tasks.filter((t) => !t.boardAt && !t.archived);
+  const available = snapshot.tasks.filter(
+    (t) => !t.boardAt && !t.archived && !t.workItemId,
+  );
   const add = (id: string) => run(() => api("task.board", { id, on: true }));
   return (
     <div
@@ -142,7 +148,8 @@ const BoardCardView = memo(
       >
         <header>
           <strong title={task.title}>{task.title}</strong>
-          <span className="badge">
+          <span className={`badge agent-badge ${task.agent}`}>
+            <AgentMark agent={task.agent} />
             {agentNames[task.agent]}
             {model ? ` · ${model.name}` : ""}
           </span>
@@ -192,7 +199,7 @@ const BoardCardView = memo(
           {recent.map((e) =>
             e.kind === "activity" ? (
               <div className="log-activity" key={e.id}>
-                <Check size={11} />
+                <ActivityIcon text={e.text} ok={e.ok} />
                 <span>{e.text}</span>
               </div>
             ) : e.kind === "error" ? (
@@ -216,7 +223,7 @@ const BoardCardView = memo(
                     "Você"
                   ) : (
                     <>
-                      <Code2 size={11} />
+                      <AgentMark agent={e.agent ?? task.agent} />
                       {agentNames[e.agent ?? task.agent]}
                     </>
                   )}

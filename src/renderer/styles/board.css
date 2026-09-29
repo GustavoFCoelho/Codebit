@@ -1,0 +1,256 @@
+/* Multitask board. */
+.board-link {
+  justify-content: flex-start;
+  gap: 10px;
+  margin: -12px 15px 18px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  font-size: 12px;
+  color: var(--text-2);
+}
+.board-link.active-link {
+  background: var(--selected);
+  color: var(--text);
+}
+.board-link .badge {
+  margin-left: auto;
+}
+.board {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px 22px 16px;
+  overflow: auto;
+  background-image: radial-gradient(#ffffff0d 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+.board-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+.board-head p {
+  font-size: 13px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+.board-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 13px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.board-chip:not(.active) .status-dot {
+  background: var(--faint);
+}
+.board-chip.active {
+  border-color: var(--green-border);
+  color: var(--green-text);
+  background: var(--green-bg);
+}
+.board-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 14px;
+  align-content: start;
+}
+.board-card {
+  display: flex;
+  flex-direction: column;
+  height: 380px;
+  min-width: 0;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.board-card.status-waiting {
+  border-color: var(--amber-border);
+}
+.board-card.status-failed {
+  border-color: var(--red-border);
+}
+.board-card > header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  padding: 10px 10px 9px 13px;
+  border-bottom: 1px solid var(--border);
+}
+.board-card > header strong {
+  flex: 1 1 100px;
+  min-width: 0;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.board-card > header .badge {
+  margin-left: 0;
+}
+.card-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.card-actions {
+  display: flex;
+}
+.card-actions .icon {
+  width: 26px;
+  height: 26px;
+}
+.board-log {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  contain: strict;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 13px;
+  font-size: 12px;
+}
+.board-log .help {
+  margin: 0;
+}
+.log-activity,
+.log-error {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 11px;
+  color: var(--muted);
+}
+.log-activity > span,
+.log-error > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.log-activity > svg {
+  color: var(--green);
+  flex-shrink: 0;
+}
+.log-error {
+  color: var(--red);
+}
+.log-message .log-author {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 3px;
+}
+.log-message.user p {
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.log-message .markdown {
+  font-size: 12px;
+}
+.log-image {
+  max-width: 100%;
+  max-height: 150px;
+  object-fit: contain;
+  align-self: flex-start;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.board-log .request-card {
+  margin: 0;
+  font-size: 12px;
+}
+.board-card > footer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 9px 11px 11px;
+  border-top: 1px solid var(--border);
+}
+.card-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.card-meta .context-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.card-queue {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+.board-card form {
+  display: flex;
+  gap: 6px;
+}
+.board-card form input {
+  flex: 1;
+  padding: 7px 9px;
+  font-size: 12px;
+}
+.board-drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 200px;
+  padding: 18px;
+  text-align: center;
+  border: 2px dashed var(--green-border);
+  border-radius: var(--radius-lg);
+  color: var(--green);
+  transition:
+    background 0.12s,
+    border-color 0.12s;
+}
+.board-drop small {
+  color: var(--muted);
+}
+.board-drop select {
+  font-size: 11px;
+  padding: 7px 9px;
+  max-width: 100%;
+}
+.board.drag-over .board-drop {
+  background: var(--green-bg);
+  border-color: var(--green);
+}
+.board-composer {
+  position: sticky;
+  bottom: 0;
+  margin-top: auto;
+}
+.board-composer .composer-buttons select {
+  font-size: 11px;
+  padding: 6px 8px;
+  max-width: 190px;
+}
+.board-composer .checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 11px;
+}

@@ -1,5 +1,7 @@
 import { createInterface } from "node:readline";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 const dialect = process.argv[2];
 const png =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a8uoAAAAASUVORK5CYII=";
@@ -9,6 +11,8 @@ let imageThread = false;
 let threadParams = {};
 let responseText = "Olá, ação concluída.";
 let userMessages = 0;
+// Claude's permission mode, changed at runtime by set_permission_mode.
+let permissionMode = null;
 const out = (value) => process.stdout.write(JSON.stringify(value) + "\n");
 // Markers in the prompt: MODE reports permission settings, ECHO returns the
 // prompt, GUIDE returns the system instructions, SLOW delays the answer, HOLD
@@ -16,7 +20,7 @@ const out = (value) => process.stdout.write(JSON.stringify(value) + "\n");
 // later; BGWAIT leaves it running; COUNT reports the messages this process got.
 // EDIT reports an edit of src/shared.ts with the CLI's own edit tool;
 // FAILTURN ends the Codex turn with an error; EXITPLAN makes Claude ask to
-// leave plan mode.
+// leave plan mode. LOOP, TDD and FAILS feed the loop guard.
 const respondTo = (text, mode) => {
   if (text.includes("MODE")) responseText = JSON.stringify(mode);
   if (text.includes("ECHO")) responseText = text;
@@ -239,6 +243,39 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       const text = m.params.input[0].text;
       const image = m.params.input.find((i) => i.type === "localImage");
       if (text.includes("HOLD")) return;
+      if (text.includes("EMPTY_DETAIL")) {
+        out({
+          method: "item/completed",
+          params: {
+            item: {
+              type: "imageGeneration",
+              id: "empty-image",
+              status: "failed",
+              result: "",
+              savedPath: null,
+              failure: null,
+              revisedPrompt: "PRIVATE_PROMPT_NOT_FOR_LOGS",
+            },
+          },
+        });
+        setTimeout(() => {
+          out({
+            method: "item/completed",
+            params: {
+              item: {
+                type: "agentMessage",
+                id: "explanation",
+                text: "Serviço temporariamente indisponível. Authorization: Bearer sk-test-private-token",
+              },
+            },
+          });
+          out({
+            method: "turn/completed",
+            params: { turn: { id: "turn-1", status: "completed" } },
+          });
+        }, 100);
+        return;
+      }
       const item = {
         type: "imageGeneration",
         id: "image-1",
@@ -250,7 +287,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
           ? { type: "usageLimitExceeded", limitId: "images", resetsAt: null }
           : null,
       };
-      if (!text.includes("NOIMAGE")) {
+      // EFFORT: only a low-effort turn produces the image.
+      const noImage =
+        text.includes("NOIMAGE") ||
+        (text.includes("EFFORT") && m.params.effort !== "low");
+      if (!noImage) {
         out({
           method: "item/started",
           params: { item: { ...item, status: "in_progress", result: "" } },
@@ -397,6 +438,54 @@ createInterface({ input: process.stdin }).on("line", (line) => {
             },
           },
         });
+      // LOOP: the same download over and over, like an agent whose download
+      // never arrives. TDD: the tests again after each edit, which is fine.
+      if (text.includes("LOOP") || text.includes("TDD")) {
+        const tdd = text.includes("TDD");
+        let n = 0;
+        const step = () => {
+          if (n++ >= 6) return tdd ? finish() : undefined;
+          const command = tdd
+            ? "npm test"
+            : "Start-Process https://exemplo.com/arquivo.zip";
+          const run = { type: "commandExecution", id: `loop-${n}`, command };
+          out({
+            method: "item/started",
+            params: { item: { ...run, status: "inProgress" } },
+          });
+          out({
+            method: "item/completed",
+            params: { item: { ...run, status: "completed", exitCode: 0 } },
+          });
+          if (tdd) {
+            const edit = {
+              type: "fileChange",
+              id: `edit-${n}`,
+              changes: [{ path: "src/a.ts", kind: "update" }],
+            };
+            out({ method: "item/started", params: { item: edit } });
+            out({
+              method: "item/completed",
+              params: { item: { ...edit, status: "completed" } },
+            });
+          }
+          setTimeout(step, 20);
+        };
+        step();
+        return;
+      }
+      // PLANITEM: a native Codex plan item.
+      if (text.includes("PLANITEM"))
+        out({
+          method: "item/completed",
+          params: {
+            item: {
+              type: "plan",
+              id: "plan-1",
+              text: "# Plano do Codex\n\n1. etapa",
+            },
+          },
+        });
       if (text.includes("FAILTURN")) {
         out({
           method: "turn/completed",
@@ -488,6 +577,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   } else {
     if (m.type === "control_request") {
       const r = m.request;
+      if (r.subtype === "set_permission_mode") permissionMode = r.mode;
       out({
         type: "control_response",
         response: {
@@ -517,13 +607,33 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       });
     }
     if (m.type === "user") {
+      const text = m.message.content[0].text;
+      // ORPHAN: a session that stopped abruptly with background work comes
+      // back reporting it stopped, in a turn of its own that ends in an empty
+      // result before our message is taken.
+      if (text.includes("ORPHAN")) {
+        out({
+          type: "system",
+          subtype: "task_notification",
+          task_id: "orfa",
+          status: "stopped",
+        });
+        out({ type: "system", subtype: "init", session_id: "native-claude" });
+        out({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          result: "",
+        });
+      }
+      if (process.argv.includes("--replay-user-messages") && m.uuid)
+        out({ type: "user", message: m.message, uuid: m.uuid, isReplay: true });
       out({
         type: "system",
         subtype: "init",
         session_id: "native-claude",
         model: "test-model",
       });
-      const text = m.message.content[0].text;
       userMessages++;
       if (text.includes("COUNT")) responseText = `mensagens:${userMessages}`;
       const flag = (name) =>
@@ -536,7 +646,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
           effort: flag("--effort"),
         });
       const delay = respondTo(text, {
-        permissionMode: flag("--permission-mode"),
+        permissionMode: permissionMode ?? flag("--permission-mode"),
         dangerous: process.argv.includes(
           "--allow-dangerously-skip-permissions",
         ),
@@ -616,6 +726,61 @@ createInterface({ input: process.stdin }).on("line", (line) => {
             },
           },
         });
+      // REPEAT: the same command with a new description each time, as the
+      // real Claude does.
+      if (text.includes("REPEAT")) {
+        for (let i = 0; i < 6; i++)
+          out({
+            type: "assistant",
+            message: {
+              content: [
+                {
+                  type: "tool_use",
+                  id: `r${i}`,
+                  name: "Bash",
+                  input: {
+                    command: "curl -O https://exemplo.com/arquivo.zip",
+                    description: `Tentativa ${i + 1} de baixar o arquivo`,
+                  },
+                },
+              ],
+            },
+          });
+        return;
+      }
+      // FAILS: different commands, every one failing.
+      if (text.includes("FAILS")) {
+        for (let i = 0; i < 7; i++) {
+          out({
+            type: "assistant",
+            message: {
+              content: [
+                {
+                  type: "tool_use",
+                  id: `t${i}`,
+                  name: "Bash",
+                  input: { command: `baixar parte ${i}` },
+                },
+              ],
+            },
+          });
+          out({
+            type: "user",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: `t${i}`,
+                  is_error: true,
+                  content: "falhou",
+                },
+              ],
+            },
+          });
+        }
+        return;
+      }
       if (text.includes("QUESTION")) {
         out({
           type: "control_request",
@@ -631,6 +796,20 @@ createInterface({ input: process.stdin }).on("line", (line) => {
                 },
               ],
             },
+          },
+        });
+      } else if (text.includes("PLAN") && !text.includes("EXITPLAN")) {
+        // The plan Claude writes to a .md file and hands over to leave plan mode.
+        const planFilePath = join(tmpdir(), `codebit-plano-${process.pid}.md`);
+        const plan = "# Plano de teste\n\n- passo um\n- passo dois";
+        writeFileSync(planFilePath, plan);
+        out({
+          type: "control_request",
+          request_id: "plan-1",
+          request: {
+            subtype: "can_use_tool",
+            tool_name: "ExitPlanMode",
+            input: { plan, planFilePath },
           },
         });
       } else if (text.includes("APPROVE") || text.includes("EXITPLAN")) {

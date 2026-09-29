@@ -2,6 +2,94 @@
 
 Ambiente: Windows 10 x64, Node 22.18, Electron 44.4.5. Data: 25/09/2026.
 
+## Depois da 0.2.7 — sub-agentes padrão e interface nova (modo código, sem versão nova)
+
+- **Sub-agentes padrão:** em Configurações → Comportamento, com a opção de aplicar a todas as conversas. **Voltar ao padrão** faz uma conversa ajustada seguir o padrão de novo (a IPC `task.update` aceita `subagents: null`).
+- **Interface:** propostas P1 a P3 de `docs/UI-ANALISE.md`, mantendo a paleta. O resumo por item está no próprio documento, com capturas de antes e depois.
+- **Arquivar e excluir tarefas:** botões na linha da barra lateral, menu do clique direito e botões na barra de título. A exclusão (IPC `task.delete`) pede confirmação, recusa tarefas trabalhando e nunca altera a pasta do projeto.
+- **Quadro de tarefas por projeto:**
+  - fila "A fazer" com despacho automático quando o modo tarefas está ligado, respeitando o limite de simultâneas;
+  - sessões internas fora das conversas;
+  - canal `codebit_tasks` (`list_tasks` e `add_tasks`) em todas as sessões do projeto: o que o usuário pede numa conversa vai para "A fazer"; sugestões do agente e continuações das sessões internas ficam pendentes até a aprovação;
+  - pausa automática após falha ao iniciar ou duas falhas seguidas.
+- **Correção de um erro que já existia:** interromper uma conversa e excluí-la em seguida gerava um erro não tratado no processo principal, porque o fim da execução ainda consultava a tarefa apagada.
+- **Claude Code atualizado:**
+  - A instalação nativa (`~/.local/bin`, a que o Codebit usa) foi de 2.1.283 para 2.1.284 com `claude update`.
+  - A do WinGet continua em 2.1.268, a mais nova disponível na origem do WinGet.
+  - Uma chamada real com o Haiku respondeu normalmente.
+- **Redes sociais (`codebit_social`):**
+  - **Validação local:**
+    - Cartão de aprovação com a prévia exata; nada é publicado antes de **Publicar**, recusar ou interromper.
+    - Instagram contra um servidor que imita a API e baixa as imagens pelos endereços recebidos: token cifrado e renovado, post, carrossel, rótulo de IA, histórico e exclusão.
+    - Patreon com o editor simulado.
+    - Conversão real para JPEG no Electron:
+      - 1080×1920 → 1080×1350 no feed;
+      - 3000×1000 → 1440×754;
+      - story sem recorte;
+      - menos de 320 px é recusado.
+    - Túnel `cloudflared` 2026.9.3 instalado pelo winget; um túnel rápido real respondeu pelo endereço público em 13 s.
+  - **Ainda não validado com as contas reais:**
+    - Instagram: falta o token da sua conta.
+    - Patreon: os passos no editor do site dependem do layout atual da página.
+- **Resultado das ações:** Codex (`item.id`), Claude (`tool_use_id`) e Devin (`toolCallId`) passam a identificar cada chamada. O runtime marca a linha da atividade com `ok`, e a conversa mostra sucesso ou falha.
+- **A suíte unitária e de integração passou inteira (143 testes em 11 arquivos, incluindo trabalho paralelo em `codex-image-reply`).** Os testes novos desta etapa cobrem:
+  - o padrão valendo para conversas sem ajuste e, quando sincronizado, para todas;
+  - a marcação de sucesso nas ações do Codex e de falha nas do Claude;
+  - a exclusão: o que é apagado, a pasta própria só quando pedido, a do projeto nunca, e a recusa com a tarefa trabalhando;
+  - as redes sociais (9 testes);
+  - o quadro de tarefas (10 testes, com o agente simulado):
+    - nada começa com o modo desligado;
+    - o limite de simultâneas e a fila;
+    - desligar deixa terminar;
+    - recomendações pendentes até aprovar;
+    - pausa após duas falhas;
+    - retomar na mesma sessão;
+    - `codebit_tasks` em toda sessão de projeto, com o papel certo (sessão interna ou conversa), e em nenhuma conversa sem projeto;
+    - o canal das conversas: pedido vai para a fila, sugestão fica pendente, `list_tasks`, início automático com o modo ligado;
+    - a validação da ponte e as instruções por papel.
+- **16 fluxos Electron passaram** (o de CLIs reais fica pulado, como sempre). Os fluxos novos:
+  - tarefas criadas por uma conversa mostram a origem e abrem essa conversa;
+  - criar, reordenar, editar e excluir no quadro de tarefas; aprovar e descartar recomendações; configurar o modo; abrir a sessão interna e voltar;
+  - arquivar, restaurar e excluir pela barra lateral, pelo clique direito e pela barra de título;
+  - conectar o Instagram e ver a prévia de um post para aprovar. Os demais foram ajustados aos novos caminhos:
+  - chips do composer;
+  - seções das Configurações;
+  - **Voltar ao padrão**;
+  - bloqueio dos sub-agentes quando sincronizados.
+- **Digitação:** o custo por tecla na conversa longa (900 mensagens) caiu de 7,7 ms para cerca de 2 ms.
+
+## Versão 0.2.7 — logo, modo código e imagens com esforço baixo
+
+- **Logo:** a marca `</>` da interface virou o ícone do app. `npm run icon` gera o SVG, o PNG e o ICO (de 16 a 256 px), e os tamanhos pequenos usam traço mais grosso. O ícone foi conferido nos dois executáveis, extraído pelo Windows: no portátil e no `Codebit.exe`, gravado via `resedit` com `signExecutable: false`. A janela usa o mesmo ícone, e as notificações também, registrado em `IconUri`.
+- **Modo código:**
+  - `npm run shortcut` cria o atalho **Codebit** na área de trabalho, que abre o Electron do projeto nesta pasta.
+  - Validação real, com build de verdade disparado pelo app: uma regra de CSS nova foi percebida e preparada, e o aviso "Interface atualizada · Recarregar" apareceu em 8,5 s. O núcleo não mudou, e a interface recarregou sem reiniciar. Ao restaurar o CSS, o app reconstruiu sozinho em 8 s.
+  - Um comentário de CSS, que a minificação remove, corretamente não gerou aviso.
+- **Imagens pelo Codex:** o turno de geração usa esforço `low` em vez do padrão do `config.toml` (era xhigh na análise de consumo).
+- **99 testes unitários/de integração passaram.** Os novos cobrem o modo código:
+  - várias mudanças seguidas viram um só build;
+  - interface e núcleo são distinguidos;
+  - um build com erro mantém a versão atual;
+  - o build feito por um agente é percebido;
+  - o reinício espera as tarefas terminarem e pode ser cancelado.
+
+  Também passaram o esforço baixo nas imagens e esperas mais longas para catálogos com a máquina ocupada.
+
+- **11 fluxos Electron passaram**, no código e no pacote `release/win-unpacked`, incluindo o novo fluxo do modo código: aviso, recarregar e reiniciar interceptado. O teste nativo com `CODEBIT_CATALOG_ONLY=1` também passou.
+
+## Versão 0.2.6 — links para arquivos locais
+
+- **Problema:** links que o Codex escreve para arquivos locais, como `[Cena Blender v004](D:/…/cena_v004.blend)`, davam "Link não permitido": todo link que não fosse imagem ia para o navegador, que só aceita `http`/`https`. Os links também não deixavam ver nem copiar o caminho.
+- **Correção:** links locais (absolutos, `/D:/…`, `file://`, `~/…` ou relativos à pasta da tarefa, sem âncoras de linha) abrem no app padrão; imagens seguem abrindo no painel lateral. O botão direito abre um menu nativo com **Abrir no app padrão**, **Mostrar na pasta** e **Copiar caminho**, ou **Abrir no navegador** e **Copiar endereço** para a web. Programas, scripts, atalhos, instaladores e documentos com macro não abrem por link do chat. O painel dos prompts salvos segue as mesmas regras.
+- **94 testes unitários/de integração passaram.** Os **10 fluxos Electron** e o teste nativo com `CODEBIT_CATALOG_ONLY=1` passaram no pacote `release/win-unpacked`. O fluxo de imagens mencionadas agora cobre:
+  - uma cena `.blend` com caminho absoluto;
+  - um `.md` relativo;
+  - um `.bat`, que é bloqueado;
+  - um arquivo inexistente;
+  - o menu do botão direito, com a cópia do caminho.
+
+  O teste troca `shell.openPath` e o menu nativo por versões que só registram, então nenhum programa é aberto.
+
 ## Versão 0.2.5 — primeira atualização pelo app
 
 - Mesma funcionalidade da 0.2.4. Serve para a primeira atualização pelo botão **Atualizar**: na 0.2.4, ela aparece como versão nova assim que o `.sha256` é gravado.
