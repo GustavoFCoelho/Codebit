@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  writeFile,
+  readFile,
+  rm,
+  stat,
+  truncate,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -664,6 +672,30 @@ describe("runtime: agentes, conversas e sub-agentes", () => {
     await expect(rt.deleteTask(busy.id)).rejects.toThrow("Interrompa");
     await rt.interrupt(busy.id);
     expect(rt.task(busy.id).title).toBe("Ocupada");
+  });
+  it("vídeos anexados podem ter até 100 MB; os demais anexos, 20 MB", async () => {
+    const rt = await runtime(["codex"]);
+    const t = await rt.createTask({ title: "Vídeo", agent: "codex" });
+    const folder = await temp();
+    // Files of the given size, without writing their bytes.
+    const sized = async (name: string, bytes: number) => {
+      const path = join(folder, name);
+      await writeFile(path, "");
+      await truncate(path, bytes);
+      return path;
+    };
+    const mb = 1024 * 1024;
+    const [saved] = await rt.attach(t.id, [await sized("teste.mp4", 30 * mb)]);
+    expect((await stat(saved)).size).toBe(30 * mb);
+    await expect(
+      rt.attach(t.id, [await sized("pacote.zip", 30 * mb)]),
+    ).rejects.toThrow("20 MB (vídeos, até 100 MB)");
+    await expect(
+      rt.attach(t.id, [await sized("longo.MOV", 100 * mb + 1)]),
+    ).rejects.toThrow("Vídeos anexados devem ter até 100 MB");
+    expect(
+      (await rt.attach(t.id, [await sized("limite.webm", 100 * mb)])).length,
+    ).toBe(1);
   });
   it("salva imagem colada como anexo da tarefa", async () => {
     const rt = await runtime(["codex"]);

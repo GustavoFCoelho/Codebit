@@ -21,6 +21,8 @@ import { randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { z } from "zod";
 import { Store } from "./store";
+import { VoiceController } from "./voice";
+import { VoskVoiceEngine } from "./voice-vosk";
 import { Runtime } from "./runtime";
 import { ImageBridge } from "./bridge";
 import { files, fileContent, changes } from "./workspace";
@@ -29,6 +31,7 @@ import { validateWorkflow } from "./images";
 import { Updater, waitForExit } from "./updater";
 import { buildProject, SourceMode } from "./source";
 import { SocialService } from "./social";
+import { mentionedPath, resolveMention } from "./mentions";
 import { prepareInstagramImage } from "./jpeg";
 import { Patreon } from "./patreon";
 import { findCloudflared, hostFiles } from "./tunnel";
@@ -59,6 +62,7 @@ if (process.env.CODEBIT_DATA_DIR)
 let win: BrowserWindow;
 let store: Store;
 let runtime: Runtime;
+let voice: VoiceController;
 let bridge: ImageBridge;
 let updater: Updater;
 let source: SourceMode | undefined;
@@ -93,7 +97,13 @@ const subagentOptions = z.object({
   effort: z.string().max(50),
   max: z.number().int().min(1).max(8),
 });
+const voiceOptionsSchema = z.object({
+  wakePhrase: z.string().trim().min(3).max(80),
+  recognizerId: z.string().max(500),
+  announcements: z.boolean(),
+});
 const settingsSchema = z.object({
+  voice: voiceOptionsSchema.optional(),
   cliPaths: z.object({
     codex: z.string().optional(),
     claude: z.string().optional(),
@@ -134,6 +144,7 @@ const settingsSchema = z.object({
     .optional(),
 });
 function emit(event: AppEvent) {
+  if (event.type === "task-signal") voice?.signal(event.signal);
   if (win && !win.isDestroyed()) win.webContents.send("codebit:event", event);
 }
 // Only while the window is in the background; a click opens the task.
@@ -188,20 +199,21 @@ const pathBase = (args: any) =>
   args.id
     ? runtime.task(id.parse(args.id)).cwd
     : z.string().min(1).max(1000).parse(args.cwd);
-function mentionedPath(base: string, raw: string) {
-  const text = raw.trim();
-  return /^file:/i.test(text)
-    ? fileURLToPath(text)
-    : /^~[\\/]/.test(text)
-      ? join(homedir(), text.slice(2))
-      : resolve(base, text);
+// Where a mentioned file is, searched when it is not where the text says.
+async function locate(base: string, raw: string) {
+  const found = await resolveMention(base, raw);
+  if (!found)
+    throw new Error(
+      `Arquivo não encontrado: ${raw}. Ele pode ter sido movido, apagado ou ainda não ter sido criado.`,
+    );
+  return found;
 }
 // Only images are served to the window, so chat text cannot expose files.
-function mentionedImage(taskId: string, raw: string) {
-  const path = mentionedPath(runtime.task(taskId).cwd, raw);
-  if (!/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(path))
+async function mentionedImage(taskId: string, raw: string) {
+  if (!/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(raw.trim()))
     throw new Error("Só imagens podem ser abertas por aqui.");
-  return path;
+  const found = await resolveMention(runtime.task(taskId).cwd, raw);
+  return found?.path ?? mentionedPath(runtime.task(taskId).cwd, raw);
 }
 // Opening these from a link an agent wrote would run a program: executables,
 // scripts, shortcuts, installers and Office files with macros.
@@ -225,6 +237,33 @@ function inactive(taskId: string) {
 }
 async function handle(method: string, args: any = {}) {
   switch (method) {
+    case "voice.state":
+      return voice.state;
+    case "voice.probe":
+      return voice.probe();
+    case "voice.configure": {
+      const a = z
+        .object({ taskId: z.string().max(500), options: voiceOptionsSchema })
+        .parse(args);
+      voice.configure(a.taskId, a.options);
+      store.saveSettings({ ...store.settings(), voice: a.options });
+      runtime.refresh();
+      return voice.state;
+    }
+    case "voice.enable":
+      return voice.enable();
+    case "voice.pause":
+      return voice.pause();
+    case "voice.stop":
+      return voice.stop();
+    case "voice.discard":
+      return voice.discard();
+    case "voice.confirm": {
+      const a = z
+        .object({ draftId: id, text: z.string().trim().min(1).max(8000) })
+        .parse(args);
+      return voice.confirm(a.draftId, a.text);
+    }
     case "snapshot":
       return snapshot();
     case "detect":
@@ -822,56 +861,79 @@ async function handle(method: string, args: any = {}) {
     }
     case "folder.open":
       return shell.openPath(runtime.task(id.parse(args.id)).cwd);
-    case "file.open":
-      return openMentioned(
-        mentionedPath(pathBase(args), z.string().max(4000).parse(args.path)),
-      );
-    case "file.reveal": {
-      const path = mentionedPath(
+    // Where a chat link leads: null when nothing matches (quiet checks of
+    // names in inline code), or the file with its kind.
+    case "file.resolve": {
+      const raw = z.string().min(1).max(4000).parse(args.path);
+      const found = await resolveMention(pathBase(args), raw);
+      if (!found && !args.quiet) await locate(pathBase(args), raw);
+      return found ?? null;
+    }
+    case "file.open": {
+      const found = await locate(
         pathBase(args),
         z.string().max(4000).parse(args.path),
       );
-      if (!existsSync(path)) throw new Error(`Arquivo não encontrado: ${path}`);
-      return shell.showItemInFolder(path);
+      return openMentioned(found.path);
+    }
+    case "file.reveal": {
+      const found = await locate(
+        pathBase(args),
+        z.string().max(4000).parse(args.path),
+      );
+      return shell.showItemInFolder(found.path);
     }
     // Right click on a chat link: a native menu, since links have no address
     // the window could show or copy.
     case "link.menu": {
       const target = z.string().min(1).max(4000).parse(args.target);
-      const path = args.local ? mentionedPath(pathBase(args), target) : "";
+      const found = args.local
+        ? await resolveMention(pathBase(args), target)
+        : undefined;
       const fail = (e: Error) =>
         dialog.showErrorBox("Não foi possível abrir", e.message);
-      const items: MenuItemConstructorOptions[] = path
+      const missing = args.local && !found;
+      const path = found?.path ?? "";
+      const items: MenuItemConstructorOptions[] = missing
         ? [
-            {
-              label: "Abrir no app padrão",
-              enabled: !runnable.test(path),
-              click: () => void openMentioned(path).catch(fail),
-            },
-            {
-              label: "Mostrar na pasta",
-              click: () =>
-                existsSync(path)
-                  ? shell.showItemInFolder(path)
-                  : fail(new Error(`Arquivo não encontrado: ${path}`)),
-            },
+            { label: "Arquivo não encontrado", enabled: false },
             { type: "separator" },
             {
               label: "Copiar caminho",
-              click: () => void clipboard.writeText(path),
-            },
-          ]
-        : [
-            {
-              label: "Abrir no navegador",
-              enabled: /^https?:\/\//i.test(target),
-              click: () => void shell.openExternal(target),
-            },
-            {
-              label: "Copiar endereço",
               click: () => void clipboard.writeText(target),
             },
-          ];
+          ]
+        : path
+          ? [
+              {
+                label:
+                  found?.kind === "dir"
+                    ? "Abrir a pasta"
+                    : "Abrir no app padrão",
+                enabled: !runnable.test(path),
+                click: () => void openMentioned(path).catch(fail),
+              },
+              {
+                label: "Mostrar na pasta",
+                click: () => shell.showItemInFolder(path),
+              },
+              { type: "separator" },
+              {
+                label: "Copiar caminho",
+                click: () => void clipboard.writeText(path),
+              },
+            ]
+          : [
+              {
+                label: "Abrir no navegador",
+                enabled: /^https?:\/\//i.test(target),
+                click: () => void shell.openExternal(target),
+              },
+              {
+                label: "Copiar endereço",
+                click: () => void clipboard.writeText(target),
+              },
+            ];
       Menu.buildFromTemplate(items).popup({ window: win });
       return;
     }
@@ -905,6 +967,15 @@ void (previous ? waitForExit(previous) : Promise.resolve()).then(() => {
   return app.whenReady().then(async () => {
     store = new Store(app.getPath("userData"));
     runtime = new Runtime(store, emit, key);
+    voice = new VoiceController(
+      new VoskVoiceEngine(
+        process.env.CODEBIT_VOICE_HOME || join(app.getAppPath(), ".voice"),
+        join(__dirname, "voice-vosk.py"),
+      ),
+      runtime,
+      (state) => emit({ type: "voice", state }),
+      store.settings().voice,
+    );
     bridge = new ImageBridge(
       runtime,
       process.execPath,
@@ -995,7 +1066,7 @@ void (previous ? waitForExit(previous) : Promise.resolve()).then(() => {
         if (url.hostname === "file")
           return net.fetch(
             pathToFileURL(
-              mentionedImage(
+              await mentionedImage(
                 decodeURIComponent(url.pathname.slice(1)),
                 url.searchParams.get("path") ?? "",
               ),
@@ -1037,6 +1108,10 @@ void (previous ? waitForExit(previous) : Promise.resolve()).then(() => {
         throw new Error("Origem não permitida.");
       return handle(z.string().parse(method), args);
     });
+    // A reload or crashed renderer must never leave an invisible microphone.
+    win.webContents.on("did-start-loading", () => voice.stop());
+    win.webContents.on("render-process-gone", () => voice.stop());
+    win.on("closed", () => voice.stop());
     win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     win.webContents.on("will-navigate", (event, url) => {
       if (url !== win.webContents.getURL()) event.preventDefault();
@@ -1101,6 +1176,7 @@ app.on("before-quit", () => {
   updater?.stop();
   source?.stop();
   for (const t of terminals.values()) t.kill();
+  voice?.stop();
   runtime?.close();
   bridge?.close();
   store?.close();

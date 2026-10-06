@@ -375,8 +375,20 @@ export class Runtime {
     const saved: string[] = [];
     for (const path of paths) {
       const info = await stat(path);
-      if (!info.isFile() || info.size > 20_000_000)
-        throw new Error("Anexos devem ser arquivos de até 20 MB.");
+      // Videos go to the agents as a path, never read into memory, so they
+      // may be larger than the other attachments.
+      const video = /[.](mp4|m4v|mov|webm|mkv|avi|wmv|flv|mpe?g|3gp)$/i.test(
+        path,
+      );
+      if (
+        !info.isFile() ||
+        info.size > (video ? 100 * 1024 * 1024 : 20_000_000)
+      )
+        throw new Error(
+          video
+            ? "Vídeos anexados devem ter até 100 MB."
+            : "Anexos devem ser arquivos de até 20 MB (vídeos, até 100 MB).",
+        );
       saved.push(
         await this.saveAttachment(taskId, basename(path), (target) =>
           copyFile(path, target),
@@ -928,8 +940,17 @@ export class Runtime {
       `O Codebit parou o prompt porque ${reason}.`,
     );
   }
-  private notify(taskId: string, body: string) {
-    this.attention({ title: this.task(taskId).title, body, taskId });
+  private notify(
+    taskId: string,
+    body: string,
+    kind: "completed" | "failed" | "waiting" = "waiting",
+  ) {
+    const title = this.task(taskId).title;
+    this.emit({
+      type: "task-signal",
+      signal: { id: randomUUID(), taskId, kind, title },
+    });
+    this.attention({ title, body, taskId });
   }
   // Closing the session would kill background commands and sub-agents, so it
   // stays open: the next message goes to it, and so does the agent's report.
@@ -1009,6 +1030,7 @@ export class Runtime {
         board
           ? `A tarefa do quadro falhou: ${board.title}`
           : "A execução falhou.",
+        "failed",
       );
     if (status === "idle" && this.task(id).status === "idle")
       this.notify(
@@ -1016,6 +1038,7 @@ export class Runtime {
         board
           ? `Tarefa do quadro concluída: ${board.title}`
           : `${agentNames[this.task(id).agent]} terminou.`,
+        "completed",
       );
     if (board) this.workFinished(board.projectId, status);
     void this.checkVersions().catch(() => {});

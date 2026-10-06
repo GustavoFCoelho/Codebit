@@ -165,6 +165,8 @@ export function Inspector({
   selectedArtifact,
   setSelectedArtifact,
   openedImage,
+  openedFile,
+  onFileShown,
   setOpenedImage,
   planRequest,
   tab,
@@ -180,6 +182,10 @@ export function Inspector({
   setSelectedArtifact: (id: string) => void;
   // An image file mentioned in the chat, shown instead of the gallery.
   openedImage?: string;
+  // A file of the task folder a chat link asked to show.
+  openedFile?: { taskId: string; path: string; at: number };
+  // Called once the file is on its way, so a remount does not open it again.
+  onFileShown: () => void;
   setOpenedImage: (path?: string) => void;
   // The plan approval still waiting in the chat, if any.
   planRequest?: string;
@@ -212,6 +218,11 @@ export function Inspector({
     setLoadingFiles(true);
     try {
       setItems(await api("workspace.files", { id: task.id, path: folder }));
+    } catch (e) {
+      // The folder on screen was removed or renamed: back to the root,
+      // without an error on every refresh.
+      if (!folder) throw e;
+      setFolder("");
     } finally {
       setLoadingFiles(false);
     }
@@ -255,6 +266,11 @@ export function Inspector({
     setPrompt(image?.prompt || "");
   }, [image?.id]);
   useEffect(() => setBroken(false), [openedImage]);
+  useEffect(() => {
+    if (!openedFile || openedFile.taskId !== task.id) return;
+    onFileShown();
+    void run(() => openFile(openedFile.path));
+  }, [openedFile?.at]);
   return (
     <aside className="inspector">
       <div className="panel-tabs">

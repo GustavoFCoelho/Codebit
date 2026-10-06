@@ -1,3 +1,4 @@
+import { copyFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { build } from "esbuild";
 import { createServer } from "vite";
@@ -20,6 +21,7 @@ await build({
   outfile: "dist/preload/index.cjs",
   external: ["electron"],
 });
+copyFileSync("src/main/voice-vosk.py", "dist/main/voice-vosk.py");
 const server = await createServer();
 await server.listen();
 const env = { ...process.env, CODEBIT_DEV_URL: "http://127.0.0.1:5173" };

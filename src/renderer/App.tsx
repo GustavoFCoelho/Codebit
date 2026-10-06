@@ -97,11 +97,14 @@ import {
   LinkedText,
   MarkdownLink,
   markdownUrl,
-  remarkImagePaths,
+  remarkFilePaths,
+  isTextPath,
+  type ResolvedPath,
 } from "./mentions";
 import { Inspector } from "./Inspector";
 import { Board, taskMime } from "./Board";
 import { WorkBoard } from "./Work";
+import { VoicePanel } from "./Voice";
 type Modal = "new" | "handoff" | "rename" | "model" | null;
 const MemoInspector = memo(Inspector);
 // Same function identity across renders, always calling the latest version.
@@ -254,6 +257,7 @@ export default function App() {
     setImageProgress(imageProgressByTask.current.get(selected) || "");
     setSelectedArtifact(undefined);
     setOpenedImage(undefined);
+    setOpenedFile(undefined);
     setPop(null);
     localStorage.setItem("codebit.task", selected);
     void run(refresh);
@@ -526,6 +530,33 @@ export default function App() {
     setOpenedImage(path);
     setTab("Imagens");
     setPanel(true);
+  });
+  // A file of the task folder shown in the side panel's file viewer.
+  // Used once, and only in the task it was asked for.
+  const [openedFile, setOpenedFile] = useState<{
+    taskId: string;
+    path: string;
+    at: number;
+  }>();
+  const fileShown = useStable(() => setOpenedFile(undefined));
+  // A path the chat mentions, found by the main process wherever it is:
+  // images go to the panel, text and code of the folder to the file viewer,
+  // folders and other files to Explorer or their app.
+  const openPath = useStable(async (path: string) => {
+    if (!task) return;
+    const found = await api<ResolvedPath>("file.resolve", {
+      id: task.id,
+      path,
+    });
+    if (found.kind === "file" && isImagePath(found.path))
+      return openImage(found.path);
+    if (found.kind === "file" && found.relative && isTextPath(found.path)) {
+      setOpenedFile({ taskId: task.id, path: found.relative, at: Date.now() });
+      setTab("Arquivos");
+      setPanel(true);
+      return;
+    }
+    await api("file.open", { id: task.id, path: found.path });
   });
   const onImage = useStable((action: "open" | "edit", artifactId: string) => {
     setOpenedImage(undefined);
@@ -1102,6 +1133,7 @@ export default function App() {
             </div>
           </div>
         </header>
+        <VoicePanel snapshot={snapshot} onOpen={openTask} />
         {view === "work" &&
         snapshot?.projects.some((p) => p.id === workProject) ? (
           <WorkBoard
@@ -1255,6 +1287,7 @@ export default function App() {
                     onImage={onImage}
                     onImageLoad={onImageLoad}
                     onOpenImage={openImage}
+                    onOpenPath={openPath}
                     onShowPlan={showPlan}
                   />
                 ))}
@@ -1908,6 +1941,8 @@ export default function App() {
                 selectedArtifact={selectedArtifact}
                 setSelectedArtifact={setSelectedArtifact}
                 openedImage={openedImage}
+                openedFile={openedFile}
+                onFileShown={fileShown}
                 planRequest={planRequest}
                 setOpenedImage={setOpenedImage}
                 tab={tab}
@@ -2407,6 +2442,7 @@ const EntryView = memo(
     onImage,
     onImageLoad,
     onOpenImage,
+    onOpenPath,
     onShowPlan,
   }: {
     entry: Entry;
@@ -2418,6 +2454,8 @@ const EntryView = memo(
     onImageLoad: () => void;
     // Opens an image file mentioned in the chat in the side panel.
     onOpenImage: (path: string) => void;
+    // Opens any path the chat mentions where it belongs.
+    onOpenPath: (path: string) => Promise<void>;
     onShowPlan: () => void;
   }) {
     return (
@@ -2449,7 +2487,7 @@ const EntryView = memo(
               </div>
               <div className="markdown">
                 <ReactMarkdown
-                  remarkPlugins={[remarkGfm, remarkImagePaths]}
+                  remarkPlugins={[remarkGfm, remarkFilePaths]}
                   urlTransform={markdownUrl}
                   components={{
                     a: ({ href, children }) => (
@@ -2457,7 +2495,7 @@ const EntryView = memo(
                         href={href}
                         base={{ id: taskId }}
                         run={run}
-                        onOpenImage={onOpenImage}
+                        onOpenPath={onOpenPath}
                       >
                         {children}
                       </MarkdownLink>
@@ -2518,7 +2556,7 @@ const EntryView = memo(
             <span>
               <LinkedText
                 text={e.text}
-                onOpen={onOpenImage}
+                onOpen={(path) => void run(() => onOpenPath(path))}
                 onMenu={(path) =>
                   void run(() => linkMenu({ id: taskId }, path, true))
                 }

@@ -17,7 +17,9 @@
     "smoke:native": "node scripts/smoke-native.mjs",
     "icon": "electron scripts/icon.mjs",
     "shortcut": "node scripts/shortcut.mjs",
-    "package": "npm run build && electron-builder --win portable --publish never"
+    "package": "npm run build && electron-builder --win portable --publish never",
+    "voice:setup": "node scripts/voice-setup.mjs",
+    "test:voice-local": "node scripts/voice-smoke.mjs"
   },
   "build": {
     "appId": "local.codebit.desktop",

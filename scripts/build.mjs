@@ -48,6 +48,7 @@ try {
   });
   await viteBuild();
   copyFileSync("build/icon.png", "dist/icon.png");
+  copyFileSync("src/main/voice-vosk.py", "dist/main/voice-vosk.py");
   // Written last: the app running from the project folder compares these
   // hashes to know whether the interface or the app core changed.
   const hash = (...files) =>
@@ -61,6 +62,7 @@ try {
       builtAt: new Date().toISOString(),
       core: hash(
         "dist/main/index.cjs",
+        "dist/main/voice-vosk.py",
         "dist/main/image-mcp.cjs",
         "dist/preload/index.cjs",
       ),

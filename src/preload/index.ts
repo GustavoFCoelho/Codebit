@@ -1,6 +1,14 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { AppEvent } from "../shared/types";
 const allowed = new Set([
+  "voice.state",
+  "voice.probe",
+  "voice.configure",
+  "voice.enable",
+  "voice.pause",
+  "voice.stop",
+  "voice.discard",
+  "voice.confirm",
   "snapshot",
   "detect",
   "auth",
@@ -79,6 +87,7 @@ const allowed = new Set([
   "update.cancel",
   "settings.updateFolder",
   "file.open",
+  "file.resolve",
   "file.reveal",
   "link.menu",
   "window.minimize",

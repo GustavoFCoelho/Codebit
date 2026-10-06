@@ -366,6 +366,7 @@ export interface SkillInfo {
   source: string;
 }
 export interface Settings {
+  voice?: import("./voice").VoiceOptions;
   cliPaths: Partial<Record<AgentId, string>>;
   comfyUrl: string;
   defaultModels: Record<AgentId, string>;
@@ -481,6 +482,8 @@ export interface AgentSession {
   models(): Promise<Model[]>;
 }
 export type AppEvent =
+  | { type: "voice"; state: import("./voice").VoiceState }
+  | { type: "task-signal"; signal: import("./voice").TaskSignal }
   | { type: "refresh"; taskId?: string }
   | { type: "terminal"; taskId: string; data: string }
   | { type: "image-progress"; taskId: string; message: string }

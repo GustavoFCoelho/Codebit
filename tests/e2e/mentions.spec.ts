@@ -20,6 +20,13 @@ test("imagens mencionadas no chat abrem no painel lateral", async () => {
   await writeFile(scene, "blend");
   await writeFile(join(folder, "docs", "nota.md"), "# Nota");
   await writeFile(join(folder, "tools", "rodar.bat"), "echo oi");
+  await writeFile(join(folder, "tools", "instalar.exe"), "MZ");
+  // A package the agent made in a subfolder, and a note elsewhere.
+  await mkdir(join(folder, "blender", "dist"), { recursive: true });
+  const zip = join(folder, "blender", "dist", "pacote_saia_v003.zip");
+  await writeFile(zip, "zip");
+  await mkdir(join(folder, "notas"));
+  await writeFile(join(folder, "notas", "leia.md"), "# Leia-me");
   const store = new Store(join(root, "data"));
   const now = new Date().toISOString();
   const task: Task = {
@@ -54,8 +61,14 @@ test("imagens mencionadas no chat abrem no painel lateral", async () => {
   });
   entry(
     "assistant",
-    `[Cena Blender v004](${scene.replaceAll("\\", "/")}) · [Registro](docs/nota.md) · [Script](tools/rodar.bat) · [Sumido](nao/existe.md) · [Site](https://example.com)`,
+    `[Cena Blender v004](${scene.replaceAll("\\", "/")}) · [Registro](docs/nota.md) · [Script](tools/rodar.bat) · [Programa](tools/instalar.exe) · [Sumido](nao/existe.md) · [Site](https://example.com)`,
     { agent: "codex" },
+  );
+  // As in the report: relative to the subfolder the agent worked in.
+  entry(
+    "assistant",
+    "O novo pacote de teste é o `dist/pacote_saia_v003.zip`. Veja também `leia.md`; rode `console.log` no teste.",
+    { agent: "claude" },
   );
   store.close();
   const env: Record<string, string> = {
@@ -96,7 +109,7 @@ test("imagens mencionadas no chat abrem no painel lateral", async () => {
     ).toBeVisible();
     // Inline code in the reply, relative to the task folder.
     await page.getByRole("link", { name: "img/tela.png" }).click();
-    await expect(path).toHaveText("img/tela.png");
+    await expect(path).toHaveText(image);
     await expect.poll(() => loaded(".inspector .inspector-image")).toBe(1);
     // The attached image.
     await page.locator(".entry-user a.attachment").click();
@@ -130,16 +143,43 @@ test("imagens mencionadas no chat abrem no painel lateral", async () => {
     const link = (name: string) => page.getByRole("link", { name });
     await link("Cena Blender v004").click();
     await expect.poll(opened).toEqual([scene]);
+    // Text files of the folder open in the side panel's file viewer.
+    const viewer = page.locator(".inspector .file-panel");
     await link("Registro").click();
-    await expect.poll(opened).toEqual([scene, join(folder, "docs", "nota.md")]);
-    // Programs and scripts never open from a link.
+    await expect(viewer).toContainText(join("docs", "nota.md"));
+    await expect(viewer.locator(".monaco-editor")).toContainText("Nota");
+    // Scripts too: shown, never run.
     await link("Script").click();
+    await expect(viewer).toContainText(join("tools", "rodar.bat"));
+    await expect(viewer.locator(".monaco-editor")).toContainText("echo oi");
+    // Programs never open from a link.
+    await link("Programa").click();
     await expect(
       page.getByText(/Por segurança, programas e scripts/),
     ).toBeVisible();
+    await page.getByRole("button", { name: "Fechar aviso" }).click();
     await link("Sumido").click();
     await expect(page.getByText(/Arquivo não encontrado/)).toBeVisible();
-    expect(await opened()).toHaveLength(2);
+    await page.getByRole("button", { name: "Fechar aviso" }).click();
+    // The package named relative to the subfolder opens where it really is.
+    await link("dist/pacote_saia_v003.zip").click();
+    await expect.poll(opened).toEqual([scene, zip]);
+    // A name alone links once found; code that is not a file stays code.
+    await link("leia.md").click();
+    await expect(viewer).toContainText(join("notas", "leia.md"));
+    // Reopening the panel does not open the file again, nor warn about it.
+    for (let i = 0; i < 2; i++) {
+      await page.getByTitle("Alternar painel").click();
+      await page.getByTitle("Alternar painel").click();
+    }
+    await page.waitForTimeout(500);
+    await expect(page.locator(".toast")).toHaveCount(0);
+    await expect(page.getByRole("link", { name: "console.log" })).toHaveCount(
+      0,
+    );
+    await expect(
+      page.locator(".entry-assistant code", { hasText: "console.log" }),
+    ).toBeVisible();
     // Right click: open, show in folder and copy the path.
     const menu = () =>
       app.evaluate(() =>

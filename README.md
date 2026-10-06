@@ -43,7 +43,7 @@ O binário é local e não possui assinatura comercial nem atualização automá
 - Diretrizes para os agentes: instruções permanentes enviadas a Codex, Claude e Devin. A padrão autoriza atualizar CLIs desatualizados, e o Codebit detecta sozinho a nova versão.
 - Catálogo automático de modelos informado pelo CLI, atualização manual e identificador manual como alternativa.
 - Esforço de raciocínio por modelo, com níveis informados pelo CLI e escolha persistida por tarefa, inclusive nas retomadas.
-- Conversas em streaming, retomada da sessão nativa, interrupção, anexos (inclusive imagens coladas), histórico SQLite, busca e arquivamento.
+- Conversas em streaming, retomada da sessão nativa, interrupção, anexos de até 20 MB (vídeos, até 100 MB; inclusive imagens coladas), histórico SQLite, busca e arquivamento.
 - Aprovações de ferramentas e respostas a perguntas dos agentes.
 - Pasta original como padrão, várias conversas em paralelo no mesmo projeto e opção de worktree Git baseada em HEAD. Mudanças não commitadas não são copiadas para a worktree.
 - Transferência de contexto editável para uma nova tarefa ligada à original, com outro agente.
@@ -117,9 +117,32 @@ Caminhos de imagem citados na conversa viram links: nas respostas (texto ou `có
 
 ### Links para arquivos locais
 
-Links que os agentes escrevem para arquivos locais funcionam como no Explorer. O Codex, por exemplo, usa `[Cena](D:/projeto/cena.blend)`. Valem caminhos absolutos (`D:/…`, `/D:/…`, `file://`), `~/…` e caminhos relativos à pasta da tarefa, e âncoras de linha como `#L12` ou `:12` são ignoradas. Ao clicar, imagens abrem no painel lateral e os demais arquivos abrem no app padrão do Windows (um `.blend` abre no Blender, por exemplo). Com o botão direito, qualquer link mostra **Abrir no app padrão**, **Mostrar na pasta** e **Copiar caminho**; links da web mostram **Abrir no navegador** e **Copiar endereço**.
+Os caminhos de arquivos que os agentes escrevem no chat funcionam como links. Isso vale para:
 
-Por segurança, programas, scripts, atalhos, instaladores e documentos do Office com macro (`.exe`, `.bat`, `.ps1`, `.py`, `.lnk`, `.msi`, `.docm` e semelhantes) não abrem por um link do chat. Para esses, use **Mostrar na pasta** ou **Copiar caminho**.
+- links em markdown, como o Codex escreve: `[Cena](D:/projeto/cena.blend)`;
+- caminhos no texto e em código inline, como `dist/pacote_v003.zip`, `C:\Users\…` ou `./docs/a.md`.
+
+Nomes soltos em código inline, como `README.md`, e pastas, como `src/main`, só viram link depois que o Codebit confirma que existem; assim `console.log` ou `Node.js` continuam como texto. Âncoras de linha como `#L12` ou `:12` são ignoradas.
+
+**Onde o arquivo é procurado.** Quando o caminho não existe exatamente como está escrito, o Codebit procura o arquivo na pasta da tarefa:
+
+- caminho relativo a uma subpasta onde o agente estava (`dist/x.zip`, quando o arquivo está em `blender/dist/x.zip`);
+- caminho encurtado com `…` ou `...` (`…/x.zip`, `blender/…/x.zip`);
+- caminho absoluto antigo ou de outra máquina, reconhecido pelo final;
+- estilo do Git Bash e do WSL (`/d/Git/…`, `/mnt/d/…`).
+
+Com várias versões do mesmo arquivo, abre a mais recente. Um nome solto repetido não é adivinhado. Pastas de dependências e caches (`node_modules`, `.git` e semelhantes) ficam fora da busca.
+
+**Ao clicar:**
+
+- imagens abrem no painel lateral;
+- arquivos de texto e código da pasta da tarefa abrem no visualizador **Arquivos** do painel, inclusive scripts, que são só exibidos;
+- pastas abrem no Explorer;
+- os demais arquivos abrem no app padrão do Windows (um `.blend` abre no Blender, por exemplo).
+
+Com o botão direito, qualquer link mostra **Abrir no app padrão**, **Mostrar na pasta** e **Copiar caminho**, ou avisa que o arquivo não foi encontrado. Links da web mostram **Abrir no navegador** e **Copiar endereço**.
+
+Por segurança, programas, atalhos, instaladores e documentos do Office com macro (`.exe`, `.lnk`, `.msi`, `.docm` e semelhantes) nunca abrem por um link do chat. Scripts (`.bat`, `.ps1`, `.py`) também não rodam: de dentro da pasta da tarefa, abrem só para leitura no painel. Para os demais casos, use **Mostrar na pasta** ou **Copiar caminho**.
 
 ## Skills e MCP
 
@@ -335,6 +358,38 @@ Conexões adicionadas no Codebit recebem o prefixo `codebit_` e são aplicadas �
 ```
 
 `agent` aceita `codex`, `claude`, `devin` ou `both` (todos os agentes). Para HTTP, use `transport: "http"` e `url`; o Devin recebe apenas servidores stdio. A autenticação interativa de servidores nativos continua no CLI. Os nomes `images` e `agents` são reservados às pontes internas de imagens e sub-agentes, que usam credenciais locais temporárias por tarefa.
+
+## Voz local com Vosk
+
+A faixa **Voz**, abaixo do título, controla a tarefa escolhida explicitamente. O microfone começa **desligado** em toda abertura ou recarga. **Verificar motor sem abrir microfone** carrega e verifica o modelo local, sem solicitar captura. Nesta máquina, o Vosk português e a voz Microsoft Maria Desktop já estão disponíveis.
+
+1. Abra **Voz**, clique **Verificar motor sem abrir microfone** e escolha a tarefa de destino. O motor **Vosk português · local** será selecionado quando disponível.
+2. Clique **Ativar microfone local**. Diga **Ei, Codebit**, espere aparecer **Ouvindo instrução** e fale uma instrução curta. O reconhecimento encerra na pausa da fala, com limite de 20 segundos.
+3. Revise/corrija a transcrição e clique **Confirmar e enviar**. Se o agente estiver ocupado, o texto entra na fila. A tarefa fica fixa até pausar. Não há confirmação falada nesta versão.
+4. **Pausar microfone** e **Desligar voz** permanecem visíveis. Nenhuma escuta é iniciada automaticamente ao reabrir o aplicativo.
+
+A frase pode ser alterada enquanto pausado. O modelo conhece “code” e “bit” separadamente; a gramática faz essa correspondência para **Ei, Codebit**. **Olá computador** também foi validada com áudio sintético. Frases com palavras fora do vocabulário são recusadas com uma explicação antes de abrir o microfone.
+
+O reconhecimento usa Vosk em um processo Python isolado, com entrada via PortAudio/sounddevice. Os avisos usam `System.Speech` e a voz de saída local do Windows. Não há chave, chamada de API ou envio de áudio. Enquanto ativado, o reconhecimento local aguarda a frase no microfone. O Codebit não grava áudio em arquivos; somente o texto confirmado segue para o CLI da tarefa.
+
+Os avisos da tarefa selecionada cobrem término, falha e necessidade de intervenção. O aviso de término espera a fila e o trabalho em segundo plano; significa que o agente terminou, não que o resultado foi validado. Durante revisão e fala de saída, a entrada fica fechada. A fala só começa depois da confirmação de fechamento do fluxo de entrada. Recarregar, fechar a janela, pausar ou perder o renderer desliga a captura. Aprovações continuam na conversa.
+
+### Instalação e limites
+
+Para preparar outra cópia a partir do código, com Python x64 instalado:
+
+```powershell
+npm run voice:setup
+npm run build
+```
+
+O instalador cria `.voice/venv`, instala versões fixadas do PyPI e baixa `vosk-model-small-pt-0.3` do domínio oficial do Vosk. O ZIP de aproximadamente 31 MB tem SHA-256 fixado e é extraído somente em `.voice/models`. A pasta `.voice` fica fora do Git. O aplicativo não instala componentes nem baixa modelos sozinho. O runtime foi validado aqui com Python 3.13 x64, Vosk 0.3.45 e sounddevice 0.5.5. Não há servidor persistente: os processos de voz são filhos do Codebit.
+
+No executável portátil, os componentes Python/modelo não estão embutidos: inicie-o com `CODEBIT_VOICE_HOME` apontando para a pasta `.voice` já preparada. No modo código, essa pasta é encontrada automaticamente junto ao projeto. Não mova o ambiente Python depois de criá-lo; reinstale-o no destino.
+
+**Qualidade:** o modelo pequeno é limitado. No teste com Maria, “Crie uma nova tarefa” foi transcrito corretamente, mas “Revise os arquivos do projeto” virou “vivaz os arquivos do projeto”. A revisão visual é obrigatória. Ativação, transcrição, anúncio em arquivo, cancelamento e filas foram testados sem captar microfone; voz humana, distância, ruído e latência de hardware não foram validados. Não substitui um assistente de voz totalmente sem uso das mãos nem integra a identidade/conversa do dot.
+
+`npm run test:voice-local` gera WAVs sintéticos locais e executa o caminho real Vosk → revisão → envio a um simulador → anúncio em WAV → retomada. Não abre microfone, não reproduz áudio e não aciona CLIs de agentes. O relatório fica em `.codebit-test/voice-smoke/report.json`. Os testes automatizados normais não exigem Vosk instalado. Veja [licenças e origem dos componentes](docs/VOICE.md).
 
 ## Permissões e dados
 

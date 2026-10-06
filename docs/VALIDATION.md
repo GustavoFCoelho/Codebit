@@ -7,6 +7,12 @@ Ambiente: Windows 10 x64, Node 22.18, Electron 44.4.5. Data: 25/09/2026.
 - **Sub-agentes padrão:** em Configurações → Comportamento, com a opção de aplicar a todas as conversas. **Voltar ao padrão** faz uma conversa ajustada seguir o padrão de novo (a IPC `task.update` aceita `subagents: null`).
 - **Interface:** propostas P1 a P3 de `docs/UI-ANALISE.md`, mantendo a paleta. O resumo por item está no próprio documento, com capturas de antes e depois.
 - **Arquivar e excluir tarefas:** botões na linha da barra lateral, menu do clique direito e botões na barra de título. A exclusão (IPC `task.delete`) pede confirmação, recusa tarefas trabalhando e nunca altera a pasta do projeto.
+- **Links para arquivos no chat:**
+  - Caminhos no texto e em código inline viram links. Nomes soltos e pastas só depois de o Codebit confirmar que existem.
+  - O processo principal acha o arquivo citado de uma subpasta, encurtado com `…`, com caminho absoluto antigo ou no estilo do Git Bash e do WSL.
+  - Texto e código da pasta abrem no visualizador do painel.
+  - Validado com o caso relatado: `dist/…_saia.zip` citado a partir de uma subpasta.
+  - Rodaram 10 testes novos e o fluxo Electron de menções, ampliado.
 - **Quadro de tarefas por projeto:**
   - fila "A fazer" com despacho automático quando o modo tarefas está ligado, respeitando o limite de simultâneas;
   - sessões internas fora das conversas;

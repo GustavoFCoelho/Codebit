@@ -2,8 +2,14 @@ import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, join } from "node:path";
 import { capture } from "./process";
 export async function within(root: string, path: string) {
-  const base = await realpath(root),
-    target = await realpath(resolve(root, path));
+  const base = await realpath(root);
+  const target = await realpath(resolve(root, path)).catch((e) => {
+    throw e?.code === "ENOENT"
+      ? new Error(
+          `Não encontrado na pasta da tarefa: ${path}. Ele pode ter sido movido ou apagado.`,
+        )
+      : e;
+  });
   const rel = relative(base, target);
   if (
     rel === ".." ||
