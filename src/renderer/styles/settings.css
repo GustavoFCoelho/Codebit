@@ -585,3 +585,37 @@ details pre {
   font-size: 11px;
   max-height: 140px;
 }
+/* Secrets: the name as a variable, the value always hidden. */
+.secret-row > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.secret-name {
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+}
+.secret-value {
+  margin-left: auto;
+  color: var(--faint);
+  letter-spacing: 2px;
+}
+.secret-input {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.secret-input input {
+  flex: 1;
+}
+.secret-warning {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--amber-text);
+  background: var(--amber-bg);
+  border: 1px solid var(--amber-border);
+  border-radius: var(--radius);
+}

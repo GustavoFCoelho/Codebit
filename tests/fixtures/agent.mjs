@@ -13,6 +13,11 @@ let responseText = "Olá, ação concluída.";
 let userMessages = 0;
 // Claude's permission mode, changed at runtime by set_permission_mode.
 let permissionMode = null;
+// NOCONTEXT plays a Claude Code without get_context_usage.
+let noContext = false;
+// PreToolUse hooks registered by the client; DELETE:<command> asks them about
+// a Bash command before "running" it.
+let hookIds = [];
 const out = (value) => process.stdout.write(JSON.stringify(value) + "\n");
 // Markers in the prompt: MODE reports permission settings, ECHO returns the
 // prompt, GUIDE returns the system instructions, SLOW delays the answer, HOLD
@@ -20,10 +25,73 @@ const out = (value) => process.stdout.write(JSON.stringify(value) + "\n");
 // later; BGWAIT leaves it running; COUNT reports the messages this process got.
 // EDIT reports an edit of src/shared.ts with the CLI's own edit tool;
 // FAILTURN ends the Codex turn with an error; EXITPLAN makes Claude ask to
-// leave plan mode. LOOP, TDD and FAILS feed the loop guard.
+// leave plan mode. LOOP, TDD and FAILS feed the loop guard. WHERE reports
+// the Codex thread resumed and the folder; ENVVAR:NAME, a variable.
+// Claude Code's get_context_usage (detail "full"), as version 2.1.284 answers.
+const contextUsage = {
+  categories: [
+    { name: "System prompt", tokens: 2400, kind: "used" },
+    { name: "System tools", tokens: 9500, kind: "used" },
+    { name: "MCP tools", tokens: 1000, kind: "used" },
+    {
+      name: "MCP tools (deferred)",
+      tokens: 21000,
+      kind: "deferred",
+      isDeferred: true,
+    },
+    { name: "Memory files", tokens: 300, kind: "used" },
+    { name: "Skills", tokens: 5200, kind: "used" },
+    { name: "Messages", tokens: 81600, kind: "used" },
+    { name: "Autocompact buffer", tokens: 33000, kind: "buffer" },
+    { name: "Free space", tokens: 67000, kind: "free" },
+  ],
+  totalTokens: 100000,
+  maxTokens: 200000,
+  memoryFiles: [
+    { path: "D:\\projeto\\CLAUDE.md", type: "Project", tokens: 300 },
+  ],
+  mcpTools: [
+    {
+      name: "mcp__codebit_images__generate_image",
+      serverName: "codebit_images",
+      tokens: 450,
+      isLoaded: true,
+    },
+    {
+      name: "mcp__codebit_images__edit_image",
+      serverName: "codebit_images",
+      tokens: 550,
+      isLoaded: true,
+    },
+    {
+      name: "mcp__higgsfield__render",
+      serverName: "higgsfield",
+      tokens: 21000,
+      isLoaded: false,
+    },
+  ],
+  skills: {
+    skillFrontmatter: [
+      { name: "dataviz", tokens: 480 },
+      { name: "code-review", tokens: 280 },
+    ],
+  },
+  messageBreakdown: {
+    toolResultTokens: 60000,
+    toolCallTokens: 4000,
+    assistantMessageTokens: 12000,
+    userMessageTokens: 5000,
+    attachmentTokens: 0,
+    unattributedTokens: 600,
+    redirectedContextTokens: 0,
+  },
+};
 const respondTo = (text, mode) => {
   if (text.includes("MODE")) responseText = JSON.stringify(mode);
   if (text.includes("ECHO")) responseText = text;
+  // ENVVAR:NAME answers with that variable of the agent's process.
+  const env = /ENVVAR:(\w+)/.exec(text);
+  if (env) responseText = `valor: ${process.env[env[1]] ?? "(ausente)"}`;
   return text.includes("SLOW") ? 200 : 30;
 };
 // Version checks get no recognizable version unless a test sets one.
@@ -241,7 +309,17 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     if (imageThread && m.method === "turn/start") {
       out({ id: m.id, result: { turn: { id: "turn-1" } } });
       const text = m.params.input[0].text;
-      const image = m.params.input.find((i) => i.type === "localImage");
+      const images = m.params.input.filter((i) => i.type === "localImage");
+      // A compliant model passes the marked prompt on, plus the lines after
+      // it; REWRITE plays one that writes its own.
+      const marked = text.match(/<<<PROMPT\n([\s\S]*?)\nPROMPT>>>/);
+      const revised = text.includes("REWRITE")
+        ? "versão reescrita pelo modelo"
+        : marked
+          ? [marked[1], text.slice(marked.index + marked[0].length).trim()]
+              .filter(Boolean)
+              .join("\n")
+          : text;
       if (text.includes("HOLD")) return;
       if (text.includes("EMPTY_DETAIL")) {
         out({
@@ -280,9 +358,13 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         type: "imageGeneration",
         id: "image-1",
         status: "completed",
-        revisedPrompt: text,
-        // Edits echo the reference so tests can verify it was sent.
-        result: image ? readFileSync(image.path).toString("base64") : png,
+        revisedPrompt: revised,
+        // Edits echo the references, in order, so tests can verify them.
+        result: images.length
+          ? Buffer.concat(images.map((i) => readFileSync(i.path))).toString(
+              "base64",
+            )
+          : png,
         failure: text.includes("LIMIT")
           ? { type: "usageLimitExceeded", limitId: "images", resetsAt: null }
           : null,
@@ -391,6 +473,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       });
       if (text.includes("GUIDE"))
         responseText = threadParams.developerInstructions;
+      if (text.includes("WHERE"))
+        responseText = JSON.stringify({
+          resumed: threadParams.threadId ?? null,
+          cwd: threadParams.cwd ?? process.cwd(),
+        });
       if (text.includes("BACKGROUND")) {
         const item = {
           type: "commandExecution",
@@ -550,7 +637,13 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         out({
           id: 900,
           method: "item/commandExecution/requestApproval",
-          params: { command: "npm test", cwd: process.cwd() },
+          // APPROVE:<command> asks about that command.
+          params: {
+            command: text.includes("APPROVE:")
+              ? text.split("APPROVE:")[1].trim()
+              : "npm test",
+            cwd: process.cwd(),
+          },
         });
         pending = "approve";
       } else setTimeout(finish, delay);
@@ -578,36 +671,43 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     if (m.type === "control_request") {
       const r = m.request;
       if (r.subtype === "set_permission_mode") permissionMode = r.mode;
+      if (r.subtype === "initialize")
+        hookIds = r.hooks?.PreToolUse?.[0]?.hookCallbackIds ?? [];
       out({
         type: "control_response",
         response: {
           subtype: "success",
           request_id: m.request_id,
           response:
-            r.subtype === "initialize"
-              ? {
-                  models: [
-                    {
-                      value: "test-model",
-                      displayName: "Test model",
-                      supportsEffort: true,
-                      supportedEffortLevels: ["low", "medium", "high"],
-                    },
-                  ],
-                  commands: [
-                    {
-                      name: "revisar",
-                      description: "Revisa o código",
-                      argumentHint: "[arquivo]",
-                    },
-                  ],
-                }
-              : {},
+            r.subtype === "get_context_usage"
+              ? noContext
+                ? {}
+                : contextUsage
+              : r.subtype === "initialize"
+                ? {
+                    models: [
+                      {
+                        value: "test-model",
+                        displayName: "Test model",
+                        supportsEffort: true,
+                        supportedEffortLevels: ["low", "medium", "high"],
+                      },
+                    ],
+                    commands: [
+                      {
+                        name: "revisar",
+                        description: "Revisa o código",
+                        argumentHint: "[arquivo]",
+                      },
+                    ],
+                  }
+                : {},
         },
       });
     }
     if (m.type === "user") {
       const text = m.message.content[0].text;
+      if (text.includes("NOCONTEXT")) noContext = true;
       // ORPHAN: a session that stopped abruptly with background work comes
       // back reporting it stopped, in a turn of its own that ends in an empty
       // result before our message is taken.
@@ -812,6 +912,24 @@ createInterface({ input: process.stdin }).on("line", (line) => {
             input: { plan, planFilePath },
           },
         });
+      } else if (text.includes("DELETE:")) {
+        if (!hookIds.length) {
+          responseText = "sem gancho";
+          setTimeout(finish, delay);
+        } else
+          out({
+            type: "control_request",
+            request_id: "hook-1",
+            request: {
+              subtype: "hook_callback",
+              callback_id: hookIds[0],
+              input: {
+                hook_event_name: "PreToolUse",
+                tool_name: "Bash",
+                tool_input: { command: text.split("DELETE:")[1].trim() },
+              },
+            },
+          });
       } else if (text.includes("APPROVE") || text.includes("EXITPLAN")) {
         out({
           type: "control_request",
@@ -828,6 +946,15 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     if (m.type === "control_response") {
       if (m.response.request_id === "exitplan-1")
         responseText = m.response.response.message;
+      if (m.response.request_id === "hook-1") {
+        const hook = m.response.response?.hookSpecificOutput;
+        responseText =
+          hook?.permissionDecision === "deny"
+            ? `bloqueado: ${hook.permissionDecisionReason}`
+            : hook?.permissionDecision === "allow"
+              ? "permitido"
+              : "liberado";
+      }
       finish();
     }
   }

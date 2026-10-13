@@ -15,8 +15,60 @@ import type {
 import { appVersion } from "../shared/types";
 // The Codex App Server picks the image model; clients cannot select it.
 export const codexImageModel = "gpt-image";
-const codexImageInstructions =
-  "Você é o gerador de imagens do Codebit. Use a ferramenta nativa de geração de imagens exatamente uma vez para atender ao pedido do usuário. Se houver uma imagem anexada, edite essa imagem. Não execute comandos, não leia arquivos e não faça perguntas.";
+// The Codex model writes the prompt of its image tool, and left alone it
+// rewrites and expands the request. The prompt goes between markers so it can
+// be passed on as written; format and background go after it.
+const codexImageInstructions = [
+  "Você é o gerador de imagens do Codebit. Chame a ferramenta nativa de geração de imagens exatamente uma vez.",
+  "O prompt da ferramenta é o texto entre as linhas <<<PROMPT e PROMPT>>>, copiado na íntegra: não resuma, não traduza, não reescreva, não corrija e não acrescente detalhes, mesmo que pareça incompleto ou ambíguo.",
+  "Formato e fundo, quando informados depois do prompt: aplique pelos parâmetros da ferramenta; se ela não tiver esses parâmetros, acrescente ao fim do prompt apenas uma frase curta com eles.",
+  "Imagens anexadas são as referências do prompt, na ordem em que foram anexadas: edite-as ou use-as como o prompt pedir.",
+  "Não execute comandos, não leia arquivos e não faça perguntas.",
+].join(" ");
+const shapes: Record<string, string> = {
+  "1024x1024": "quadrado",
+  "1536x1024": "paisagem",
+  "1024x1536": "retrato",
+  "2048x1152": "paisagem",
+};
+// The message for the Codex image turn: the prompt, then what goes with it.
+export function codexImageText(
+  prompt: string,
+  options: Pick<ImageOptions, "size" | "background">,
+  references: number,
+) {
+  return [
+    "<<<PROMPT",
+    prompt.trim(),
+    "PROMPT>>>",
+    "",
+    options.size !== "auto" &&
+      `Formato: ${shapes[options.size] ?? "personalizado"}, ${options.size} px.`,
+    options.background === "transparent" &&
+      "Fundo: transparente (PNG com canal alfa).",
+    options.background === "opaque" && "Fundo: opaco.",
+    references === 1 && "1 imagem anexada.",
+    references > 1 && `${references} imagens anexadas.`,
+  ]
+    .filter((line) => line !== false)
+    .join("\n")
+    .trim();
+}
+// Size and transparency, read from the PNG header and chunks.
+export function pngInfo(bytes: Buffer) {
+  const width = bytes.readUInt32BE(16);
+  const height = bytes.readUInt32BE(20);
+  const colorType = bytes[25];
+  let alpha = colorType === 4 || colorType === 6;
+  for (let at = 8; !alpha && at + 8 <= bytes.length;) {
+    const length = bytes.readUInt32BE(at);
+    const type = bytes.toString("latin1", at + 4, at + 8);
+    if (type === "tRNS") alpha = true;
+    if (type === "IDAT" || type === "IEND") break;
+    at += 12 + length;
+  }
+  return { width, height, alpha };
+}
 async function initCodex(channel: Channel) {
   await channel.request("initialize", {
     clientInfo: { name: "codebit", title: "Codebit", version: appVersion },
@@ -306,11 +358,12 @@ export class ImageService {
     }
     return result;
   }
+  // inputPaths: images to edit or use as references, in order.
   async generate(
     taskId: string,
     prompt: string,
     options: ImageOptions,
-    inputPath?: string,
+    inputPaths: string[] = [],
   ): Promise<Artifact> {
     if (this.jobs.has(taskId))
       throw new Error("A tarefa já tem uma geração em andamento.");
@@ -320,18 +373,22 @@ export class ImageService {
     const id = randomUUID();
     this.progress(taskId, "Preparando geração…");
     try {
-      const bytes =
+      const { bytes, revisedPrompt } =
         options.provider === "codex"
-          ? await this.codex(taskId, prompt, options, inputPath, abort.signal)
-          : options.provider === "openai"
-            ? await this.openai(prompt, options, inputPath, abort.signal)
-            : await this.comfy(
-                taskId,
-                prompt,
-                options,
-                inputPath,
-                abort.signal,
-              );
+          ? await this.codex(taskId, prompt, options, inputPaths, abort.signal)
+          : {
+              bytes:
+                options.provider === "openai"
+                  ? await this.openai(prompt, options, inputPaths, abort.signal)
+                  : await this.comfy(
+                      taskId,
+                      prompt,
+                      options,
+                      inputPaths,
+                      abort.signal,
+                    ),
+              revisedPrompt: undefined,
+            };
       if (abort.signal.aborted)
         throw new Error(
           "Geração cancelada localmente. O provedor pode concluir a solicitação já enviada.",
@@ -344,7 +401,11 @@ export class ImageService {
         throw new Error(
           "O provedor retornou um formato incompatível. Configure uma saída PNG no workflow.",
         );
-      return await this.save(taskId, prompt, options, bytes, id);
+      return {
+        ...(await this.save(taskId, prompt, options, bytes, id)),
+        ...(revisedPrompt ? { revisedPrompt } : {}),
+        ...(inputPaths.length ? { references: inputPaths } : {}),
+      };
     } finally {
       this.jobs.delete(taskId);
       this.progress(taskId, "");
@@ -386,7 +447,7 @@ export class ImageService {
     taskId: string,
     prompt: string,
     options: ImageOptions,
-    inputPath: string | undefined,
+    inputPaths: string[],
     signal: AbortSignal,
   ) {
     const installation = this.codexInstallation();
@@ -394,122 +455,119 @@ export class ImageService {
       throw new Error(
         "Codex CLI não encontrado. Selecione o executável em Configurações → Agentes.",
       );
-    return new Promise<Buffer>((resolve, reject) => {
-      let settled = false;
-      const done = (error?: Error, bytes?: Buffer) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reply.close();
-        signal.removeEventListener("abort", cancel);
-        channel.close();
-        if (!error) return resolve(bytes!);
-        const detail = imageDiagnosticText(error.message);
-        const folder = join(this.root, "logs", "image-generations");
-        const path = join(folder, randomUUID() + ".json");
-        void mkdir(folder, { recursive: true })
-          .then(() =>
-            writeFile(path, JSON.stringify(reply.diagnostic(detail), null, 2)),
-          )
-          .then(
-            () => reject(new Error(`${detail}\nDiagnóstico: ${path}`)),
-            () =>
-              reject(
-                new Error(
-                  `${detail}\nNão foi possível salvar o diagnóstico local.`,
-                ),
+    return new Promise<{ bytes: Buffer; revisedPrompt?: string }>(
+      (resolve, reject) => {
+        let settled = false;
+        const done = (
+          error?: Error,
+          bytes?: Buffer,
+          revisedPrompt?: string,
+        ) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reply.close();
+          signal.removeEventListener("abort", cancel);
+          channel.close();
+          if (!error) return resolve({ bytes: bytes!, revisedPrompt });
+          const detail = imageDiagnosticText(error.message);
+          const folder = join(this.root, "logs", "image-generations");
+          const path = join(folder, randomUUID() + ".json");
+          void mkdir(folder, { recursive: true })
+            .then(() =>
+              writeFile(
+                path,
+                JSON.stringify(reply.diagnostic(detail), null, 2),
               ),
-          );
-      };
-      const cancel = () =>
-        done(
-          new Error(
-            "Geração cancelada localmente. O Codex pode concluir a solicitação já enviada.",
-          ),
-        );
-      const timer = setTimeout(
-        () =>
+            )
+            .then(
+              () => reject(new Error(`${detail}\nDiagnóstico: ${path}`)),
+              () =>
+                reject(
+                  new Error(
+                    `${detail}\nNão foi possível salvar o diagnóstico local.`,
+                  ),
+                ),
+            );
+        };
+        const cancel = () =>
           done(
             new Error(
-              reply.failureMessage(
-                "Tempo esgotado aguardando a imagem do Codex.",
+              "Geração cancelada localmente. O Codex pode concluir a solicitação já enviada.",
+            ),
+          );
+        const timer = setTimeout(
+          () =>
+            done(
+              new Error(
+                reply.failureMessage(
+                  "Tempo esgotado aguardando a imagem do Codex.",
+                ),
               ),
             ),
-          ),
-        600000,
-      );
-      const reply = new CodexImageReply({
-        success: (bytes) => done(undefined, bytes),
-        failure: (error) => done(error),
-        progress: (text) => this.progress(taskId, text),
-      });
-      const channel = new Channel(
-        installation,
-        ["app-server", "--listen", "stdio://"],
-        this.root,
-        "codex",
-        (msg) => {
-          const p = msg.params || {};
-          if (msg.id != null && msg.method) {
-            channel.send({
-              id: msg.id,
-              error: {
-                code: -32601,
-                message: "Solicitação não suportada na geração de imagens.",
-              },
-            });
-            return;
-          }
-          reply.receive(msg);
-        },
-        (e) => done(new Error(reply.failureMessage(e.message))),
-      );
-      signal.addEventListener("abort", cancel, { once: true });
-      if (signal.aborted) return cancel();
-      void (async () => {
-        await initCodex(channel);
-        const { thread } = await channel.request("thread/start", {
-          cwd: this.root,
-          ephemeral: true,
-          approvalPolicy: "never",
-          sandbox: "read-only",
-          developerInstructions: codexImageInstructions,
+          600000,
+        );
+        const reply = new CodexImageReply({
+          success: (bytes, meta) => done(undefined, bytes, meta.revisedPrompt),
+          failure: (error) => done(error),
+          progress: (text) => this.progress(taskId, text),
         });
-        reply.setThread(thread.id);
-        const [width, height] = options.size.split("x").map(Number);
-        const shape =
-          width === height
-            ? "quadrado"
-            : width > height
-              ? "paisagem"
-              : "retrato";
-        const input: any[] = [
-          {
-            type: "text",
-            text:
-              (inputPath ? "Edite a imagem anexada: " : "") +
-              prompt +
-              (options.size === "auto"
-                ? ""
-                : `\n\nFormato desejado: ${shape}, ${options.size} px.`),
-            text_elements: [],
+        const channel = new Channel(
+          installation,
+          ["app-server", "--listen", "stdio://"],
+          this.root,
+          "codex",
+          (msg) => {
+            const p = msg.params || {};
+            if (msg.id != null && msg.method) {
+              channel.send({
+                id: msg.id,
+                error: {
+                  code: -32601,
+                  message: "Solicitação não suportada na geração de imagens.",
+                },
+              });
+              return;
+            }
+            reply.receive(msg);
           },
-        ];
-        if (inputPath) input.push({ type: "localImage", path: inputPath });
-        // The turn only calls the image tool: low effort spends less of the
-        // plan than the default from config.toml (often xhigh).
-        await channel.request("turn/start", {
-          threadId: thread.id,
-          input,
-          effort: "low",
-        });
-      })().catch((e) => done(e));
-    });
+          (e) => done(new Error(reply.failureMessage(e.message))),
+        );
+        signal.addEventListener("abort", cancel, { once: true });
+        if (signal.aborted) return cancel();
+        void (async () => {
+          await initCodex(channel);
+          const { thread } = await channel.request("thread/start", {
+            cwd: this.root,
+            ephemeral: true,
+            approvalPolicy: "never",
+            sandbox: "read-only",
+            developerInstructions: codexImageInstructions,
+          });
+          reply.setThread(thread.id);
+          const input: any[] = [
+            {
+              type: "text",
+              text: codexImageText(prompt, options, inputPaths.length),
+              text_elements: [],
+            },
+            ...inputPaths.map((path) => ({ type: "localImage", path })),
+          ];
+          // The turn only calls the image tool: low effort spends less of the
+          // plan than the default from config.toml (often xhigh).
+          await channel.request("turn/start", {
+            threadId: thread.id,
+            input,
+            effort: "low",
+          });
+        })().catch((e) => done(e));
+      },
+    );
   }
   private async openai(
     prompt: string,
     options: ImageOptions,
-    inputPath: string | undefined,
+    inputPaths: string[],
     signal: AbortSignal,
   ) {
     const key = this.key();
@@ -521,43 +579,39 @@ export class ImageService {
       throw new Error("Modelo de imagem não suportado.");
     const endpoint =
       "https://api.openai.com/v1/images/" +
-      (inputPath ? "edits" : "generations");
+      (inputPaths.length ? "edits" : "generations");
     const headers: Record<string, string> = { Authorization: `Bearer ${key}` };
+    const fields: Record<string, string> = {
+      model: options.model,
+      prompt,
+      size: options.size,
+      quality: options.quality,
+      output_format: "png",
+      ...(options.background && options.background !== "auto"
+        ? { background: options.background }
+        : {}),
+    };
     let body: any;
-    if (inputPath) {
+    if (inputPaths.length) {
       const form = new FormData();
-      for (const [k, v] of Object.entries({
-        model: options.model,
-        prompt,
-        size: options.size,
-        quality: options.quality,
-        output_format: "png",
-      }))
-        form.append(k, v);
-      const bytes = await readFile(inputPath);
-      form.append(
-        "image[]",
-        new Blob([bytes], {
-          type:
-            extname(inputPath).toLowerCase() === ".png"
-              ? "image/png"
-              : extname(inputPath).toLowerCase() === ".webp"
-                ? "image/webp"
-                : "image/jpeg",
-        }),
-        basename(inputPath),
-      );
+      for (const [k, v] of Object.entries(fields)) form.append(k, v);
+      for (const path of inputPaths)
+        form.append(
+          "image[]",
+          new Blob([await readFile(path)], {
+            type:
+              extname(path).toLowerCase() === ".png"
+                ? "image/png"
+                : extname(path).toLowerCase() === ".webp"
+                  ? "image/webp"
+                  : "image/jpeg",
+          }),
+          basename(path),
+        );
       body = form;
     } else {
       headers["Content-Type"] = "application/json";
-      body = JSON.stringify({
-        model: options.model,
-        prompt,
-        size: options.size,
-        quality: options.quality,
-        output_format: "png",
-        n: 1,
-      });
+      body = JSON.stringify({ ...fields, n: 1 });
     }
     const data = await jsonRequest(endpoint, {
       method: "POST",
@@ -573,9 +627,12 @@ export class ImageService {
     taskId: string,
     prompt: string,
     options: ImageOptions,
-    inputPath: string | undefined,
+    inputPaths: string[],
     signal: AbortSignal,
   ) {
+    if (inputPaths.length > 1)
+      throw new Error("O ComfyUI usa uma imagem de entrada por vez.");
+    const inputPath = inputPaths[0];
     const base = this.settings().comfyUrl.replace(/\/$/, "");
     const workflow = this.workflows().find((w) => w.id === options.workflow);
     if (!workflow) throw new Error("Selecione um workflow.");

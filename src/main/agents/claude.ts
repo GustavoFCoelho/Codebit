@@ -6,9 +6,11 @@ import { nativeModels } from "./models";
 import { claudeCommands } from "./catalog";
 import { claudeWindows } from "./quota";
 import { codebitInstructions } from "../extensions";
+import { claudeContext } from "./context";
 import type {
   AgentEvent,
   AgentSession,
+  InspectCommand,
   Installation,
   Model,
   Task,
@@ -23,6 +25,8 @@ export class ClaudeSession implements AgentSession {
   private channel: Channel;
   private ready: Promise<any>;
   private requests = new Map<string, any>();
+  // Commands held by the blast radius hook, with what they reach.
+  private hooks = new Map<string, string>();
   private textSeen = false;
   private model = "";
   private used = 0;
@@ -37,6 +41,7 @@ export class ClaudeSession implements AgentSession {
     mcp: Record<string, any>,
     private emit: (event: AgentEvent) => void,
     private guidelines = "",
+    private inspect?: InspectCommand,
   ) {
     const args = [
       "--print",
@@ -71,7 +76,22 @@ export class ClaudeSession implements AgentSession {
       (msg) => this.receive(msg),
       (e) => emit({ type: "error", text: e.message }),
     );
-    this.ready = this.channel.request("initialize", { hooks: {} });
+    // Commands that delete a lot stop for the user, even in Bypass: the hook
+    // runs before Claude's own permissions. A long timeout, since a hook that
+    // times out lets the command through.
+    this.ready = this.channel.request("initialize", {
+      hooks: inspect
+        ? {
+            PreToolUse: [
+              {
+                matcher: "Bash|PowerShell",
+                hookCallbackIds: ["codebit-blast"],
+                timeout: 86400,
+              },
+            ],
+          }
+        : {},
+    });
     this.ready.then(
       (r) => emit({ type: "commands", commands: claudeCommands(r.commands) }),
       () => {},
@@ -154,20 +174,27 @@ export class ClaudeSession implements AgentSession {
       const size =
         models.find(([id]) => id === this.model)?.[1].contextWindow ??
         Math.max(0, ...models.map(([, m]) => m.contextWindow || 0));
-      // Local commands such as /context do not call the model.
-      if (this.used)
-        this.emit({ type: "usage", used: this.used, size: size || undefined });
+      const used = this.used;
       this.used = 0;
-      if (msg.is_error)
+      if (msg.is_error) {
+        // Local commands such as /context do not call the model.
+        if (used) this.emit({ type: "usage", used, size: size || undefined });
         this.emit({
           type: "error",
           text: (msg.errors || [msg.result || "Falha no Claude."]).join("\n"),
         });
-      else this.emit({ type: "done" });
+      } else
+        void this.readContext(used, size).finally(() =>
+          this.emit({ type: "done" }),
+        );
     }
     if (msg.type === "control_request") {
       const r = msg.request,
         id = msg.request_id;
+      if (r.subtype === "hook_callback") {
+        void this.guard(id, r.input);
+        return;
+      }
       if (r.subtype !== "can_use_tool") {
         this.channel.send({
           type: "control_response",
@@ -217,18 +244,55 @@ export class ClaudeSession implements AgentSession {
           },
         });
       } else
-        this.emit({
-          type: "request",
-          request: {
-            id,
-            kind: "approval",
-            title: `Permitir ${r.tool_name}?`,
-            detail: JSON.stringify(r.input, null, 2),
-            choices: ["decline", "accept"],
-            tool: r.tool_name,
-          },
-        });
+        void this.blast(r.input?.command, true).then((blast) =>
+          this.emit({
+            type: "request",
+            request: {
+              id,
+              kind: "approval",
+              title: `Permitir ${r.tool_name}?`,
+              detail: JSON.stringify(r.input, null, 2),
+              choices: ["decline", "accept"],
+              tool: r.tool_name,
+              ...(blast ? { blast } : {}),
+            },
+          }),
+        );
     }
+  }
+  private blast(command: unknown, asking: boolean) {
+    return typeof command === "string" && this.inspect
+      ? this.inspect(command, asking).catch(() => undefined)
+      : Promise.resolve(undefined);
+  }
+  // A command about to run: on its way unless it deletes a lot, in which
+  // case the user sees what it reaches and decides.
+  private async guard(id: string, input: any) {
+    const command = input?.tool_input?.command;
+    const blast = await this.blast(command, false);
+    if (!blast) {
+      this.hookAnswer(id, {});
+      return;
+    }
+    this.hooks.set(id, blast.summary);
+    this.emit({
+      type: "request",
+      request: {
+        id,
+        kind: "approval",
+        title: "Confirmar comando que apaga arquivos?",
+        detail: command,
+        choices: ["decline", "accept"],
+        tool: input?.tool_name,
+        blast,
+      },
+    });
+  }
+  private hookAnswer(id: string, output: any) {
+    this.channel.send({
+      type: "control_response",
+      response: { subtype: "success", request_id: id, response: output },
+    });
   }
   async send(text: string, attachments: string[]) {
     await this.ready;
@@ -274,6 +338,21 @@ export class ClaudeSession implements AgentSession {
     });
   }
   respond(id: string, value: any) {
+    const summary = this.hooks.get(id);
+    if (summary !== undefined) {
+      this.hooks.delete(id);
+      const allow = value.decision === "accept";
+      this.hookAnswer(id, {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: allow ? "allow" : "deny",
+          permissionDecisionReason: allow
+            ? "O usuário viu o alcance no Codebit e permitiu."
+            : `O usuário viu o alcance no Codebit (${summary}) e cancelou. Não tente apagar isso por outro caminho: explique o que pretendia e pergunte como seguir.`,
+        },
+      });
+      return;
+    }
     const r = this.requests.get(id);
     if (!r) throw new Error("Esta solicitação não está mais ativa.");
     const response =
@@ -319,6 +398,23 @@ export class ClaudeSession implements AgentSession {
   async interrupt() {
     await this.ready;
     await this.channel.request("interrupt");
+  }
+  // At the end of an answer, what the context is made of: Claude Code works
+  // it out locally, with no call to the model. Versions without the request
+  // show only the total from the answer's usage.
+  private async readContext(used: number, size: number) {
+    let usage: ReturnType<typeof claudeContext>;
+    try {
+      usage = claudeContext(
+        await this.channel.request(
+          "get_context_usage",
+          { detail: "full" },
+          4000,
+        ),
+      );
+    } catch {}
+    if (usage?.parts?.length) this.emit({ type: "usage", ...usage });
+    else if (used) this.emit({ type: "usage", used, size: size || undefined });
   }
   close() {
     this.channel.close();

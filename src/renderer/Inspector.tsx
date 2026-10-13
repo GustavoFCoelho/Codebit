@@ -716,6 +716,19 @@ export function Inspector({
                   alt={image.prompt}
                 />
               )}
+              {image && promptChanged(image) && (
+                <details className="revised-prompt">
+                  <summary>O gerador alterou o prompt</summary>
+                  <p>{image.revisedPrompt}</p>
+                </details>
+              )}
+              {!!image?.references?.length && (
+                <p className="image-references">
+                  {image.references.length === 1
+                    ? "Feita a partir de 1 imagem de referência."
+                    : `Feita a partir de ${image.references.length} imagens de referência.`}
+                </p>
+              )}
             </>
           ) : (
             <div className="panel-empty">
@@ -758,6 +771,28 @@ export function Inspector({
                 )}
               </select>
             </label>
+            {task.images.provider !== "comfyui" && (
+              <label>
+                Fundo
+                <select
+                  value={task.images.background ?? "auto"}
+                  onChange={(e) =>
+                    void run(() =>
+                      patch({
+                        images: {
+                          ...task.images,
+                          background: e.target.value as any,
+                        },
+                      }),
+                    )
+                  }
+                >
+                  <option value="auto">Automático</option>
+                  <option value="transparent">Transparente</option>
+                  <option value="opaque">Opaco</option>
+                </select>
+              </label>
+            )}
             {task.images.provider === "openai" && (
               <label>
                 Qualidade
@@ -860,6 +895,12 @@ export function Inspector({
       )}
     </aside>
   );
+}
+// Whether the generator used another prompt (Codex rewrites it); a format
+// line after the original does not count.
+function promptChanged(a: Artifact) {
+  const norm = (s: string) => s.trim().replace(/\s+/g, " ");
+  return !!a.revisedPrompt && !norm(a.revisedPrompt).startsWith(norm(a.prompt));
 }
 function TerminalPane({
   task,

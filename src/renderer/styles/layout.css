@@ -458,3 +458,134 @@
 .status-spacer {
   flex: 1;
 }
+/* A conversation with a message written and not sent. */
+.task-draft {
+  display: inline-flex;
+  flex-shrink: 0;
+  color: var(--amber);
+}
+/* What the context is made of. Part colors: the validated dark categorical
+   steps (dataviz reference palette, slots 1-4, checked on --surface-3). */
+.statusbar button.context-meter {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  padding: 0;
+  color: var(--muted);
+}
+.context-popover {
+  width: 340px;
+  --part-instructions: #3987e5;
+  --part-tools: #d95926;
+  --part-skills: #199e70;
+  --part-conversation: #c98500;
+}
+.context-total {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.context-stack {
+  display: flex;
+  gap: 2px;
+  height: 10px;
+}
+.context-segment {
+  min-width: 3px;
+  transition: opacity 0.12s;
+}
+.context-segment:first-child {
+  border-radius: 4px 0 0 4px;
+}
+.context-segment:last-child {
+  border-radius: 0 4px 4px 0;
+}
+.context-segment:only-child {
+  border-radius: 4px;
+}
+.context-segment.dim {
+  opacity: 0.35;
+}
+.part-instructions {
+  background: var(--part-instructions);
+}
+.part-tools {
+  background: var(--part-tools);
+}
+.part-skills {
+  background: var(--part-skills);
+}
+.part-conversation {
+  background: var(--part-conversation);
+}
+.context-parts {
+  display: flex;
+  flex-direction: column;
+}
+.context-parts details {
+  margin: 0;
+}
+.context-parts summary {
+  display: grid;
+  grid-template-columns: 12px 10px 1fr auto 42px;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 4px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  list-style: none;
+}
+.context-parts summary::-webkit-details-marker {
+  display: none;
+}
+.context-parts details.hovered > summary,
+.context-parts summary:hover {
+  background: var(--hover);
+}
+.context-parts .chevron {
+  color: var(--faint);
+  transition: transform 0.12s;
+}
+.context-parts details[open] .chevron {
+  transform: rotate(90deg);
+}
+.context-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+.context-tokens {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.context-share {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.context-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 3px 4px 3px 33px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+.context-item > span:first-child {
+  overflow-wrap: anywhere;
+}
+.context-parts details > .help {
+  margin: 2px 0 6px 33px;
+}
+.context-tip {
+  margin: 0;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-2);
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius);
+}

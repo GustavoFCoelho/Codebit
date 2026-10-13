@@ -53,7 +53,7 @@ export class Channel {
     receive: (v: any) => void,
     fail: (e: Error) => void,
   ) {
-    this.child = launch(i.command, [...i.args, ...args], cwd);
+    this.child = launch(i.command, [...i.args, ...args], cwd, i.env);
     // Codex App Server and ACP are both JSON-RPC; ACP requires the version tag.
     const rpc = dialect !== "claude";
     const lines = new JsonLines((msg) => {

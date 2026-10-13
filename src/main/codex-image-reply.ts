@@ -26,7 +26,11 @@ export class CodexImageReply {
   private events: Record<string, unknown>[] = [];
   constructor(
     private options: {
-      success: (bytes: Buffer) => void;
+      // revisedPrompt: the prompt the Codex model gave its image tool.
+      success: (
+        bytes: Buffer,
+        meta: { revisedPrompt?: string; transparentBackground?: boolean },
+      ) => void;
       failure: (error: Error) => void;
       progress: (text: string) => void;
       readImage?: (path: string) => Promise<Buffer>;
@@ -72,6 +76,16 @@ export class CodexImageReply {
     if (p.turnId || p.turn?.id)
       this.turnId = imageDiagnosticText(p.turnId || p.turn.id);
     const item = p.item;
+    const meta = {
+      revisedPrompt:
+        typeof item?.revisedPrompt === "string"
+          ? item.revisedPrompt
+          : undefined,
+      transparentBackground:
+        typeof item?.transparentBackground === "boolean"
+          ? item.transparentBackground
+          : undefined,
+    };
     if (item?.type === "imageGeneration") {
       this.record({
         method: imageDiagnosticText(msg.method),
@@ -90,7 +104,7 @@ export class CodexImageReply {
           );
         } else if (item.result) {
           this.close();
-          this.options.success(Buffer.from(item.result, "base64"));
+          this.options.success(Buffer.from(item.result, "base64"), meta);
         } else if (item.savedPath) {
           // turn/completed can arrive before the asynchronous file read finishes.
           this.reading = true;
@@ -99,7 +113,7 @@ export class CodexImageReply {
             (bytes) => {
               if (this.closed) return;
               this.close();
-              this.options.success(bytes);
+              this.options.success(bytes, meta);
             },
             (error: Error) => this.fail(imageDiagnosticText(error.message)),
           );

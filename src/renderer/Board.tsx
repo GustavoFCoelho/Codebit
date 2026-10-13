@@ -13,13 +13,9 @@ import remarkGfm from "remark-gfm";
 import type { AgentId, BoardCard, Model, Snapshot } from "../shared/types";
 import { agentIds, agentNames } from "../shared/types";
 import { api, artifactUrl } from "./api";
-import {
-  ActivityIcon,
-  AgentMark,
-  ContextMeter,
-  RequestCard,
-  statusName,
-} from "./parts";
+import { getDraft, saveDraft } from "./drafts";
+import { ActivityIcon, AgentMark, RequestCard, statusName } from "./parts";
+import { ContextMeter } from "./Context";
 export const taskMime = "application/x-codebit-task";
 const busy = ["running", "waiting", "queued"];
 // Several tasks side by side; tasks in different folders run in parallel.
@@ -290,7 +286,12 @@ const BoardCardView = memo(
 );
 // Starts a new task on the board with its first message.
 function BoardComposer({ snapshot, run }: { snapshot: Snapshot; run: any }) {
-  const [text, setText] = useState("");
+  // The new task being written is kept like a chat draft.
+  const [text, setRawText] = useState(() => getDraft("board")?.text ?? "");
+  const setText = (value: string) => {
+    setRawText(value);
+    saveDraft("board", value, []);
+  };
   const [projectId, setProjectId] = useState("");
   const [agent, setAgent] = useState<AgentId>("codex");
   const [worktree, setWorktree] = useState(false);

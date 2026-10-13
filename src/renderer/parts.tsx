@@ -14,16 +14,25 @@ import {
   Users,
   Wrench,
   X,
+  TriangleAlert,
+  Folder,
+  File,
 } from "lucide-react";
 import type {
   AgentId,
   AgentInfo,
+  BlastPreview,
   Entry,
   Model,
   SubagentOptions,
   Task,
 } from "../shared/types";
-import { agentIds, agentNames, socialNetworkNames } from "../shared/types";
+import {
+  agentIds,
+  agentNames,
+  formatBytes,
+  socialNetworkNames,
+} from "../shared/types";
 import { effortLabel } from "../shared/models";
 import { api, fileUrl } from "./api";
 // Pieces shared by the chat, the multitask board and the settings.
@@ -261,36 +270,74 @@ export function SubagentOptionsForm({
     </>
   );
 }
-export function ContextMeter({ task, model }: { task: Task; model?: Model }) {
-  const size = task.context?.size ?? model?.contextWindow;
-  const used = task.context?.used;
-  if (!size)
-    return (
-      <span
-        className="context-meter"
-        title="O agente informa o tamanho do contexto na primeira resposta."
-      >
-        Contexto: {used ? `${formatTokens(used)} usados` : "após a resposta"}
-      </span>
-    );
-  const percent = Math.min(100, ((used ?? 0) / size) * 100);
+// What a destructive command reaches, shown before it runs.
+function BlastView({ blast }: { blast: BlastPreview }) {
   return (
-    <span
-      className={`context-meter ${percent >= 85 ? "high" : percent >= 60 ? "mid" : ""}`}
-      title={
-        used === undefined
-          ? `Janela de contexto do modelo: ${size.toLocaleString("pt-BR")} tokens.`
-          : `${used.toLocaleString("pt-BR")} de ${size.toLocaleString("pt-BR")} tokens usados na última resposta (${percent.toFixed(1)}%).`
-      }
-    >
-      <span className="meter">
-        <span style={{ width: `${percent}%` }} />
-      </span>
-      Contexto:{" "}
-      {used === undefined
-        ? formatTokens(size)
-        : `${formatTokens(Math.max(0, size - used))} livres de ${formatTokens(size)}`}
-    </span>
+    <div className="blast" role="group" aria-label="Alcance do comando">
+      <div className="blast-summary">
+        <TriangleAlert size={15} aria-hidden />
+        <strong>{blast.summary}</strong>
+      </div>
+      {blast.outside && (
+        <p className="blast-warning">Inclui itens fora da pasta da tarefa.</p>
+      )}
+      {blast.unknown && (
+        <p className="blast-warning">
+          Não dá para medir tudo: {blast.unknown}.
+        </p>
+      )}
+      {!!blast.temporary?.files && (
+        <p className="help">
+          Inclui {blast.temporary.files.toLocaleString("pt-BR")} arquivos
+          temporários ou de cache ({formatBytes(blast.temporary.bytes)}), que
+          não contam para os limites.
+        </p>
+      )}
+      {blast.filtered && (
+        <p className="help">
+          Os filtros do comando decidem o que sai; os números são o máximo.
+        </p>
+      )}
+      {blast.partial && (
+        <p className="help">
+          A contagem parou antes do fim, porque a pasta é muito grande.
+        </p>
+      )}
+      {blast.entries.length > 0 && (
+        <ul className="blast-entries">
+          {blast.entries.map((e) => (
+            <li key={e.path}>
+              {e.dir ? (
+                <Folder size={13} aria-label="Pasta" />
+              ) : (
+                <File size={13} aria-label="Arquivo" />
+              )}
+              <span className="blast-path">{e.path}</span>
+              <span className="blast-size">{formatBytes(e.bytes)}</span>
+            </li>
+          ))}
+          {blast.more > 0 && (
+            <li className="blast-more">e mais {blast.more}</li>
+          )}
+        </ul>
+      )}
+      {!!blast.git?.length && (
+        <>
+          <p className="help">Alterações não salvas que se perdem:</p>
+          <ul className="blast-entries">
+            {blast.git.map((path) => (
+              <li key={path}>
+                <File size={13} aria-hidden />
+                <span className="blast-path">{path}</span>
+              </li>
+            ))}
+            {!!blast.gitMore && (
+              <li className="blast-more">e mais {blast.gitMore}</li>
+            )}
+          </ul>
+        </>
+      )}
+    </div>
   );
 }
 export function RequestCard({
@@ -334,6 +381,7 @@ export function RequestCard({
         <strong>{r.title}</strong>
         {entry.resolved && <span className="badge">Resolvida</span>}
       </div>
+      {r.blast && <BlastView blast={r.blast} />}
       {r.detail && <pre>{r.detail}</pre>}
       {r.social && (
         <div className="social-preview">
@@ -431,7 +479,9 @@ export function RequestCard({
                   ? "Continuar planejando"
                   : r.social
                     ? "Não publicar"
-                    : "Recusar"}
+                    : r.blast
+                      ? "Cancelar"
+                      : "Recusar"}
               </button>
               <button
                 className="primary"

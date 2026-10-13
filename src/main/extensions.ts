@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { parse } from "smol-toml";
 import type { AgentId, McpConfig, SkillInfo } from "../shared/types";
+import { subagentLabel } from "../shared/types";
 export async function skills(cwd?: string): Promise<SkillInfo[]> {
   const result: SkillInfo[] = [];
   for (const agent of ["codex", "claude"] as AgentId[]) {
@@ -76,10 +77,8 @@ export function codebitInstructions(mcp: Record<string, any>, guidelines = "") {
   return (
     "Você está no Codebit. Responda em português do Brasil." +
     stopWhenStuck +
-    " Use o MCP codebit_images para gerar ou editar imagens; ele utiliza o provedor e modelo escolhidos na tarefa." +
-    (mcp.codebit_agents
-      ? " Para dividir trabalho, use run_subagents do MCP codebit_agents: cada item roda em um sub-agente separado, na mesma pasta. Dê a cada um uma parte independente e evite que editem os mesmos arquivos."
-      : "") +
+    " Use o MCP codebit_images para gerar ou editar imagens; ele utiliza o provedor e modelo escolhidos na tarefa. Ele aceita formato, fundo transparente, várias imagens de referência (inclusive arquivos da pasta) e saveAs para salvar no projeto." +
+    (mcp.codebit_agents ? subagentInstructions(mcp.codebit_agents.env) : "") +
     (mcp.codebit_tasks?.env?.CODEBIT_TASK_ROLE === "board"
       ? " Esta conversa trabalha numa tarefa do quadro do projeto. Ao terminar, se perceber trabalho de continuação que mereça outra tarefa (um bug encontrado, uma melhoria, uma pendência), use add_tasks do MCP codebit_tasks, com título e descrição completa de cada uma. Elas ficam pendentes da aprovação do usuário: não trabalhe nelas agora."
       : mcp.codebit_tasks
@@ -91,6 +90,20 @@ export function codebitInstructions(mcp: Record<string, any>, guidelines = "") {
     guidelinesText(guidelines)
   );
 }
+// The user turned sub-agents on to have work delegated, to the CLI and model
+// they chose; without saying when, agents keep doing everything themselves or
+// use their own native sub-agents.
+function subagentInstructions(env: Record<string, string> = {}) {
+  let label = "";
+  try {
+    label = subagentLabel(JSON.parse(env.CODEBIT_SUBAGENTS));
+  } catch {}
+  return (
+    " Os sub-agentes do Codebit estão ligados nesta conversa: run_subagents, do MCP codebit_agents, executa tarefas em paralelo" +
+    (label ? ` com ${label},` : "") +
+    " na mesma pasta. O usuário os ligou para você delegar: quando o pedido tiver partes que andam sozinhas (pesquisar, revisar, analisar ou alterar arquivos e módulos diferentes, escrever testes, comparar alternativas), divida e delegue essas partes com run_subagents, em vez de fazer tudo em sequência. Para delegar, prefira run_subagents aos seus sub-agentes nativos. Os sub-agentes não veem esta conversa: descreva cada tarefa por completo, com contexto, arquivos e o que entregar, e não deixe dois editarem o mesmo arquivo. Trabalho curto, ou em que cada passo depende do anterior, faça você mesmo. Se as instruções do projeto (AGENTS.md, CLAUDE.md ou semelhantes) proibirem sub-agentes ou delegação, elas valem: não use run_subagents sem um pedido explícito do usuário."
+  );
+}
 // User guidelines from Settings, sent to every agent.
 export function guidelinesText(guidelines = "") {
   return guidelines.trim()
@@ -98,16 +111,24 @@ export function guidelinesText(guidelines = "") {
     : "";
 }
 // Internal servers (codebit_images, codebit_agents) come from the task bridge.
+// vars: the user's secrets, which ${NAME} in a server's env can refer to.
 export function mcpFor(
   agent: AgentId,
   configs: McpConfig[],
   internal: Record<string, any>,
+  vars: Record<string, string> = {},
 ) {
   const servers: Record<string, any> = {};
   for (const [name, server] of Object.entries(internal))
-    // Codex stops MCP calls after 60 s by default; subagents take longer.
     servers[name] =
-      agent === "codex" ? { ...server, tool_timeout_sec: 3600 } : server;
+      // Codex stops MCP calls after 60 s by default; subagents take longer.
+      agent === "codex"
+        ? { ...server, tool_timeout_sec: 3600 }
+        : // Claude Code defers MCP tools behind its tool search, showing the
+          // model only their names; Codebit's own tools stay loaded.
+          agent === "claude"
+          ? { ...server, alwaysLoad: true }
+          : server;
   for (const c of configs.filter(
     (c) => c.enabled && (c.agent === agent || c.agent === "both"),
   )) {
@@ -131,11 +152,12 @@ export function mcpFor(
           Object.entries(c.env || {}).map(([key, value]) => {
             const ref = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value);
             if (ref) {
-              if (!process.env[ref[1]])
+              const found = vars[ref[1]] ?? process.env[ref[1]];
+              if (!found)
                 throw new Error(
                   `Variável de ambiente ausente para MCP ${c.name}: ${ref[1]}`,
                 );
-              return [key, process.env[ref[1]]];
+              return [key, found];
             }
             return [key, value];
           }),

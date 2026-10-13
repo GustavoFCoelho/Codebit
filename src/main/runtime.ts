@@ -9,7 +9,15 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, basename, relative, resolve } from "node:path";
+import {
+  join,
+  basename,
+  dirname,
+  extname,
+  isAbsolute,
+  relative,
+  resolve,
+} from "node:path";
 import type {
   AgentCommand,
   AgentQuota,
@@ -33,6 +41,7 @@ import type {
 } from "../shared/types";
 import {
   agentNames,
+  defaultDeleteGuard,
   defaultImages,
   defaultLoopGuard,
   socialNetworkNames,
@@ -41,6 +50,7 @@ import {
 import type { SocialPreview, WorkItem, WorkSettings } from "../shared/types";
 import { defaultWork, workStatus } from "../shared/types";
 import type { SocialService } from "./social";
+import type { SecretVault } from "./secrets";
 import { Store } from "./store";
 import { discover, checkAuth, readVersion } from "./discovery";
 import { CodexSession } from "./agents/codex";
@@ -49,7 +59,8 @@ import { DevinSession } from "./agents/devin";
 import { probeCommands, probeModels } from "./agents/catalog";
 import { probeQuota } from "./agents/quota";
 import { createWorktree, isGit, removeWorktree } from "./workspace";
-import { codexImageModel, ImageService } from "./images";
+import { codexImageModel, ImageService, pngInfo } from "./images";
+import { blastRadius, meaningful, risky } from "./blast";
 import { mcpFor } from "./extensions";
 import { LoopGuard } from "./guard";
 import type { BridgeKind } from "./bridge";
@@ -63,6 +74,14 @@ export class Runtime {
   images: ImageService;
   // Social networks of the projects; set by the app, absent in some tests.
   social?: SocialService;
+  // The user's secrets, given to every agent session; set by the app.
+  secrets?: SecretVault;
+  // What an agent sees of the image it made: the app sends a reduced copy,
+  // which costs less context; tests get the PNG itself.
+  imagePreview = async (bytes: Buffer, _alpha: boolean) => ({
+    mimeType: "image/png",
+    data: bytes.toString("base64"),
+  });
   // Posts waiting for the user's approval, by their chat request id.
   private socialRequests = new Map<
     string,
@@ -364,7 +383,7 @@ export class Runtime {
       id: randomUUID(),
       taskId,
       kind,
-      text,
+      text: this.redact(text),
       createdAt: new Date().toISOString(),
     };
     this.store.put("entry", entry);
@@ -672,29 +691,42 @@ export class Runtime {
       task.agent === "codex" && !task.effort && selectedModel?.defaultEffort
         ? { ...task, effort: selectedModel.defaultEffort }
         : task;
-    const mcp = mcpFor(task.agent, this.store.settings().mcp, {
-      codebit_images: this.bridgeConfig(task.id, "images"),
-      ...(subagentsFor(task, this.store.settings()).enabled
-        ? { codebit_agents: this.bridgeConfig(task.id, "agents") }
-        : {}),
-      ...(task.projectId && this.social?.accounts(task.projectId).length
-        ? { codebit_social: this.bridgeConfig(task.id, "social") }
-        : {}),
-      // Every session of a project reaches its task board.
-      ...(task.projectId
-        ? {
-            codebit_tasks: this.bridgeConfig(task.id, "tasks", {
-              CODEBIT_TASK_ROLE: task.workItemId ? "board" : "chat",
-            }),
-          }
-        : {}),
-    });
+    const mcp = mcpFor(
+      task.agent,
+      this.store.settings().mcp,
+      {
+        codebit_images: this.bridgeConfig(task.id, "images"),
+        ...(subagentsFor(task, this.store.settings()).enabled
+          ? {
+              codebit_agents: this.bridgeConfig(task.id, "agents", {
+                CODEBIT_SUBAGENTS: JSON.stringify(
+                  subagentsFor(task, this.store.settings()),
+                ),
+              }),
+            }
+          : {}),
+        ...(task.projectId && this.social?.accounts(task.projectId).length
+          ? { codebit_social: this.bridgeConfig(task.id, "social") }
+          : {}),
+        // Every session of a project reaches its task board.
+        ...(task.projectId
+          ? {
+              codebit_tasks: this.bridgeConfig(task.id, "tasks", {
+                CODEBIT_TASK_ROLE: task.workItemId ? "board" : "chat",
+              }),
+            }
+          : {}),
+      },
+      this.secrets?.env(task.agent),
+    );
     const session = this.createSession(installation, sessionTask, mcp, (e) =>
       this.handle(task.id, e),
     );
     this.sessions.set(task.id, session);
     return session;
   }
+  // Every agent process gets the user's secrets, and the agent learns their
+  // names (never the values) along with the user's guidelines.
   private createSession(
     installation: Installation,
     task: Task,
@@ -702,12 +734,33 @@ export class Runtime {
     emit: (event: AgentEvent) => void,
   ): AgentSession {
     return new sessionTypes[task.agent](
-      installation,
+      { ...installation, env: this.secrets?.env(task.agent) },
       task,
       mcp,
       emit,
-      this.store.settings().guidelines,
+      [this.store.settings().guidelines, this.secrets?.notes(task.agent)]
+        .filter((s) => s?.trim())
+        .join("\n\n"),
+      (command, asking, cwd) => this.inspect(task, command, asking, cwd),
     );
+  }
+  // What a command would delete. With an approval already on screen it is
+  // always shown; a command about to run on its own only stops when it goes
+  // beyond the user's limits, outside the task folder, or cannot be measured.
+  private async inspect(
+    task: Task,
+    command: string,
+    asking: boolean,
+    cwd?: string,
+  ) {
+    const preview = await blastRadius(command, cwd || task.cwd);
+    if (!preview) return;
+    if (asking) return meaningful(preview) ? preview : undefined;
+    const guard = this.store.settings().deleteGuard ?? defaultDeleteGuard;
+    return guard.enabled && risky(preview, guard) ? preview : undefined;
+  }
+  private redact(text: string) {
+    return this.secrets ? this.secrets.redact(text) : text;
   }
   // Conversation the task's agent has not seen since it was selected.
   private missedContext(task: Task) {
@@ -750,6 +803,8 @@ export class Runtime {
         context: {
           used: event.used,
           size: event.size ?? this.task(taskId).context?.size,
+          ...(event.parts ? { parts: event.parts } : {}),
+          ...(event.deferred ? { deferred: event.deferred } : {}),
         },
       });
       return;
@@ -800,7 +855,8 @@ export class Runtime {
         this.assistantIds.set(taskId, id);
       }
       const entry = this.store.get<Entry>("entry", id);
-      entry.text += event.text;
+      // Masked on the whole text: a value can arrive split in two chunks.
+      entry.text = this.redact(entry.text + event.text);
       this.store.put("entry", entry);
       if (!this.notifyTimer)
         this.notifyTimer = setTimeout(() => {
@@ -929,15 +985,16 @@ export class Runtime {
   private stopStuckQuick(id: string, reason: string) {
     const q = this.quick.get(id);
     if (!q?.session) return;
+    const what = q.run.kind === "chat" ? "o chat rápido" : "o prompt";
     this.attention({
       title: q.run.name,
-      body: "Parei o prompt: uma ação se repetia sem sucesso.",
+      body: `Parei ${what}: uma ação se repetia sem sucesso.`,
     });
     void q.session.interrupt().catch(() => {});
     this.endQuick(
       id,
       "interrupted",
-      `O Codebit parou o prompt porque ${reason}.`,
+      `O Codebit parou ${what} porque ${reason}.`,
     );
   }
   private notify(
@@ -1043,6 +1100,51 @@ export class Runtime {
     if (board) this.workFinished(board.projectId, status);
     void this.checkVersions().catch(() => {});
   }
+  // Removes a project from Codebit with everything Codebit keeps for it:
+  // conversations, board, saved prompts and social accounts. The project
+  // folder is never touched; worktrees made by Codebit only when asked.
+  async deleteProject(projectId: string, removeWorktrees = false) {
+    const project = this.store.get<Project>("project", projectId);
+    const tasks = this.store
+      .all<Task>("task")
+      .filter((t) => t.projectId === projectId);
+    if (
+      tasks.some((t) => this.busyTask(t.id) || this.sessions.has(t.id)) ||
+      [...this.quick.values()].some(
+        (q) =>
+          q.run.projectId === projectId &&
+          ["running", "waiting"].includes(q.run.status),
+      )
+    )
+      throw new Error(
+        "Interrompa as conversas, as tarefas do quadro e os prompts deste projeto que estão trabalhando antes de removê-lo.",
+      );
+    // Nothing new starts on the board while it goes.
+    this.store.put("project", {
+      ...project,
+      work: { ...(project.work ?? defaultWork), enabled: false },
+    });
+    for (const t of tasks) await this.deleteTask(t.id, removeWorktrees);
+    for (const item of this.workItems(projectId))
+      this.store.delete("work", item.id);
+    for (const prompt of this.store.all<SavedPrompt>("prompt"))
+      if (prompt.projectId === projectId)
+        this.store.delete("prompt", prompt.id);
+    if (this.social)
+      for (const account of this.social.accounts(projectId))
+        await this.social.remove(account.id);
+    for (const post of this.store.all<{ id: string; projectId: string }>(
+      "post",
+    ))
+      if (post.projectId === projectId) this.store.delete("post", post.id);
+    // Finished saved-prompt runs could not become conversations anymore.
+    for (const [id, q] of this.quick)
+      if (q.run.projectId === projectId) await this.dismissQuick(id);
+    this.dispatching.delete(projectId);
+    this.workFailures.delete(projectId);
+    this.store.delete("project", projectId);
+    this.refresh();
+  }
   // Removes a task with what Codebit keeps for it: history, images,
   // attachment copies and its saved plan. The project folder is never
   // touched; the task's own folder or worktree only when asked.
@@ -1127,32 +1229,32 @@ export class Runtime {
     );
     return { task: this.task(task.id), draft: summary };
   }
+  // references: images to edit or combine, after the task's own reference.
   async generate(
     taskId: string,
     prompt: string,
     options?: ImageOptions,
+    references: string[] = [],
   ): Promise<Artifact> {
     const t = this.task(taskId);
     const selected = { ...(options || t.images) };
-    let inputPath: string | undefined;
-    if (selected.inputImage) {
-      const artifact = this.store
-        .artifacts(taskId)
-        .find((a) => a.id === selected.inputImage);
-      const attachment = this.store
-        .all<any>("attachment")
-        .find((a) => a.id === selected.inputImage && a.taskId === taskId);
-      inputPath = artifact?.path || attachment?.path;
-      if (!inputPath || !/\.(png|jpe?g|webp)$/i.test(inputPath))
-        throw new Error("Selecione uma imagem anexada a esta tarefa.");
-      if (selected.provider === "comfyui" && selected.workflow === "sdxl-text")
-        selected.workflow = "sdxl-edit";
-    }
+    const inputPaths = await Promise.all(
+      [
+        ...(selected.inputImage ? [selected.inputImage] : []),
+        ...references,
+      ].map((ref) => this.imageReference(t, ref)),
+    );
+    if (
+      inputPaths.length &&
+      selected.provider === "comfyui" &&
+      selected.workflow === "sdxl-text"
+    )
+      selected.workflow = "sdxl-edit";
     const artifact = await this.images.generate(
       taskId,
       prompt,
       selected,
-      inputPath,
+      inputPaths,
     );
     this.store.put("artifact", artifact);
     this.entry(taskId, "image", prompt, { artifactId: artifact.id });
@@ -1668,17 +1770,87 @@ export class Runtime {
       this.socialRequests.set(id, { taskId, resolve }),
     );
   }
+  // An image of the task (generated or attached) by its id, or a file by
+  // its path, absolute or from the task folder.
+  private async imageReference(task: Task, ref: string) {
+    const path =
+      this.store.artifacts(task.id).find((a) => a.id === ref)?.path ??
+      this.store
+        .all<any>("attachment")
+        .find((a) => a.id === ref && a.taskId === task.id)?.path ??
+      resolve(task.cwd, ref);
+    if (!/\.(png|jpe?g|webp)$/i.test(path))
+      throw new Error(`Use imagens PNG, JPEG ou WebP como referência: ${ref}`);
+    const info = await stat(path).catch(() => null);
+    if (!info?.isFile())
+      throw new Error(
+        `Imagem não encontrada: ${ref}. Use o ID de uma imagem desta tarefa, um anexo ou um caminho de arquivo.`,
+      );
+    if (info.size > 20_000_000)
+      throw new Error(`A imagem passa de 20 MB: ${ref}`);
+    return path;
+  }
+  // Where an agent asked to keep a copy: a PNG inside the task folder.
+  private imageTarget(task: Task, saveAs: string) {
+    const target = resolve(
+      task.cwd,
+      extname(saveAs) ? saveAs : saveAs + ".png",
+    );
+    const rel = relative(task.cwd, target);
+    if (extname(target).toLowerCase() !== ".png")
+      throw new Error("saveAs precisa ser um arquivo .png.");
+    if (!rel || rel.startsWith("..") || isAbsolute(rel))
+      throw new Error("saveAs precisa ficar dentro da pasta da tarefa.");
+    return target;
+  }
   async imageTool(
     taskId: string,
-    args: { prompt: string; inputImage?: string },
+    args: {
+      prompt: string;
+      inputImage?: string;
+      images?: string[];
+      aspect?: "square" | "landscape" | "portrait";
+      background?: ImageOptions["background"];
+      saveAs?: string;
+    },
   ) {
     const t = this.task(taskId);
     if (t.mode === "plan")
       throw new Error("Geração de imagem desabilitada em modo planejamento.");
-    const artifact = await this.generate(taskId, args.prompt, {
+    const target = args.saveAs ? this.imageTarget(t, args.saveAs) : undefined;
+    const sizes = {
+      square: "1024x1024",
+      landscape: "1536x1024",
+      portrait: "1024x1536",
+    };
+    // The reference picked in the panel is for the user's own generations.
+    const options: ImageOptions = {
       ...t.images,
-      inputImage: args.inputImage,
-    });
+      inputImage: undefined,
+      ...(args.aspect ? { size: sizes[args.aspect] } : {}),
+      ...(args.background ? { background: args.background } : {}),
+    };
+    const artifact = await this.generate(taskId, args.prompt, options, [
+      ...(args.inputImage ? [args.inputImage] : []),
+      ...(args.images ?? []),
+    ]);
+    if (target) {
+      await mkdir(dirname(target), { recursive: true });
+      await copyFile(artifact.path, target);
+    }
+    const bytes = await readFile(artifact.path);
+    const info = pngInfo(bytes);
+    const warnings: string[] = [];
+    if (args.background === "transparent" && t.images.provider === "comfyui")
+      warnings.push("O ComfyUI não aplica fundo transparente.");
+    else if (args.background === "transparent" && !info.alpha)
+      warnings.push(
+        "O gerador não devolveu fundo transparente: a imagem não tem canal alfa.",
+      );
+    // Whether the generator kept the prompt; a format line may follow it.
+    const sent = args.prompt.trim().replace(/\s+/g, " ");
+    const used = artifact.revisedPrompt?.trim().replace(/\s+/g, " ");
+    const kept = !used || used.startsWith(sent);
     return {
       content: [
         {
@@ -1686,15 +1858,18 @@ export class Runtime {
           text: JSON.stringify({
             id: artifact.id,
             path: artifact.path,
+            ...(target ? { savedTo: target } : {}),
             provider: artifact.provider,
             model: artifact.model,
+            width: info.width,
+            height: info.height,
+            transparent: info.alpha,
+            promptKept: kept,
+            ...(kept ? {} : { revisedPrompt: artifact.revisedPrompt }),
+            ...(warnings.length ? { warnings } : {}),
           }),
         },
-        {
-          type: "image",
-          mimeType: "image/png",
-          data: (await readFile(artifact.path)).toString("base64"),
-        },
+        { type: "image", ...(await this.imagePreview(bytes, info.alpha)) },
       ],
     };
   }
@@ -1898,7 +2073,7 @@ export class Runtime {
         );
       };
       const session = this.createSession(installation, task, {}, (e) => {
-        if (e.type === "text") text += e.text;
+        if (e.type === "text") text = this.redact(text + e.text);
         else if (e.type === "activity") {
           const row = this.entry(parent.id, "activity", `${label} · ${e.text}`);
           this.trackCall(parent.id, e.id && `${label}#${e.id}`, row.id);
@@ -1976,7 +2151,12 @@ export class Runtime {
     const installation = this.agents.find((a) => a.id === agent)?.selected;
     if (!installation)
       throw new Error("Configure o executável do agente em Configurações.");
-    const mcp = mcpFor(agent, this.store.settings().mcp, {});
+    const mcp = mcpFor(
+      agent,
+      this.store.settings().mcp,
+      {},
+      this.secrets?.env(agent),
+    );
     const cwd = project?.path ?? join(this.store.root, "scratch", "prompts");
     if (!project) await mkdir(cwd, { recursive: true });
     const now = new Date().toISOString();
@@ -2012,6 +2192,14 @@ export class Runtime {
       updatedAt: now,
       images: { ...defaultImages },
     };
+    return this.launchQuick(run, task, installation, mcp);
+  }
+  private launchQuick(
+    run: QuickRun,
+    task: Task,
+    installation: Installation,
+    mcp: Record<string, any>,
+  ) {
     const q: { run: QuickRun; session?: AgentSession; guard?: LoopGuard } = {
       run,
       guard: this.newGuard(),
@@ -2022,17 +2210,136 @@ export class Runtime {
     );
     this.publishQuick(run.id, true);
     q.session
-      .send(prompt.text, [])
+      .send(run.text, [])
       .catch((e) => this.endQuick(run.id, "failed", e.message));
     return run;
+  }
+  // Quick chat: questions and small jobs apart from the conversations, kept
+  // only in memory. A follow-up resumes the same CLI session, so it keeps
+  // the context of the previous answers.
+  async startQuickChat(input: {
+    text: string;
+    agent: AgentId;
+    mode: Task["mode"];
+    // Where it works: a project's folder, or a scratch folder of Codebit.
+    projectId?: string;
+    after?: string;
+  }) {
+    const text = input.text.trim();
+    if (!text) throw new Error("Escreva a mensagem.");
+    const previous = input.after ? this.quick.get(input.after)?.run : undefined;
+    if (input.after && !previous)
+      throw new Error("Este chat rápido terminou. Comece um novo.");
+    if (previous && ["running", "waiting"].includes(previous.status))
+      throw new Error("Aguarde a resposta anterior.");
+    let base: Pick<
+      QuickRun,
+      "agent" | "model" | "effort" | "projectId" | "cwd"
+    >;
+    if (previous) base = previous;
+    else {
+      const project = input.projectId
+        ? this.store.get<Project>("project", input.projectId)
+        : undefined;
+      if (project && !project.trusted)
+        throw new Error(
+          "Confie no projeto antes de usar o chat rápido nele. Abra uma tarefa do projeto e confirme.",
+        );
+      const cwd = project?.path ?? join(this.store.root, "scratch", "quick");
+      if (!project) await mkdir(cwd, { recursive: true });
+      base = {
+        agent: input.agent,
+        model: this.store.settings().defaultModels[input.agent] ?? "",
+        projectId: project?.id ?? "",
+        cwd,
+      };
+    }
+    const installation = this.agents.find((a) => a.id === base.agent)?.selected;
+    if (!installation)
+      throw new Error("Configure o executável do agente em Configurações.");
+    const now = new Date().toISOString();
+    const run: QuickRun = {
+      ...base,
+      id: randomUUID(),
+      kind: "chat",
+      promptId: "",
+      name: "Chat rápido",
+      text,
+      mode: input.mode,
+      status: "running",
+      reply: "",
+      activity: [],
+      startedAt: now,
+      nativeId: previous?.nativeId,
+    };
+    // Only the latest message's run is kept; the chat panel has the rest.
+    if (previous) await this.dismissQuick(previous.id);
+    return this.launchQuick(
+      run,
+      {
+        id: `quick:${run.id}`,
+        projectId: run.projectId,
+        title: run.name,
+        agent: run.agent,
+        model: run.model,
+        effort: run.effort,
+        cwd: run.cwd,
+        worktree: false,
+        mode: run.mode,
+        status: "running",
+        archived: false,
+        createdAt: now,
+        updatedAt: now,
+        images: { ...defaultImages },
+        nativeId: previous?.nativeId,
+      },
+      installation,
+      mcpFor(
+        run.agent,
+        this.store.settings().mcp,
+        {},
+        this.secrets?.env(run.agent),
+      ),
+    );
+  }
+  // A quick chat worth keeping becomes a conversation with every exchange,
+  // resuming the same CLI session.
+  async keepQuickChat(
+    id: string,
+    turns: { user: string; assistant: string }[],
+  ) {
+    const run = this.quick.get(id)?.run;
+    if (!run || run.status === "running" || run.status === "waiting")
+      throw new Error("Aguarde a resposta terminar.");
+    const first = turns[0]?.user.split("\n")[0].trim() || "Chat rápido";
+    const t = await this.createTask({
+      projectId: run.projectId,
+      title: first.slice(0, 60),
+      agent: run.agent,
+      cwd: run.cwd,
+    });
+    const task = this.store.put<Task>("task", {
+      ...t,
+      model: run.model,
+      effort: run.effort ?? "",
+      mode: run.mode,
+      nativeId: run.nativeId,
+    });
+    for (const turn of turns) {
+      this.entry(task.id, "user", turn.user);
+      if (turn.assistant)
+        this.entry(task.id, "assistant", turn.assistant, { agent: run.agent });
+    }
+    await this.dismissQuick(id);
+    return task;
   }
   private quickEvent(id: string, e: AgentEvent) {
     const q = this.quick.get(id);
     if (!q?.session || this.disposed) return;
     const run = q.run;
-    if (e.type === "text") run.reply += e.text;
+    if (e.type === "text") run.reply = this.redact(run.reply + e.text);
     else if (e.type === "activity") {
-      run.activity.push(e.text);
+      run.activity.push(this.redact(e.text));
       const reason = q.guard?.action(
         e.key ?? e.text,
         e.text,
@@ -2076,10 +2383,17 @@ export class Runtime {
     q.session = undefined;
     Object.assign(q.run, { status, error, request: undefined });
     this.publishQuick(id, true);
+    const chat = q.run.kind === "chat";
     if (status === "done")
-      this.attention({ title: q.run.name, body: "Prompt concluído." });
+      this.attention({
+        title: q.run.name,
+        body: chat ? "Resposta pronta." : "Prompt concluído.",
+      });
     if (status === "failed")
-      this.attention({ title: q.run.name, body: "O prompt falhou." });
+      this.attention({
+        title: q.run.name,
+        body: chat ? "O chat rápido falhou." : "O prompt falhou.",
+      });
   }
   private publishQuick(id: string, now = false) {
     const q = this.quick.get(id);

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm, readFile, writeFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { ImageService } from "../src/main/images";
+import { codexImageText, ImageService, pngInfo } from "../src/main/images";
 import {
   defaultImages,
   type ImageOptions,
@@ -99,6 +99,24 @@ describe("provedores de imagem", () => {
     );
     expect(JSON.parse(calls[1].body).model).toBe("gpt-image-2.5-flare");
     expect(await readFile(artifact.path)).toEqual(png);
+    // Background goes as a parameter; several references, as image[].
+    await service.generate("task", "Um ícone", {
+      ...openaiImages,
+      background: "transparent",
+    });
+    expect(JSON.parse(calls[2].body).background).toBe("transparent");
+    const a = join(roots[0], "a.png");
+    const b = join(roots[0], "b.webp");
+    await writeFile(a, png);
+    await writeFile(b, png);
+    await service.generate("task", "Combine", openaiImages, [a, b]);
+    const form = calls[3].body as FormData;
+    expect(String(calls[3].url)).toMatch(/edits$/);
+    expect(form.getAll("image[]").map((f: any) => f.type)).toEqual([
+      "image/png",
+      "image/webp",
+    ]);
+    expect(form.get("background")).toBeNull();
   });
   it("não repete geração após falha de cota", async () => {
     const fetch = vi.fn(
@@ -190,13 +208,65 @@ describe("imagens pelo Codex CLI", () => {
     const reference = join(roots[0], "reference.png");
     const edited = Buffer.concat([png, Buffer.from("referencia")]);
     await writeFile(reference, edited);
+    const artifact = await service.generate("t", "Deixe azul", defaultImages, [
+      reference,
+    ]);
+    expect(await readFile(artifact.path)).toEqual(edited);
+    expect(artifact.references).toEqual([reference]);
+  });
+  it("pede o prompt literal e devolve o que o gerador usou", async () => {
+    const service = await setup(undefined, codex);
+    const text = codexImageText(
+      'Um elmo com "CODEBIT" gravado',
+      { size: "1536x1024", background: "transparent" },
+      2,
+    );
+    expect(text).toBe(
+      [
+        "<<<PROMPT",
+        'Um elmo com "CODEBIT" gravado',
+        "PROMPT>>>",
+        "",
+        "Formato: paisagem, 1536x1024 px.",
+        "Fundo: transparente (PNG com canal alfa).",
+        "2 imagens anexadas.",
+      ].join("\n"),
+    );
+    // A model that follows the instructions keeps the prompt.
+    const kept = await service.generate("t", "Um farol azul", {
+      ...defaultImages,
+      size: "1024x1536",
+    });
+    expect(kept.revisedPrompt).toBe(
+      "Um farol azul\nFormato: retrato, 1024x1536 px.",
+    );
+    // One that rewrites it is reported as it is.
+    const rewritten = await service.generate("t", "REWRITE", defaultImages);
+    expect(rewritten.revisedPrompt).toBe("versão reescrita pelo modelo");
+  });
+  it("envia várias referências em ordem", async () => {
+    const service = await setup(undefined, codex);
+    const a = join(roots[0], "personagem.png");
+    const b = join(roots[0], "armadura.png");
+    await writeFile(a, Buffer.concat([png, Buffer.from("A")]));
+    await writeFile(b, Buffer.from("B"));
     const artifact = await service.generate(
       "t",
-      "Deixe azul",
+      "Vista a armadura no personagem",
       defaultImages,
-      reference,
+      [a, b],
     );
-    expect(await readFile(artifact.path)).toEqual(edited);
+    expect(await readFile(artifact.path)).toEqual(
+      Buffer.concat([png, Buffer.from("A"), Buffer.from("B")]),
+    );
+    expect(artifact.revisedPrompt).toContain("2 imagens anexadas.");
+  });
+  it("lê dimensões e transparência do PNG", () => {
+    // The test image is grayscale with alpha (color type 4).
+    expect(pngInfo(png)).toEqual({ width: 1, height: 1, alpha: true });
+    const gray = Buffer.from(png);
+    gray[25] = 0;
+    expect(pngInfo(gray).alpha).toBe(false);
   });
   it("informa quando o CLI não está instalado", async () => {
     const service = await setup();

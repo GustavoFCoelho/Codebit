@@ -246,10 +246,13 @@ export const QuickPanel = memo(function QuickPanel({
   run: any;
 }) {
   const [runs, setRuns] = useState<QuickRun[]>([]);
+  // The quick chat's messages have their own panel.
   useEffect(() => {
-    void api<QuickRun[]>("quick.list").then(setRuns);
+    void api<QuickRun[]>("quick.list").then((all) =>
+      setRuns(all.filter((r) => r.kind !== "chat")),
+    );
     return window.codebit.onEvent((e) => {
-      if (e.type === "quick")
+      if (e.type === "quick" && e.run.kind !== "chat")
         setRuns((all) =>
           all.some((r) => r.id === e.run.id)
             ? all.map((r) => (r.id === e.run.id ? e.run : r))

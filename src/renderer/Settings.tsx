@@ -35,12 +35,14 @@ import {
   agentIds,
   agentNames,
   defaultGuidelines,
+  defaultDeleteGuard,
   defaultLoopGuard,
   defaultSubagents,
 } from "../shared/types";
 import { api } from "./api";
 import { SubagentOptionsForm, Switch } from "./parts";
 import { SocialSettings } from "./Social";
+import { SecretsSettings } from "./Secrets";
 // Settings sections, in the order of the side navigation.
 const sections = [
   {
@@ -72,6 +74,13 @@ const sections = [
     icon: Plug,
     title: "Conexões MCP",
     description: "Servidores de ferramentas oferecidos aos agentes.",
+  },
+  {
+    id: "Secrets",
+    icon: KeyRound,
+    title: "Secrets",
+    description:
+      "Chaves de API e outros valores que todas as sessões dos agentes recebem.",
   },
   {
     id: "Redes sociais",
@@ -155,6 +164,7 @@ export function SettingsView({
       </div>
     );
   const guard = settings.loopGuard ?? defaultLoopGuard;
+  const deletes = settings.deleteGuard ?? defaultDeleteGuard;
   const subagentDefaults = settings.defaultSubagents ?? defaultSubagents;
   async function save(value: Settings) {
     await api("settings.save", value);
@@ -578,7 +588,70 @@ export function SettingsView({
                 </SettingRow>
               ))}
             </div>
+            <div className="settings-card">
+              <div className="card-head">
+                <h3>Confirmação antes de apagar</h3>
+                <p className="help">
+                  Antes de um comando que apaga arquivos ou descarta alterações
+                  do Git, o Codebit mede o alcance: quantos arquivos e pastas, o
+                  tamanho e os maiores itens. No Claude Code isso vale em
+                  qualquer modo, inclusive Bypass. No Codex e no Devin, o
+                  alcance aparece nos pedidos de aprovação do modo Executar; no
+                  Bypass deles não há como interceptar. Apagar fora da pasta da
+                  tarefa, caminhos com variáveis e Git que descarta alterações
+                  sempre perguntam.
+                </p>
+              </div>
+              <Switch
+                checked={deletes.enabled}
+                onChange={(enabled) =>
+                  void run(() =>
+                    save({ ...settings, deleteGuard: { ...deletes, enabled } }),
+                  )
+                }
+              >
+                Pedir confirmação antes de comandos que apagam muito
+              </Switch>
+              {(
+                [
+                  [
+                    "files",
+                    "A partir de quantos arquivos",
+                    "Exclusões menores passam direto.",
+                  ],
+                  [
+                    "megabytes",
+                    "A partir de quantos MB",
+                    "Um único arquivo grande também pergunta.",
+                  ],
+                ] as const
+              ).map(([field, label, help]) => (
+                <SettingRow key={field} title={label} help={help}>
+                  <input
+                    className="narrow"
+                    type="number"
+                    min={1}
+                    disabled={!deletes.enabled}
+                    aria-label={label}
+                    value={deletes[field]}
+                    onChange={(e) =>
+                      setSettings({
+                        ...settings,
+                        deleteGuard: {
+                          ...deletes,
+                          [field]: Math.max(1, Number(e.target.value) || 1),
+                        },
+                      })
+                    }
+                    onBlur={() => void run(() => save(settings))}
+                  />
+                </SettingRow>
+              ))}
+            </div>
           </section>
+        )}
+        {tab === "Secrets" && snapshot && (
+          <SecretsSettings snapshot={snapshot} run={run} />
         )}
         {tab === "Redes sociais" && (
           <SocialSettings snapshot={snapshot} task={task} run={run} />

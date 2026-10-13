@@ -34,6 +34,33 @@ it("ponte MCP limita chamadas à tarefa autorizada e revoga a credencial", async
       ).status,
     ).toBe(200);
     expect(calls).toEqual([{ id: "task-a", args: { prompt: "teste" } }]);
+    // Format, background, references and copy are checked before the call.
+    const full = {
+      prompt: "teste",
+      images: ["a.png", "b.png"],
+      aspect: "portrait",
+      background: "transparent",
+      saveAs: "arte/a.png",
+    };
+    expect(
+      (await send(env.CODEBIT_TOOL_URL, env.CODEBIT_TOOL_TOKEN, full)).status,
+    ).toBe(200);
+    for (const wrong of [
+      { aspect: "panorama" },
+      { background: "verde" },
+      { images: "a.png" },
+      { images: Array(11).fill("a.png") },
+    ])
+      expect(
+        (
+          await send(env.CODEBIT_TOOL_URL, env.CODEBIT_TOOL_TOKEN, {
+            ...full,
+            ...wrong,
+          })
+        ).status,
+      ).toBe(400);
+    expect(calls).toHaveLength(2);
+    calls.pop();
     bridge.revoke("task-a");
     expect(
       (

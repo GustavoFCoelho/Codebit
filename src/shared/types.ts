@@ -36,6 +36,17 @@ export interface AgentCommand {
 export interface ContextUsage {
   used: number;
   size?: number;
+  // What it is made of, when the CLI tells (Claude Code), in display order:
+  // instructions, tools, skills, conversation and the compaction reserve.
+  parts?: ContextPart[];
+  // Tool definitions kept out until the agent searches for them.
+  deferred?: number;
+}
+export interface ContextPart {
+  id: "instructions" | "tools" | "skills" | "conversation" | "reserve";
+  tokens: number;
+  // The heaviest pieces of the part: memory files, MCP servers, skills…
+  items?: { label: string; tokens: number }[];
 }
 // Plan usage reported by the agent CLI for the logged-in account.
 export interface QuotaWindow {
@@ -70,6 +81,30 @@ export interface Installation {
   args: string[];
   version: string;
   error?: string;
+  // Extra environment of a session's process: the user's secrets.
+  env?: Record<string, string>;
+}
+// A value the user keeps in Codebit, such as an API key. Only the name and
+// the description reach the interface; the value stays encrypted and goes to
+// the agents' processes as an environment variable.
+export interface UserSecret {
+  id: string;
+  name: string;
+  description: string;
+  createdAt: string;
+  updatedAt: string;
+}
+export const secretNamePattern = /^[A-Z_][A-Z0-9_]{0,99}$/;
+// Variables a CLI reads for its own login or settings. A secret with one of
+// these names would, for example, switch Claude Code from the subscription to
+// billing an API key, so it is not given to that agent.
+const agentOwnVariables: Record<AgentId, RegExp> = {
+  claude: /^(ANTHROPIC_|CLAUDE_)/,
+  codex: /^(CODEX_|OPENAI_BASE_URL$)/,
+  devin: /^(DEVIN_|WINDSURF_)/,
+};
+export function secretBlockedFor(name: string, agent: AgentId) {
+  return agentOwnVariables[agent].test(name);
 }
 export interface AgentInfo {
   id: AgentId;
@@ -159,6 +194,8 @@ export interface ImageOptions {
   workflow: string;
   seed: number;
   inputImage?: string;
+  // Transparent works with GPT Image; ComfyUI presets ignore it.
+  background?: "auto" | "transparent" | "opaque";
 }
 export type TaskMode = "plan" | "execute" | "bypass";
 export interface SubagentOptions {
@@ -227,7 +264,61 @@ export interface RequestPrompt {
   plan?: boolean;
   // A social media post waiting for the user: exactly what goes out.
   social?: SocialPreview;
+  // A command that deletes files or throws away work: what it reaches.
+  blast?: BlastPreview;
 }
+// What a destructive command would reach, measured before it runs.
+export interface BlastPreview {
+  summary: string;
+  files: number;
+  dirs: number;
+  bytes: number;
+  // The heaviest items, relative to the task folder when inside it.
+  entries: { path: string; bytes: number; dir: boolean }[];
+  more: number;
+  // Something it deletes is outside the task folder (scratch aside).
+  outside: boolean;
+  // What is in caches and scratch folders: routine, not held to the limits.
+  temporary?: { files: number; bytes: number };
+  // The count stopped early (a very large folder).
+  partial?: boolean;
+  // Filters (find, -Include) decide what goes: the numbers are the most.
+  filtered?: boolean;
+  // Why part of the scope could not be worked out (variables, wildcards).
+  unknown?: string;
+  // Files whose uncommitted changes Git would throw away.
+  git?: string[];
+  gitMore?: number;
+}
+// Given to the agents' sessions: what a command would delete. "asking" is
+// true when an approval is already being shown, false for a command about to
+// run on its own, which only stops when it is risky.
+export type InspectCommand = (
+  command: string,
+  asking: boolean,
+  cwd?: string,
+) => Promise<BlastPreview | undefined>;
+export interface DeleteGuardSettings {
+  enabled: boolean;
+  // Asks from this many files, or this size; always outside the task folder.
+  files: number;
+  megabytes: number;
+}
+// "61,2 GB", "340 KB".
+export const formatBytes = (n: number) =>
+  n >= 1024 ** 3
+    ? `${(n / 1024 ** 3).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} GB`
+    : n >= 1024 ** 2
+      ? `${(n / 1024 ** 2).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} MB`
+      : n >= 1024
+        ? `${Math.round(n / 1024)} KB`
+        : `${n} bytes`;
+// Asset projects (Blender files of a gigabyte and more) set the size limit.
+export const defaultDeleteGuard: DeleteGuardSettings = {
+  enabled: true,
+  files: 50,
+  megabytes: 1024,
+};
 export type SocialNetwork = "instagram" | "patreon";
 export const socialNetworkNames: Record<SocialNetwork, string> = {
   instagram: "Instagram",
@@ -311,6 +402,8 @@ export interface SavedPrompt {
 // A run of a saved prompt; it lives in memory while Codebit is open.
 export interface QuickRun {
   id: string;
+  // A saved prompt's run, or a message of the quick chat.
+  kind?: "prompt" | "chat";
   promptId: string;
   name: string;
   text: string;
@@ -337,6 +430,10 @@ export interface Artifact {
   model: string;
   createdAt: string;
   options: ImageOptions;
+  // The prompt the generator used, when the provider rewrites it (Codex).
+  revisedPrompt?: string;
+  // Images sent to be edited or used as references, in order.
+  references?: string[];
 }
 export interface Workflow {
   id: string;
@@ -380,6 +477,8 @@ export interface Settings {
   defaultMode?: Task["mode"];
   // Stops agents that keep repeating an action that is not working.
   loopGuard?: LoopGuardSettings;
+  // Confirmation before commands that delete a lot or discard work.
+  deleteGuard?: DeleteGuardSettings;
   // Sub-agents of chats without their own; with syncSubagents, of every chat.
   defaultSubagents?: SubagentOptions;
   syncSubagents?: boolean;
@@ -438,6 +537,7 @@ export interface Snapshot {
   source?: SourceState;
   settings: Settings;
   agents: AgentInfo[];
+  secrets: UserSecret[];
 }
 export type AgentEvent =
   | { type: "text"; text: string }
@@ -457,7 +557,13 @@ export type AgentEvent =
   | { type: "plan"; text: string; path?: string }
   | { type: "request"; request: RequestPrompt }
   | { type: "native"; id: string }
-  | { type: "usage"; used: number; size?: number }
+  | {
+      type: "usage";
+      used: number;
+      size?: number;
+      parts?: ContextPart[];
+      deferred?: number;
+    }
   // An image the agent generated with its own tool (base64 PNG or a file).
   | { type: "image"; prompt: string; data?: string; path?: string }
   | { type: "quota"; windows: QuotaWindow[] }
@@ -512,6 +618,19 @@ export function subagentsFor(
 ) {
   const fallback = settings.defaultSubagents ?? defaultSubagents;
   return settings.syncSubagents ? fallback : (task.subagents ?? fallback);
+}
+// How the agents are told what their sub-agents run: "Codex · gpt-6-luna ·
+// esforço xhigh, até 4 ao mesmo tempo".
+export function subagentLabel(
+  o: Pick<SubagentOptions, "agent" | "model" | "effort" | "max">,
+) {
+  return [
+    agentNames[o.agent] ?? o.agent,
+    o.model || "modelo padrão",
+    ...(o.effort ? [`esforço ${o.effort}`] : []),
+  ]
+    .join(" · ")
+    .concat(o.max > 1 ? `, até ${o.max} ao mesmo tempo` : ", um por vez");
 }
 export const defaultImages: ImageOptions = {
   provider: "codex",

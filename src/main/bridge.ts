@@ -52,10 +52,21 @@ function validate(kind: BridgeKind, args: any) {
     return;
   }
   if (kind === "images") {
+    const text = (v: unknown, max: number) =>
+      v === undefined || (typeof v === "string" && v.length <= max);
+    const oneOf = (v: unknown, values: string[]) =>
+      v === undefined || values.includes(v as string);
     if (
       typeof args.prompt !== "string" ||
       args.prompt.length > 32000 ||
-      (args.inputImage !== undefined && typeof args.inputImage !== "string")
+      !text(args.inputImage, 2000) ||
+      (args.images !== undefined &&
+        (!Array.isArray(args.images) ||
+          args.images.length > 10 ||
+          args.images.some((i: unknown) => !text(i, 2000) || !i))) ||
+      !oneOf(args.aspect, ["square", "landscape", "portrait"]) ||
+      !oneOf(args.background, ["auto", "transparent", "opaque"]) ||
+      !text(args.saveAs, 1000)
     )
       throw new Error("Parâmetros de imagem inválidos.");
     return;

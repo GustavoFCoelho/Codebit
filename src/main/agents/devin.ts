@@ -9,6 +9,7 @@ import type {
   Installation,
   Model,
   Task,
+  InspectCommand,
 } from "../../shared/types";
 import { appVersion } from "../../shared/types";
 const modes = { plan: "plan", execute: "accept-edits", bypass: "bypass" };
@@ -38,6 +39,8 @@ export class DevinSession implements AgentSession {
     private mcp: Record<string, any>,
     private emit: (event: AgentEvent) => void,
     private guidelines = "",
+    // What a command to approve would delete, shown with the approval.
+    private inspect?: InspectCommand,
   ) {
     this.channel = new Channel(
       i,
@@ -109,18 +112,30 @@ export class DevinSession implements AgentSession {
       const id = String(msg.id);
       if (msg.method === "session/request_permission") {
         this.requests.set(id, msg);
-        this.emit({
-          type: "request",
-          request: {
-            id,
-            kind: "approval",
-            title: p.toolCall?.title
-              ? `Permitir ${p.toolCall.title}?`
-              : "Permitir ação?",
-            detail: JSON.stringify(p.toolCall?.rawInput ?? p.toolCall, null, 2),
-            choices: ["decline", "accept"],
-          },
-        });
+        const command = p.toolCall?.rawInput?.command;
+        void (
+          typeof command === "string" && this.inspect
+            ? this.inspect(command, true).catch(() => undefined)
+            : Promise.resolve(undefined)
+        ).then((blast) =>
+          this.emit({
+            type: "request",
+            request: {
+              id,
+              kind: "approval",
+              title: p.toolCall?.title
+                ? `Permitir ${p.toolCall.title}?`
+                : "Permitir ação?",
+              detail: JSON.stringify(
+                p.toolCall?.rawInput ?? p.toolCall,
+                null,
+                2,
+              ),
+              choices: ["decline", "accept"],
+              ...(blast ? { blast } : {}),
+            },
+          }),
+        );
       } else
         this.channel.send({
           id: msg.id,

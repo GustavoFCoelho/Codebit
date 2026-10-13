@@ -38,3 +38,19 @@ export async function prepareInstagramImage(
   await writeFile(out, data);
   return image.getSize();
 }
+// A copy of a generated image for the agent to look at: up to 768 px, JPEG
+// unless it has transparency, which JPEG would paint black.
+export async function imagePreview(bytes: Buffer, alpha: boolean) {
+  let image = nativeImage.createFromBuffer(bytes);
+  const { width, height } = image.getSize();
+  const scale = 768 / Math.max(width, height);
+  if (scale < 1)
+    image = image.resize({
+      width: Math.round(width * scale),
+      height: Math.round(height * scale),
+      quality: "best",
+    });
+  return alpha
+    ? { mimeType: "image/png", data: image.toPNG().toString("base64") }
+    : { mimeType: "image/jpeg", data: image.toJPEG(85).toString("base64") };
+}

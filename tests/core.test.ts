@@ -22,12 +22,15 @@ import { ClaudeSession } from "../src/main/agents/claude";
 import { DevinSession } from "../src/main/agents/devin";
 import { Runtime } from "../src/main/runtime";
 import { LoopGuard } from "../src/main/guard";
+import { codebitInstructions, mcpFor } from "../src/main/extensions";
 import { parseClaudeUsage } from "../src/main/agents/quota";
 import {
   appVersion,
   defaultGuidelines,
   defaultImages,
   defaultSubagents,
+  defaultDeleteGuard,
+  subagentLabel,
   subagentsFor,
   type AgentEvent,
   type AgentId,
@@ -615,6 +618,74 @@ describe("runtime: agentes, conversas e sub-agentes", () => {
     });
     expect(await turn(plain.id)).not.toContain("codebit_agents");
   });
+  it("os agentes sabem quando delegar, e o Claude recebe a ferramenta carregada", async () => {
+    const options = {
+      enabled: true,
+      agent: "codex",
+      model: "gpt-6-luna",
+      effort: "xhigh",
+      max: 4,
+    } as const;
+    const label = subagentLabel(options);
+    expect(label).toBe(
+      "Codex · gpt-6-luna · esforço xhigh, até 4 ao mesmo tempo",
+    );
+    expect(
+      subagentLabel({ agent: "devin", model: "", effort: "", max: 1 }),
+    ).toBe("Devin · modelo padrão, um por vez");
+    const env = { CODEBIT_SUBAGENTS: JSON.stringify(options) };
+    const text = codebitInstructions({ codebit_agents: { env } });
+    expect(text).toContain(`em paralelo com ${label},`);
+    expect(text).toContain(
+      "prefira run_subagents aos seus sub-agentes nativos",
+    );
+    expect(text).toContain("faça você mesmo");
+    // A project that forbids delegation keeps its rule.
+    expect(text).toContain("proibirem sub-agentes ou delegação, elas valem");
+    expect(codebitInstructions({})).not.toContain("run_subagents");
+    // Claude Code would defer them behind its tool search.
+    const internal = { codebit_agents: { command: "x", args: [], env } };
+    const user = {
+      id: "u",
+      name: "meu",
+      agent: "both",
+      enabled: true,
+      transport: "stdio",
+      command: "c",
+      args: [],
+      env: {},
+    } as any;
+    const claude = mcpFor("claude", [user], internal);
+    expect(claude.codebit_agents.alwaysLoad).toBe(true);
+    expect(claude.codebit_meu).not.toHaveProperty("alwaysLoad");
+    const codex = mcpFor("codex", [], internal);
+    expect(codex.codebit_agents).toMatchObject({ tool_timeout_sec: 3600 });
+    expect(codex.codebit_agents).not.toHaveProperty("alwaysLoad");
+    // Each session carries the sub-agents of the moment.
+    const rt = await runtime(["codex"]);
+    rt.store.saveSettings({
+      ...rt.store.settings(),
+      defaultSubagents: options,
+    });
+    rt.bridgeConfig = (_id, kind, extra = {}) => ({
+      command: "node",
+      args: [kind],
+      env: extra,
+    });
+    const configs: any[] = [];
+    const create = (rt as any).createSession.bind(rt);
+    (rt as any).createSession = (...args: any[]) => {
+      configs.push(args[2]);
+      return create(...args);
+    };
+    const t = await rt.createTask({ title: "Delegar", agent: "codex" });
+    await rt.send(t.id, "GUIDE");
+    await idle(rt, t.id);
+    expect(JSON.parse(configs[0].codebit_agents.env.CODEBIT_SUBAGENTS)).toEqual(
+      options,
+    );
+    expect(lastReply(rt, t.id).text).toContain(label);
+  });
   it("excluir apaga histórico, imagens, anexos e plano; pastas só quando pedido", async () => {
     const rt = await runtime(["codex"]);
     const root = rt.store.root;
@@ -948,6 +1019,259 @@ describe("prompts salvos", () => {
     expect(rt.store.snapshot().prompts.map((x) => x.name)).toEqual(["Testes"]);
   });
 });
+describe("confirmação antes de apagar", () => {
+  const files = async (dir: string, n: number) => {
+    await mkdir(dir, { recursive: true });
+    for (let i = 0; i < n; i++) await writeFile(join(dir, `${i}.txt`), "x");
+  };
+  const pending = (rt: Runtime, id: string) =>
+    rt.store
+      .entries(id)
+      .filter((e) => e.kind === "request" && !e.resolved)
+      .at(-1)!;
+  it("Claude: apagar muito para e mostra o alcance, mesmo em Bypass", async () => {
+    const rt = await runtime(["claude"]);
+    const t = await rt.createTask({ title: "Limpeza", agent: "claude" });
+    expect(t.mode).toBe("bypass");
+    await files(join(t.cwd, "grande"), 60);
+    await files(join(t.cwd, "pequena"), 1);
+    // Small and inside the folder: it goes on its own.
+    await rt.send(t.id, "DELETE:rm -rf pequena");
+    await idle(rt, t.id);
+    expect(lastReply(rt, t.id).text).toBe("liberado");
+    // Big: the user sees what it reaches and decides.
+    await rt.send(t.id, "DELETE:rm -rf grande");
+    await eventually(() => rt.task(t.id).status === "waiting");
+    const asked = pending(rt, t.id);
+    expect(asked.request!.blast).toMatchObject({
+      files: 60,
+      dirs: 1,
+      outside: false,
+    });
+    rt.respond(t.id, asked.id, { decision: "decline" });
+    await idle(rt, t.id);
+    expect(lastReply(rt, t.id).text).toMatch(
+      /^bloqueado: O usuário viu o alcance no Codebit \(Apaga 60 arquivos/,
+    );
+    // Allowed: it runs, with no second approval from Claude.
+    await rt.send(t.id, "DELETE:rm -rf grande");
+    await eventually(() => rt.task(t.id).status === "waiting");
+    rt.respond(t.id, pending(rt, t.id).id, { decision: "accept" });
+    await idle(rt, t.id);
+    expect(lastReply(rt, t.id).text).toBe("permitido");
+    // Turned off, nothing stops.
+    rt.store.saveSettings({
+      ...rt.store.settings(),
+      deleteGuard: { ...defaultDeleteGuard, enabled: false },
+    });
+    await rt.send(t.id, "DELETE:rm -rf grande");
+    await idle(rt, t.id);
+    expect(lastReply(rt, t.id).text).toBe("liberado");
+  });
+  it("Codex: o pedido de aprovação mostra o alcance do comando", async () => {
+    const rt = await runtime(["codex"]);
+    const t = await rt.createTask({ title: "Limpar", agent: "codex" });
+    rt.updateTask(t.id, { mode: "execute" });
+    await files(join(t.cwd, "saida"), 3);
+    await rt.send(t.id, "APPROVE:rm -rf saida");
+    await eventually(() => rt.task(t.id).status === "waiting");
+    expect(pending(rt, t.id).request!.blast).toMatchObject({
+      files: 3,
+      summary: "Apaga 3 arquivos e 1 pasta · 3 bytes",
+    });
+    await rt.interrupt(t.id);
+  });
+});
+describe("imagens pelos agentes", () => {
+  // A 1×1 grayscale PNG with no alpha channel.
+  const opaque = () => {
+    const bytes = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a8uoAAAAASUVORK5CYII=",
+      "base64",
+    );
+    bytes[25] = 0;
+    return bytes;
+  };
+  it("aceita formato, fundo, referências da pasta e salva no projeto", async () => {
+    const rt = await runtime(["codex"]);
+    const t = await rt.createTask({ title: "Arte", agent: "codex" });
+    await mkdir(join(t.cwd, "refs"), { recursive: true });
+    await writeFile(join(t.cwd, "refs", "base.png"), opaque());
+    const result = await rt.imageTool(t.id, {
+      prompt: "Um elmo",
+      images: ["refs/base.png"],
+      aspect: "landscape",
+      background: "transparent",
+      saveAs: "concepts/elmo",
+    });
+    const info = JSON.parse(result.content[0].text!);
+    expect(info).toMatchObject({
+      savedTo: join(t.cwd, "concepts", "elmo.png"),
+      width: 1,
+      height: 1,
+      transparent: false,
+      promptKept: true,
+    });
+    expect(info.revisedPrompt).toBeUndefined();
+    // Asked for transparency and did not get it: the agent is told.
+    expect(info.warnings[0]).toContain("não devolveu fundo transparente");
+    expect(await readFile(info.savedTo)).toEqual(opaque());
+    expect(result.content[1]).toMatchObject({
+      type: "image",
+      mimeType: "image/png",
+    });
+    const [artifact] = rt.store.artifacts(t.id);
+    expect(artifact.options).toMatchObject({
+      size: "1536x1024",
+      background: "transparent",
+    });
+    expect(artifact.references).toEqual([join(t.cwd, "refs", "base.png")]);
+    // A rewritten prompt goes back to the agent.
+    const rewritten = JSON.parse(
+      (await rt.imageTool(t.id, { prompt: "REWRITE" })).content[0].text!,
+    );
+    expect(rewritten).toMatchObject({
+      promptKept: false,
+      revisedPrompt: "versão reescrita pelo modelo",
+    });
+    // Copies stay inside the task folder, as PNG; references must exist.
+    await expect(
+      rt.imageTool(t.id, { prompt: "x", saveAs: "../fora.png" }),
+    ).rejects.toThrow("dentro da pasta");
+    await expect(
+      rt.imageTool(t.id, { prompt: "x", saveAs: "a.jpg" }),
+    ).rejects.toThrow(".png");
+    await expect(
+      rt.imageTool(t.id, { prompt: "x", images: ["nada.png"] }),
+    ).rejects.toThrow("Imagem não encontrada");
+    // Planning never generates.
+    rt.updateTask(t.id, { mode: "plan" });
+    await expect(rt.imageTool(t.id, { prompt: "x" })).rejects.toThrow(
+      "planejamento",
+    );
+  });
+});
+describe("chat rápido", () => {
+  const settle = (rt: Runtime) =>
+    eventually(() =>
+      rt
+        .quickRuns()
+        .every((r) => r.status !== "running" && r.status !== "waiting"),
+    );
+  it("cada mensagem retoma a sessão anterior, sem criar conversa", async () => {
+    const rt = await runtime(["codex"]);
+    const first = await rt.startQuickChat({
+      text: "WHERE",
+      agent: "codex",
+      mode: "plan",
+    });
+    expect(first).toMatchObject({ kind: "chat", name: "Chat rápido" });
+    await settle(rt);
+    const one = rt.quickRuns()[0];
+    expect(one.status).toBe("done");
+    // No project: a scratch folder of Codebit, in a fresh session.
+    expect(JSON.parse(one.reply)).toEqual({
+      resumed: null,
+      cwd: join(rt.store.root, "scratch", "quick"),
+    });
+    expect(one.nativeId).toBe("native-codex");
+    // While an answer is on the way, the next message waits.
+    const slow = await rt.startQuickChat({
+      text: "SLOW ECHO segunda",
+      agent: "codex",
+      mode: "execute",
+      after: one.id,
+    });
+    await expect(
+      rt.startQuickChat({
+        text: "terceira",
+        agent: "codex",
+        mode: "plan",
+        after: slow.id,
+      }),
+    ).rejects.toThrow("Aguarde a resposta anterior");
+    await settle(rt);
+    // Only the latest message's run is kept, and it is not a conversation.
+    expect(rt.quickRuns().map((r) => r.id)).toEqual([slow.id]);
+    expect(rt.quickRuns()[0]).toMatchObject({
+      mode: "execute",
+      nativeId: "native-codex",
+    });
+    expect(rt.store.snapshot().tasks).toHaveLength(0);
+    const third = await rt.startQuickChat({
+      text: "WHERE",
+      agent: "claude" as any,
+      mode: "plan",
+      after: slow.id,
+    });
+    // The agent and folder are those of the first message.
+    expect(third.agent).toBe("codex");
+    await settle(rt);
+    expect(JSON.parse(rt.quickRuns()[0].reply).resumed).toBe("native-codex");
+    // A run that is gone cannot be continued.
+    await expect(
+      rt.startQuickChat({
+        text: "oi",
+        agent: "codex",
+        mode: "plan",
+        after: one.id,
+      }),
+    ).rejects.toThrow("Este chat rápido terminou");
+  });
+  it("trabalha na pasta do projeto escolhido e vira conversa com tudo", async () => {
+    const rt = await runtime(["codex"]);
+    const dir = await temp();
+    const p = await rt.project(dir);
+    await expect(
+      rt.startQuickChat({
+        text: "oi",
+        agent: "codex",
+        mode: "plan",
+        projectId: p.id,
+      }),
+    ).rejects.toThrow("Confie no projeto");
+    rt.store.put("project", { ...p, trusted: true });
+    const notices: string[] = [];
+    rt.attention = (n) => notices.push(n.body);
+    await rt.startQuickChat({
+      text: "WHERE",
+      agent: "codex",
+      mode: "plan",
+      projectId: p.id,
+    });
+    await settle(rt);
+    const first = rt.quickRuns()[0];
+    expect(JSON.parse(first.reply).cwd).toBe(p.path);
+    expect(notices).toEqual(["Resposta pronta."]);
+    const second = await rt.startQuickChat({
+      text: "ECHO e agora?",
+      agent: "codex",
+      mode: "plan",
+      after: first.id,
+    });
+    await settle(rt);
+    // Keeping it makes a conversation with every exchange.
+    const reply = rt.quickRuns()[0].reply;
+    const task = await rt.keepQuickChat(second.id, [
+      { user: "WHERE", assistant: first.reply },
+      { user: "ECHO e agora?", assistant: reply },
+    ]);
+    expect(task).toMatchObject({
+      title: "WHERE",
+      projectId: p.id,
+      agent: "codex",
+      mode: "plan",
+      nativeId: "native-codex",
+    });
+    expect(rt.store.entries(task.id).map((e) => [e.kind, e.text])).toEqual([
+      ["user", "WHERE"],
+      ["assistant", first.reply],
+      ["user", "ECHO e agora?"],
+      ["assistant", reply],
+    ]);
+    expect(rt.quickRuns()).toHaveLength(0);
+  });
+});
 describe("proteção contra repetição", () => {
   const warnings = (rt: Runtime, id: string) =>
     rt.store.entries(id).filter((e) => e.kind === "warning");
@@ -1170,7 +1494,8 @@ describe("contexto, skills e comandos", () => {
         (e) => events.push(e),
       );
       cleanups.push(() => session.close());
-      await session.send("Olá", []);
+      // The total of the answer; Claude's breakdown has a test of its own.
+      await session.send("Olá NOCONTEXT", []);
       await eventually(() => events.some((e) => e.type === "done"));
       expect(events.filter((e) => e.type === "usage").at(-1)).toEqual({
         type: "usage",
@@ -1237,7 +1562,39 @@ describe("contexto, skills e comandos", () => {
     const t = await rt.createTask({ title: "Contexto", agent: "claude" });
     await rt.send(t.id, "Olá");
     await idle(rt, t.id);
-    expect(rt.task(t.id).context).toEqual({ used: 1200, size: 500000 });
+    // Claude Code tells what the context is made of, at no model cost.
+    const context = rt.task(t.id).context!;
+    expect(context).toMatchObject({
+      used: 100000,
+      size: 200000,
+      deferred: 21000,
+    });
+    expect(context.parts!.map((p) => [p.id, p.tokens])).toEqual([
+      ["instructions", 2700],
+      ["tools", 10500],
+      ["skills", 5200],
+      ["conversation", 81600],
+      ["reserve", 33000],
+    ]);
+    const [instructions, tools, , conversation] = context.parts!;
+    expect(instructions.items).toContainEqual({
+      label: "CLAUDE.md (projeto)",
+      tokens: 300,
+    });
+    // MCP tools left out of the context do not count.
+    expect(tools.items).toEqual([
+      { label: "Ferramentas do Claude Code", tokens: 9500 },
+      { label: "MCP · codebit_images", tokens: 1000 },
+    ]);
+    expect(conversation.items![0]).toEqual({
+      label: "Resultados de ferramentas (arquivos lidos, saídas de comandos)",
+      tokens: 60000,
+    });
+    // Without the breakdown (older versions), the total of the answer.
+    const old = await rt.createTask({ title: "Antigo", agent: "claude" });
+    await rt.send(old.id, "NOCONTEXT");
+    await idle(rt, old.id);
+    expect(rt.task(old.id).context).toEqual({ used: 1200, size: 500000 });
     expect(rt.updateTask(t.id, { model: "outro" }).context).toBeUndefined();
   });
   it("trocar de agente e voltar sem novas mensagens não reenvia contexto", async () => {

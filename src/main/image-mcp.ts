@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline";
-import { appVersion } from "../shared/types";
+import { appVersion, subagentLabel } from "../shared/types";
 const send = (id: any, result: any) =>
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
 // The same helper serves the image, subagent or social tools of a task.
@@ -9,6 +9,14 @@ const board = process.env.CODEBIT_TOOLS === "tasks";
 // Board sessions suggest follow-ups; other project sessions also add
 // what the user asks for.
 const boardSession = process.env.CODEBIT_TASK_ROLE === "board";
+// The sub-agents' CLI, model and limit, to tell the agent what it delegates to.
+const subagents = (() => {
+  try {
+    return JSON.parse(process.env.CODEBIT_SUBAGENTS ?? "");
+  } catch {
+    return undefined;
+  }
+})();
 const boardTools = [
   {
     name: "list_tasks",
@@ -59,6 +67,26 @@ const imageList = {
   items: { type: "string" },
   description:
     "Caminhos dos arquivos (absolutos ou relativos à pasta da tarefa) ou IDs de imagens geradas pelo Codebit.",
+};
+// What a call may choose; the provider and model stay the user's choice.
+const imageOptions = {
+  aspect: {
+    type: "string",
+    enum: ["square", "landscape", "portrait"],
+    description:
+      "Formato: square (1024×1024), landscape (1536×1024) ou portrait (1024×1536). Sem ele, vale o formato escolhido na tarefa.",
+  },
+  background: {
+    type: "string",
+    enum: ["auto", "transparent", "opaque"],
+    description:
+      "transparent para recortes com canal alfa: ícones, sprites, objetos isolados.",
+  },
+  saveAs: {
+    type: "string",
+    description:
+      "Caminho .png na pasta da tarefa onde salvar uma cópia (ex.: concepts/armadura.png). Pastas são criadas e um arquivo existente é substituído.",
+  },
 };
 const socialTools = [
   {
@@ -131,7 +159,9 @@ const tools = board
           {
             name: "run_subagents",
             description:
-              "Executa tarefas em sub-agentes do Codebit, com o CLI, modelo, esforço e limite de execuções simultâneas escolhidos pelo usuário. Os sub-agentes trabalham na mesma pasta e não veem esta conversa: descreva cada tarefa por completo. Retorna a resposta final de cada um.",
+              "Delega tarefas a sub-agentes do Codebit, que rodam em paralelo" +
+              (subagents ? ` com ${subagentLabel(subagents)}` : "") +
+              ", o CLI e o modelo que o usuário escolheu para isso. Use quando o pedido tiver partes independentes: pesquisas, revisões, análises, mudanças em arquivos ou módulos diferentes, testes. Os sub-agentes trabalham na mesma pasta e não veem esta conversa: descreva cada tarefa por completo, com contexto, arquivos e o que entregar, e não deixe dois editarem o mesmo arquivo. Retorna a resposta final de cada um.",
             inputSchema: {
               type: "object",
               properties: {
@@ -159,10 +189,16 @@ const tools = board
           {
             name: "generate_image",
             description:
-              "Gera uma imagem usando exatamente o provedor e modelo selecionados pelo usuário nesta tarefa do Codebit. Retorna o ID e o arquivo.",
+              "Gera uma imagem com o provedor e o modelo que o usuário escolheu nesta tarefa do Codebit (normalmente GPT Image). O prompt chega ao gerador como você o escreveu: descreva assunto, estilo, composição, enquadramento, iluminação, cores e o que não deve aparecer; textos que devem aparecer na imagem vão entre aspas. Retorna o ID, o arquivo, as dimensões, uma prévia reduzida e promptKept; se o gerador tiver alterado o prompt, revisedPrompt mostra o que ele usou: compare e ajuste.",
             inputSchema: {
               type: "object",
-              properties: { prompt: { type: "string" } },
+              properties: {
+                prompt: {
+                  type: "string",
+                  description: "Descrição completa da imagem.",
+                },
+                ...imageOptions,
+              },
               required: ["prompt"],
               additionalProperties: false,
             },
@@ -170,14 +206,30 @@ const tools = board
           {
             name: "edit_image",
             description:
-              "Edita uma imagem desta tarefa pelo ID retornado por generate_image ou pelo identificador de anexo fornecido pelo usuário.",
+              "Edita uma imagem ou cria uma nova a partir de referências. Com uma imagem, descreva a mudança e diga o que deve ficar igual (rosto, pose, cores, enquadramento). Com várias, diga no prompt o papel de cada uma pela ordem (ex.: a primeira é o personagem; a segunda, a armadura a vestir nele). Retorna o mesmo que generate_image.",
             inputSchema: {
               type: "object",
               properties: {
-                prompt: { type: "string" },
-                inputImage: { type: "string" },
+                prompt: {
+                  type: "string",
+                  description:
+                    "A mudança, ou a imagem a criar a partir das referências.",
+                },
+                images: {
+                  type: "array",
+                  items: { type: "string" },
+                  minItems: 1,
+                  maxItems: 10,
+                  description:
+                    "Imagens, em ordem: IDs retornados por generate_image ou edit_image, identificadores de anexos do usuário ou caminhos de arquivos PNG, JPEG ou WebP (relativos à pasta da tarefa ou absolutos).",
+                },
+                inputImage: {
+                  type: "string",
+                  description: "Uma imagem só; o mesmo que images com um item.",
+                },
+                ...imageOptions,
               },
-              required: ["prompt", "inputImage"],
+              required: ["prompt"],
               additionalProperties: false,
             },
           },
@@ -246,8 +298,12 @@ input.on("line", async (line) => {
         throw new Error(
           agents ? "Informe ao menos uma tarefa." : "Informe o prompt.",
         );
-      if (msg.params.name === "edit_image" && !args.inputImage)
-        throw new Error("Prompt e imagem de edição são obrigatórios.");
+      if (
+        msg.params.name === "edit_image" &&
+        !args.inputImage &&
+        !args.images?.length
+      )
+        throw new Error("Informe a imagem a editar em images.");
       const response = await fetch(process.env.CODEBIT_TOOL_URL!, {
         method: "POST",
         headers: {

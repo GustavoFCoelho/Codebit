@@ -226,6 +226,24 @@
   border-radius: var(--radius);
   margin: 0 14px 10px;
 }
+/* What the generator did with the request, under the selected image. */
+.revised-prompt,
+.image-references {
+  margin: 0 14px 10px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.revised-prompt summary {
+  cursor: pointer;
+  color: var(--amber);
+}
+.revised-prompt p {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 160px;
+  overflow: auto;
+}
 .image-settings {
   padding: 5px 17px 20px;
 }

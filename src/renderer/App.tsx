@@ -50,6 +50,7 @@ import {
   LayoutGrid,
   ListTodo,
   ArrowLeft,
+  Zap,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -80,7 +81,6 @@ import { api, artifactUrl, fileName, fileUrl, readBase64 } from "./api";
 import {
   ActivityIcon,
   AgentMark,
-  ContextMeter,
   RequestCard,
   SectionLabel,
   statusName,
@@ -104,6 +104,9 @@ import {
 import { Inspector } from "./Inspector";
 import { Board, taskMime } from "./Board";
 import { WorkBoard } from "./Work";
+import { ContextMeter } from "./Context";
+import { draftIds, getDraft, pruneDrafts, saveDraft } from "./drafts";
+import { QuickChat, quickChatStatus, useQuickChat } from "./QuickChat";
 import { VoicePanel } from "./Voice";
 type Modal = "new" | "handoff" | "rename" | "model" | null;
 const MemoInspector = memo(Inspector);
@@ -140,6 +143,9 @@ export default function App() {
   // The task being renamed, and the one waiting for delete confirmation.
   const [renameId, setRenameId] = useState<string>();
   const [deleting, setDeleting] = useState<Task>();
+  // The project waiting for confirmation to leave Codebit.
+  const [removing, setRemoving] = useState<Project>();
+  const [removeWorktrees, setRemoveWorktrees] = useState(false);
   const [removeFolder, setRemoveFolder] = useState(false);
   // The composer popover open: agent and model, images or sub-agents.
   const [pop, setPop] = useState<"agent" | "images" | "subagents" | null>(null);
@@ -178,6 +184,9 @@ export default function App() {
   const [openedImage, setOpenedImage] = useState<string>();
   const [quickOpen, setQuickOpen] = useState(false);
   const [quickSelected, setQuickSelected] = useState<string>();
+  // The quick chat panel; its messages live in QuickChat.tsx.
+  const [chatOpen, setChatOpen] = useState(false);
+  const quickChat = quickChatStatus(useQuickChat());
   const handoffDraft = useRef<{ id: string; text: string } | undefined>(
     undefined,
   );
@@ -249,11 +258,15 @@ export default function App() {
     setTask(undefined);
     setEntries([]);
     setArtifacts([]);
+    // The message being written in this conversation, if any.
+    const saved = getDraft(selected);
     setDraft(
-      handoffDraft.current?.id === selected ? handoffDraft.current.text : "",
+      handoffDraft.current?.id === selected
+        ? handoffDraft.current.text
+        : (saved?.text ?? ""),
     );
     handoffDraft.current = undefined;
-    setAttachments([]);
+    setAttachments(saved?.attachments ?? []);
     setImageProgress(imageProgressByTask.current.get(selected) || "");
     setSelectedArtifact(undefined);
     setOpenedImage(undefined);
@@ -266,6 +279,29 @@ export default function App() {
   useEffect(() => {
     void run(refresh);
   }, [view]);
+  // Conversations with an unsent message, marked in the sidebar.
+  const [withDraft, setWithDraft] = useState(draftIds);
+  useEffect(() => {
+    if (!selected) return;
+    saveDraft(selected, draft, attachments);
+    const has = draftIds().has(selected);
+    setWithDraft((current) => {
+      if (current.has(selected) === has) return current;
+      const next = new Set(current);
+      if (has) next.add(selected);
+      else next.delete(selected);
+      return next;
+    });
+  }, [draft, attachments]);
+  useEffect(() => {
+    if (
+      snapshot &&
+      pruneDrafts(
+        new Set([...snapshot.tasks.map((t) => t.id), "board", "quick-chat"]),
+      )
+    )
+      setWithDraft(draftIds());
+  }, [snapshot?.tasks.length]);
   const openTask = useStable((id: string) => {
     setSelected(id);
     setView("workspace");
@@ -284,6 +320,25 @@ export default function App() {
     setDeleting(undefined);
     if (selectedRef.current === t.id) setSelected("");
   }
+  async function removeProject(p: Project) {
+    await api("project.delete", { id: p.id, worktrees: removeWorktrees });
+    setRemoving(undefined);
+    if (task?.projectId === p.id) setSelected("");
+    if (view === "work" && workProject === p.id) setView("workspace");
+  }
+  const projectAction = useStable((p: Project, action?: string) => {
+    if (action === "new") newTask(p.id);
+    if (action === "board") {
+      setWorkProject(p.id);
+      setView("work");
+    }
+    if (action === "folder")
+      void run(() => api("project.folder", { id: p.id }));
+    if (action === "delete") {
+      setRemoveWorktrees(false);
+      setRemoving(p);
+    }
+  });
   // Sidebar actions, from the row buttons or the right-click menu.
   const taskAction = useStable((t: Task, action?: string) => {
     if (action === "open") openTask(t.id);
@@ -330,6 +385,9 @@ export default function App() {
     } else if (key === "n") {
       e.preventDefault();
       newTask();
+    } else if (key === "j") {
+      e.preventDefault();
+      toggleChat();
     } else if (key === "." && task && (active || task.background)) {
       e.preventDefault();
       void run(() => api("task.interrupt", { id: task.id }));
@@ -347,12 +405,23 @@ export default function App() {
         taskId: task?.id,
       });
       setQuickSelected(started.id);
+      setChatOpen(false);
       setQuickOpen(true);
     });
   }
   const closeQuick = useStable(() => setQuickOpen(false));
   const keptQuick = useStable((id: string) => {
     setQuickOpen(false);
+    openTask(id);
+  });
+  // Both panels take the same place.
+  const toggleChat = useStable(() => {
+    setQuickOpen(false);
+    setChatOpen((open) => !open);
+  });
+  const closeChat = useStable(() => setChatOpen(false));
+  const keptChat = useStable((id: string) => {
+    setChatOpen(false);
     openTask(id);
   });
   // Opening a task, or returning to the chat, starts at the latest message.
@@ -699,6 +768,23 @@ export default function App() {
             ) : null;
           })()}
         </button>
+        <button
+          className={`board-link ${chatOpen ? "active-link" : ""}`}
+          title="Perguntas e execuções rápidas, sem histórico (Ctrl+J)"
+          onClick={toggleChat}
+        >
+          <Zap size={17} />
+          Chat rápido
+          {quickChat && (
+            <span
+              className={`status-dot ${quickChat === "waiting" ? "amber" : ""}`}
+              title={
+                quickChat === "waiting" ? "Aguardando você" : "Respondendo"
+              }
+            />
+          )}
+          <kbd>Ctrl J</kbd>
+        </button>
         <nav className="project-list">
           {showArchived && (
             <div className="archived-note" role="status">
@@ -750,6 +836,7 @@ export default function App() {
                     key={t.id}
                     task={t}
                     selected={t.id === selected && view === "workspace"}
+                    draft={withDraft.has(t.id)}
                     onSelect={() => openTask(t.id)}
                     onAction={taskAction}
                   />
@@ -774,7 +861,15 @@ export default function App() {
           )}
           {snapshot?.projects.map((p) => (
             <div className="project" key={p.id}>
-              <div className="project-title">
+              <div
+                className="project-title"
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  void api<string | undefined>("project.menu", {
+                    id: p.id,
+                  }).then((action) => projectAction(p, action));
+                }}
+              >
                 <button
                   className="project-toggle"
                   aria-expanded={isOpen(`project:${p.id}`)}
@@ -795,6 +890,14 @@ export default function App() {
                   onClick={() => newTask(p.id)}
                 >
                   <Plus size={14} />
+                </button>
+                <button
+                  className="icon on-hover danger-icon"
+                  title="Remover o projeto do Codebit"
+                  aria-label={`Remover o projeto ${p.name}`}
+                  onClick={() => projectAction(p, "delete")}
+                >
+                  <Trash2 size={13} />
                 </button>
               </div>
               {isOpen(`project:${p.id}`) && (
@@ -844,6 +947,7 @@ export default function App() {
                       key={t.id}
                       task={t}
                       selected={t.id === selected && view === "workspace"}
+                      draft={withDraft.has(t.id)}
                       onSelect={() => openTask(t.id)}
                       onAction={taskAction}
                     />
@@ -1978,7 +2082,7 @@ export default function App() {
               <span className="status-spacer" />
               {selectedInfo && <QuotaMeter info={selectedInfo} run={run} />}
               <span className="status-divider" />
-              <ContextMeter task={task} model={selectedModel} />
+              <ContextMeter task={task} model={selectedModel} details />
               <span className="status-divider" />
               <span>{agentNames[task.agent]}</span>
               <span className="status-divider" />
@@ -2003,6 +2107,15 @@ export default function App() {
           </button>
         </div>
       )}
+      {chatOpen && snapshot && (
+        <QuickChat
+          snapshot={snapshot}
+          projectId={task?.projectId ?? ""}
+          onClose={closeChat}
+          onOpenTask={keptChat}
+          run={run}
+        />
+      )}
       {quickOpen && (
         <QuickPanel
           selected={quickSelected}
@@ -2021,6 +2134,90 @@ export default function App() {
           run={run}
         />
       )}
+      {removing &&
+        (() => {
+          const tasks =
+            snapshot?.tasks.filter((t) => t.projectId === removing.id) ?? [];
+          const chats = tasks.filter((t) => !t.workItemId).length;
+          const board = (snapshot?.work ?? []).filter(
+            (w) => w.projectId === removing.id,
+          ).length;
+          const prompts = (snapshot?.prompts ?? []).filter(
+            (p) => p.projectId === removing.id,
+          ).length;
+          const worktrees = tasks.filter((t) => t.worktree).length;
+          const count = (n: number, one: string, many: string) =>
+            `${n} ${n === 1 ? one : many}`;
+          return (
+            <div
+              className="modal-backdrop"
+              onMouseDown={(e) => {
+                if (e.target === e.currentTarget) setRemoving(undefined);
+              }}
+            >
+              <form
+                className="modal"
+                role="dialog"
+                aria-label="Remover projeto"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void run(() => removeProject(removing));
+                }}
+              >
+                <div className="modal-header">
+                  <h2>Remover “{removing.name}” do Codebit?</h2>
+                  <button
+                    type="button"
+                    className="icon"
+                    aria-label="Fechar"
+                    onClick={() => setRemoving(undefined)}
+                  >
+                    <X size={19} />
+                  </button>
+                </div>
+                <p className="help">
+                  O Codebit apaga o que guarda deste projeto:{" "}
+                  {count(chats, "conversa", "conversas")} (com imagens, anexos e
+                  planos),{" "}
+                  {count(board, "tarefa do quadro", "tarefas do quadro")},{" "}
+                  {count(prompts, "prompt salvo", "prompts salvos")} do projeto
+                  e as contas de redes sociais conectadas a ele. Não dá para
+                  desfazer.
+                </p>
+                <p className="help">
+                  A pasta <code>{removing.path}</code> não é alterada: você pode
+                  abri-la de novo depois, como um projeto novo.
+                </p>
+                {worktrees > 0 && (
+                  <label className="checkbox">
+                    <input
+                      type="checkbox"
+                      checked={removeWorktrees}
+                      onChange={(e) => setRemoveWorktrees(e.target.checked)}
+                    />
+                    Remover também as{" "}
+                    {count(worktrees, "worktree", "worktrees")} que o Codebit
+                    criou (alterações não commitadas nelas serão perdidas; os
+                    branches continuam no repositório)
+                  </label>
+                )}
+                <div className="modal-actions">
+                  <button
+                    type="button"
+                    className="quiet"
+                    onClick={() => setRemoving(undefined)}
+                  >
+                    Cancelar
+                  </button>
+                  <button className="primary danger-button" type="submit">
+                    <Trash2 size={15} />
+                    Remover projeto
+                  </button>
+                </div>
+              </form>
+            </div>
+          );
+        })()}
       {deleting && (
         <div
           className="modal-backdrop"
@@ -2828,11 +3025,14 @@ function ago(iso: string) {
 function TaskItem({
   task,
   selected,
+  draft,
   onSelect,
   onAction,
 }: {
   task: Task;
   selected: boolean;
+  // A message written and not sent yet.
+  draft?: boolean;
   onSelect: () => void;
   onAction: (task: Task, action?: string) => void;
 }) {
@@ -2861,6 +3061,11 @@ function TaskItem({
       >
         <AgentMark agent={task.agent} />
         <span className="task-title">{task.title}</span>
+        {draft && (
+          <span className="task-draft" title="Mensagem não enviada">
+            <Pencil size={11} aria-hidden />
+          </span>
+        )}
         {flagged ? (
           <span
             className={`status-dot ${task.status === "waiting" ? "amber" : task.status === "failed" ? "red" : task.status === "interrupted" ? "muted-dot" : "pulse"}`}

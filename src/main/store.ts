@@ -9,6 +9,7 @@ import type {
   WorkItem,
   Settings,
   Task,
+  UserSecret,
 } from "../shared/types";
 import { defaultGuidelines } from "../shared/types";
 export class Store {
@@ -114,6 +115,9 @@ export class Store {
         a.name.localeCompare(b.name, "pt-BR"),
       ),
       work: this.all<WorkItem>("work").sort((a, b) => a.order - b.order),
+      secrets: this.all<UserSecret>("user-secret").sort((a, b) =>
+        a.name.localeCompare(b.name),
+      ),
     };
   }
   close() {

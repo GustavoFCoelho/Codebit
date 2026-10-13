@@ -9,6 +9,7 @@ import type {
   Installation,
   Model,
   Task,
+  InspectCommand,
 } from "../../shared/types";
 import { appVersion } from "../../shared/types";
 export class CodexSession implements AgentSession {
@@ -30,6 +31,8 @@ export class CodexSession implements AgentSession {
     mcp: Record<string, any>,
     private emit: (event: AgentEvent) => void,
     private guidelines = "",
+    // What a command to approve would delete, shown with the approval.
+    private inspect?: InspectCommand,
   ) {
     this.channel = new Channel(
       i,
@@ -102,28 +105,37 @@ export class CodexSession implements AgentSession {
           },
         });
       else if (msg.method.includes("requestApproval"))
-        this.emit({
-          type: "request",
-          request: {
-            id,
-            kind: "approval",
-            title: msg.method.includes("fileChange")
-              ? "Permitir alterações?"
-              : msg.method.includes("permissions")
-                ? "Conceder permissões?"
-                : "Permitir execução?",
-            detail: [
-              p.reason,
-              p.command,
-              p.changes ? JSON.stringify(p.changes, null, 2) : "",
-              p.permissions ? JSON.stringify(p.permissions) : "",
-              p.cwd,
-            ]
-              .filter(Boolean)
-              .join("\n"),
-            choices: ["decline", "accept"],
-          },
-        });
+        void (
+          typeof p.command === "string" && this.inspect
+            ? this.inspect(p.command, true, p.cwd || undefined).catch(
+                () => undefined,
+              )
+            : Promise.resolve(undefined)
+        ).then((blast) =>
+          this.emit({
+            type: "request",
+            request: {
+              id,
+              kind: "approval",
+              title: msg.method.includes("fileChange")
+                ? "Permitir alterações?"
+                : msg.method.includes("permissions")
+                  ? "Conceder permissões?"
+                  : "Permitir execução?",
+              detail: [
+                p.reason,
+                p.command,
+                p.changes ? JSON.stringify(p.changes, null, 2) : "",
+                p.permissions ? JSON.stringify(p.permissions) : "",
+                p.cwd,
+              ]
+                .filter(Boolean)
+                .join("\n"),
+              choices: ["decline", "accept"],
+              ...(blast ? { blast } : {}),
+            },
+          }),
+        );
       // Codex asks before running MCP tools through a confirmation elicitation.
       else if (
         msg.method === "mcpServer/elicitation/request" &&

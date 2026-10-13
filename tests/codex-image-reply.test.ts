@@ -93,6 +93,8 @@ describe("conclusão da imagem Codex", () => {
           type: "imageGeneration",
           result: "",
           savedPath: "generated.png",
+          revisedPrompt: "prompt usado",
+          transparentBackground: true,
         },
       },
     });
@@ -101,7 +103,11 @@ describe("conclusão da imagem Codex", () => {
     const bytes = Buffer.from("synthetic image");
     finish(bytes);
     await pending;
-    expect(success).toHaveBeenCalledWith(bytes);
+    // The prompt the Codex model used goes along with the image.
+    expect(success).toHaveBeenCalledWith(bytes, {
+      revisedPrompt: "prompt usado",
+      transparentBackground: true,
+    });
     expect(failure).not.toHaveBeenCalled();
   });
   it("mantém o erro de leitura do arquivo após a conclusão do turno", async () => {

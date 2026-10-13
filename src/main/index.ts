@@ -32,7 +32,8 @@ import { Updater, waitForExit } from "./updater";
 import { buildProject, SourceMode } from "./source";
 import { SocialService } from "./social";
 import { mentionedPath, resolveMention } from "./mentions";
-import { prepareInstagramImage } from "./jpeg";
+import { imagePreview, prepareInstagramImage } from "./jpeg";
+import { SecretVault } from "./secrets";
 import { Patreon } from "./patreon";
 import { findCloudflared, hostFiles } from "./tunnel";
 import { capture } from "./process";
@@ -89,6 +90,7 @@ const imageOptions = z.object({
     .min(0)
     .max(2 ** 32 - 1),
   inputImage: z.string().max(2000).optional(),
+  background: z.enum(["auto", "transparent", "opaque"]).optional(),
 });
 const subagentOptions = z.object({
   enabled: z.boolean(),
@@ -142,6 +144,13 @@ const settingsSchema = z.object({
       failures: z.number().int().min(2).max(50),
     })
     .optional(),
+  deleteGuard: z
+    .object({
+      enabled: z.boolean(),
+      files: z.number().int().min(1).max(1_000_000),
+      megabytes: z.number().min(1).max(10_000_000),
+    })
+    .optional(),
 });
 function emit(event: AppEvent) {
   if (event.type === "task-signal") voice?.signal(event.signal);
@@ -170,6 +179,8 @@ function notify(notice: { title: string; body: string; taskId?: string }) {
   n.on("close", () => notices.delete(n));
   n.show();
 }
+// The key saved for images, else an OPENAI_API_KEY among the secrets or in
+// the environment.
 function key() {
   const encrypted = store.secret("openai-image");
   if (encrypted) {
@@ -177,7 +188,7 @@ function key() {
       throw new Error("O armazenamento seguro do Windows não está disponível.");
     return safeStorage.decryptString(Buffer.from(encrypted, "base64"));
   }
-  return process.env.OPENAI_API_KEY;
+  return runtime.secrets?.value("OPENAI_API_KEY") || process.env.OPENAI_API_KEY;
 }
 function snapshot() {
   return {
@@ -188,7 +199,9 @@ function snapshot() {
     settings: {
       ...store.settings(),
       hasOpenAIKey: !!(
-        store.secret("openai-image") || process.env.OPENAI_API_KEY
+        store.secret("openai-image") ||
+        runtime.secrets?.value("OPENAI_API_KEY") ||
+        process.env.OPENAI_API_KEY
       ),
     },
   };
@@ -290,6 +303,42 @@ async function handle(method: string, args: any = {}) {
       runtime.refresh();
       return p;
     }
+    // Forgets a project in Codebit; its folder on disk stays as it is.
+    case "project.delete": {
+      const a = z.object({ id, worktrees: z.boolean().optional() }).parse(args);
+      for (const t of store.snapshot().tasks)
+        if (t.projectId === a.id) {
+          terminals.get(t.id)?.kill();
+          terminals.delete(t.id);
+        }
+      await runtime.deleteProject(a.id, !!a.worktrees);
+      return;
+    }
+    // Right click on a project in the sidebar; the renderer acts on it.
+    case "project.menu": {
+      store.get<Project>("project", id.parse(args.id));
+      return await new Promise<string | undefined>((resolve) => {
+        const item = (label: string, action: string) => ({
+          label,
+          click: () => resolve(action),
+        });
+        Menu.buildFromTemplate([
+          item("Nova tarefa", "new"),
+          item("Quadro de tarefas", "board"),
+          item("Abrir a pasta", "folder"),
+          { type: "separator" },
+          item("Remover do Codebit…", "delete"),
+        ]).popup({
+          window: win,
+          // A click comes before or right after the menu closes.
+          callback: () => setTimeout(() => resolve(undefined), 100),
+        });
+      });
+    }
+    case "project.folder":
+      return shell.openPath(
+        store.get<Project>("project", id.parse(args.id)).path,
+      );
     case "task.create":
       return runtime.createTask(
         z
@@ -382,6 +431,32 @@ async function handle(method: string, args: any = {}) {
       return runtime.dismissQuick(id.parse(args.id));
     case "quick.keep":
       return runtime.keepQuick(id.parse(args.id));
+    case "quick.chat":
+      return runtime.startQuickChat(
+        z
+          .object({
+            text: z.string().trim().min(1).max(20000),
+            agent,
+            mode: z.enum(["plan", "execute", "bypass"]),
+            projectId: z.string().max(500).optional(),
+            after: id.optional(),
+          })
+          .parse(args),
+      );
+    case "quick.keepChat":
+      return runtime.keepQuickChat(
+        id.parse(args.id),
+        z
+          .array(
+            z.object({
+              user: z.string().max(20000),
+              assistant: z.string().max(400000),
+            }),
+          )
+          .min(1)
+          .max(200)
+          .parse(args.turns),
+      );
     case "task.respond": {
       const a = z
         .object({
@@ -682,6 +757,24 @@ async function handle(method: string, args: any = {}) {
       store.saveSettings(s);
       return runtime.detect();
     }
+    case "secrets.save": {
+      const secret = runtime.secrets!.save(
+        z
+          .object({
+            id: id.optional(),
+            name: z.string().trim().min(1).max(100),
+            value: z.string().max(32000).optional(),
+            description: z.string().max(500).optional(),
+          })
+          .parse(args),
+      );
+      runtime.refresh();
+      return secret;
+    }
+    case "secrets.delete":
+      runtime.secrets!.delete(id.parse(args.id));
+      runtime.refresh();
+      return;
     case "settings.key": {
       const value = z.string().max(1000).parse(args.key).trim();
       if (value && !safeStorage.isEncryptionAvailable())
@@ -787,11 +880,15 @@ async function handle(method: string, args: any = {}) {
         cols: 100,
         rows: 24,
         cwd: t.cwd,
-        env: Object.fromEntries(
-          Object.entries(process.env).filter(
-            (p): p is [string, string] => typeof p[1] === "string",
+        // The user's secrets are there too, as in the agents' sessions.
+        env: {
+          ...Object.fromEntries(
+            Object.entries(process.env).filter(
+              (p): p is [string, string] => typeof p[1] === "string",
+            ),
           ),
-        ),
+          ...runtime.secrets?.env(),
+        },
       });
       terminals.set(taskId, term);
       terminalBuffers.set(taskId, "");
@@ -985,6 +1082,18 @@ void (previous ? waitForExit(previous) : Promise.resolve()).then(() => {
     runtime.bridgeConfig = (id, kind, env) => bridge.config(id, kind, env);
     runtime.revokeBridge = (id) => bridge.revoke(id);
     runtime.attention = notify;
+    runtime.imagePreview = imagePreview;
+    runtime.secrets = new SecretVault(store, {
+      encrypt: (value) => {
+        if (!safeStorage.isEncryptionAvailable())
+          throw new Error(
+            "O armazenamento seguro do Windows não está disponível.",
+          );
+        return safeStorage.encryptString(value).toString("base64");
+      },
+      decrypt: (value) =>
+        safeStorage.decryptString(Buffer.from(value, "base64")),
+    });
     social = new SocialService({
       store,
       encrypt: (value) => {
