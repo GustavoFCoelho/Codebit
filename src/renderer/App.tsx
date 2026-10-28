@@ -7,6 +7,8 @@ import {
   useRef,
   useState,
   type ReactNode,
+  type ComponentProps,
+  startTransition,
 } from "react";
 import {
   Code2,
@@ -48,9 +50,9 @@ import {
   EyeOff,
   Gauge,
   LayoutGrid,
-  ListTodo,
-  ArrowLeft,
+  Gamepad2,
   Zap,
+  Brain,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -103,11 +105,12 @@ import {
 } from "./mentions";
 import { Inspector } from "./Inspector";
 import { Board, taskMime } from "./Board";
-import { WorkBoard } from "./Work";
 import { ContextMeter } from "./Context";
 import { draftIds, getDraft, pruneDrafts, saveDraft } from "./drafts";
+import { DraftInput, useEditorDraft } from "./DraftInput";
 import { QuickChat, quickChatStatus, useQuickChat } from "./QuickChat";
 import { VoicePanel } from "./Voice";
+import { GamingBench } from "./GamingBench";
 type Modal = "new" | "handoff" | "rename" | "model" | null;
 const MemoInspector = memo(Inspector);
 // Same function identity across renders, always calling the latest version.
@@ -122,17 +125,16 @@ export default function App() {
     localStorage.getItem("codebit.task") || "",
   );
   const [view, setView] = useState<
-    "workspace" | "settings" | "extensions" | "board" | "work"
+    "workspace" | "settings" | "extensions" | "board" | "gaming"
   >("workspace");
-  // The project whose task board is open.
-  const [workProject, setWorkProject] = useState("");
   const viewRef = useRef(view);
   viewRef.current = view;
   const [board, setBoard] = useState<BoardCard[]>([]);
   const [task, setTask] = useState<Task>();
   const [entries, setEntries] = useState<Entry[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [draft, setDraft] = useState("");
+  const editorDraft = useEditorDraft();
+  const { text: draft, replace: setDraft } = editorDraft;
   const [attachments, setAttachments] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
@@ -160,6 +162,9 @@ export default function App() {
   const searchInput = useRef<HTMLInputElement>(null);
   const [hideContext, setHideContext] = useState(
     localStorage.getItem("codebit.hideContext") === "1",
+  );
+  const [hideThoughts, setHideThoughts] = useState(
+    localStorage.getItem("codebit.hideThoughts") === "1",
   );
   // Commands and skills of the selected task's agent, keyed by task and agent.
   const [commands, setCommands] = useState<{
@@ -215,7 +220,7 @@ export default function App() {
   );
   async function refresh() {
     const data = await api<Snapshot>("snapshot");
-    setSnapshot(data);
+    startTransition(() => setSnapshot(data));
     if (viewRef.current === "board") {
       setBoard(await api<BoardCard[]>("board.read"));
       return;
@@ -228,9 +233,11 @@ export default function App() {
         artifacts: Artifact[];
       }>("task.read", { id });
       if (selectedRef.current === id) {
-        setTask(value.task);
-        setEntries(value.entries);
-        setArtifacts(value.artifacts);
+        startTransition(() => {
+          setTask(value.task);
+          setEntries(value.entries);
+          setArtifacts(value.artifacts);
+        });
       }
     }
   }
@@ -283,7 +290,7 @@ export default function App() {
   const [withDraft, setWithDraft] = useState(draftIds);
   useEffect(() => {
     if (!selected) return;
-    saveDraft(selected, draft, attachments);
+    saveDraft(selected, editorDraft.current.current.text, attachments);
     const has = draftIds().has(selected);
     setWithDraft((current) => {
       if (current.has(selected) === has) return current;
@@ -324,14 +331,9 @@ export default function App() {
     await api("project.delete", { id: p.id, worktrees: removeWorktrees });
     setRemoving(undefined);
     if (task?.projectId === p.id) setSelected("");
-    if (view === "work" && workProject === p.id) setView("workspace");
   }
   const projectAction = useStable((p: Project, action?: string) => {
     if (action === "new") newTask(p.id);
-    if (action === "board") {
-      setWorkProject(p.id);
-      setView("work");
-    }
     if (action === "folder")
       void run(() => api("project.folder", { id: p.id }));
     if (action === "delete") {
@@ -490,16 +492,17 @@ export default function App() {
     (e) => e.kind === "request" && !e.resolved,
   );
   // "Ocultar contexto" keeps the conversation and drops tool runs and
-  // approvals already answered.
+  // approvals already answered; "Ocultar pensamentos" drops the thoughts.
   const visibleEntries = useMemo(
     () =>
-      hideContext
-        ? entries.filter(
-            (e) =>
-              e.kind !== "activity" && !(e.kind === "request" && e.resolved),
-          )
-        : entries,
-    [entries, hideContext],
+      entries.filter(
+        (e) =>
+          !(
+            hideContext &&
+            (e.kind === "activity" || (e.kind === "request" && e.resolved))
+          ) && !(hideThoughts && e.kind === "thought"),
+      ),
+    [entries, hideContext, hideThoughts],
   );
   // Typing "/" at the start of the message lists the agent's skills and commands.
   const slash = /^\/(\S*)$/.exec(draft)?.[1];
@@ -535,7 +538,8 @@ export default function App() {
       setCommands({ key, list: [], error: (e as Error).message });
     }
   }
-  // Codex invokes skills with $name; Claude and Devin run /name.
+  // Codex invokes skills with $name; Claude and Devin run /name. Antigravity
+  // lists none: its slash commands only work in its own terminal.
   function chooseCommand(c: AgentCommand) {
     setDraft(`${task?.agent === "codex" ? "$" : "/"}${c.name} `);
   }
@@ -663,7 +667,7 @@ export default function App() {
       // While the agent works, messages wait in the task queue.
       await api(active ? "task.enqueue" : "task.send", {
         id: task.id,
-        text: draft,
+        text: editorDraft.current.current.text,
         attachments,
       });
       setDraft("");
@@ -674,10 +678,10 @@ export default function App() {
     }
   }
   async function generateImage() {
-    if (!task || !draft.trim()) return;
+    if (!task || !editorDraft.current.current.text.trim()) return;
     setTab("Imagens");
     setPanel(true);
-    const prompt = draft;
+    const prompt = editorDraft.current.current.text;
     setDraft("");
     try {
       const result = await api<Artifact>("images.generate", {
@@ -769,6 +773,13 @@ export default function App() {
           })()}
         </button>
         <button
+          className={`board-link ${view === "gaming" ? "active-link" : ""}`}
+          onClick={() => setView("gaming")}
+        >
+          <Gamepad2 size={17} />
+          Gaming Bench
+        </button>
+        <button
           className={`board-link ${chatOpen ? "active-link" : ""}`}
           title="Perguntas e execuções rápidas, sem histórico (Ctrl+J)"
           onClick={toggleChat}
@@ -827,7 +838,8 @@ export default function App() {
                 .filter(
                   (t) =>
                     !t.projectId &&
-                    !t.workItemId &&
+                    !t.gamingBenchBatch &&
+                    !t.title.startsWith("Gaming Bench ·") &&
                     t.archived === showArchived &&
                     t.title.toLowerCase().includes(search.toLowerCase()),
                 )
@@ -859,7 +871,7 @@ export default function App() {
               Abra uma pasta para começar seu primeiro projeto.
             </p>
           )}
-          {snapshot?.projects.map((p) => (
+          {snapshot?.projects.filter((p) => !p.hidden).map((p) => (
             <div className="project" key={p.id}>
               <div
                 className="project-title"
@@ -900,45 +912,13 @@ export default function App() {
                   <Trash2 size={13} />
                 </button>
               </div>
-              {isOpen(`project:${p.id}`) && (
-                <button
-                  className={`work-link ${(view === "work" && workProject === p.id) || (view === "workspace" && task?.workItemId && task.projectId === p.id) ? "active-link" : ""}`}
-                  title="Quadro de tarefas do projeto"
-                  aria-label={`Tarefas de ${p.name}`}
-                  onClick={() => {
-                    setWorkProject(p.id);
-                    setView("work");
-                  }}
-                >
-                  <ListTodo size={15} />
-                  <span>Tarefas</span>
-                  {p.work?.enabled && (
-                    <span
-                      className="status-dot pulse"
-                      title="Modo tarefas ligado"
-                    />
-                  )}
-                  {(() => {
-                    const pending = snapshot.work.filter(
-                      (i) => i.projectId === p.id && i.state === "pending",
-                    ).length;
-                    return pending ? (
-                      <span
-                        className="badge attention"
-                        title="Recomendações esperando aprovação"
-                      >
-                        {pending}
-                      </span>
-                    ) : null;
-                  })()}
-                </button>
-              )}
               {isOpen(`project:${p.id}`) &&
                 snapshot.tasks
                   .filter(
                     (t) =>
                       t.projectId === p.id &&
-                      !t.workItemId &&
+                      !t.gamingBenchBatch &&
+                      !t.title.startsWith("Gaming Bench ·") &&
                       t.archived === showArchived &&
                       t.title.toLowerCase().includes(search.toLowerCase()),
                   )
@@ -1076,19 +1056,6 @@ export default function App() {
           <div className="title-context">
             {view === "workspace" && task ? (
               <>
-                {task.workItemId && (
-                  <button
-                    className="icon back-to-board"
-                    title="Voltar ao quadro de tarefas"
-                    aria-label="Voltar ao quadro de tarefas"
-                    onClick={() => {
-                      setWorkProject(task.projectId);
-                      setView("work");
-                    }}
-                  >
-                    <ArrowLeft size={16} />
-                  </button>
-                )}
                 <h1
                   title="Clique duas vezes para renomear"
                   onDoubleClick={() => startRename(task)}
@@ -1105,9 +1072,6 @@ export default function App() {
                     "Conversa sem projeto"
                   )}
                   {task.worktree && <span className="badge">worktree</span>}
-                  {task.workItemId && (
-                    <span className="badge">tarefa do quadro</span>
-                  )}
                   {task.parentId && (
                     <span className="badge">tarefa vinculada</span>
                   )}
@@ -1117,11 +1081,11 @@ export default function App() {
               <span className="title-subtle">
                 {view === "board"
                   ? "Modo Multitarefa"
-                  : view === "work"
-                    ? "Quadro de tarefas"
-                    : view === "workspace"
-                      ? "Seu próximo projeto começa aqui"
-                      : "Configurações"}
+                  : view === "gaming"
+                    ? "Gaming Bench"
+                  : view === "workspace"
+                    ? "Seu próximo projeto começa aqui"
+                    : "Configurações"}
               </span>
             )}
           </div>
@@ -1143,6 +1107,25 @@ export default function App() {
                   {hideContext ? <Eye size={15} /> : <EyeOff size={15} />}
                   <span>
                     {hideContext ? "Mostrar contexto" : "Ocultar contexto"}
+                  </span>
+                </button>
+                <button
+                  className={`quiet compact ${hideThoughts ? "toggled" : ""}`}
+                  aria-pressed={hideThoughts}
+                  title="Mostra ou esconde o que o agente pensa entre as ações"
+                  onClick={() => {
+                    localStorage.setItem(
+                      "codebit.hideThoughts",
+                      hideThoughts ? "0" : "1",
+                    );
+                    setHideThoughts(!hideThoughts);
+                  }}
+                >
+                  <Brain size={15} />
+                  <span>
+                    {hideThoughts
+                      ? "Mostrar pensamentos"
+                      : "Ocultar pensamentos"}
                   </span>
                 </button>
                 <button
@@ -1238,21 +1221,15 @@ export default function App() {
           </div>
         </header>
         <VoicePanel snapshot={snapshot} onOpen={openTask} />
-        {view === "work" &&
-        snapshot?.projects.some((p) => p.id === workProject) ? (
-          <WorkBoard
-            project={snapshot.projects.find((p) => p.id === workProject)!}
-            snapshot={snapshot}
-            run={run}
-            onOpen={openTask}
-          />
-        ) : view === "board" && snapshot ? (
+        {view === "board" && snapshot ? (
           <Board
             cards={board}
             snapshot={snapshot}
             run={run}
             onOpen={openTask}
           />
+        ) : view === "gaming" && snapshot ? (
+          <GamingBench snapshot={snapshot} run={run} onOpen={openTask} />
         ) : view !== "workspace" ? (
           <SettingsView
             snapshot={snapshot}
@@ -1276,7 +1253,7 @@ export default function App() {
             <span className="eyebrow">UM WORKSPACE. SEUS AGENTES.</span>
             <h2>O que vamos construir?</h2>
             <p>
-              Codex, Claude e Devin, no mesmo lugar.
+              Codex, Claude, Devin e Antigravity, no mesmo lugar.
               <br />
               Seu código, suas ferramentas e seus modelos de imagem.
             </p>
@@ -1376,25 +1353,21 @@ export default function App() {
                     </div>
                   </div>
                 )}
-                {visibleEntries.map((e) => (
-                  <EntryView
-                    key={e.id}
-                    entry={e}
-                    agent={task.agent}
-                    taskId={task.id}
-                    artifact={
-                      e.artifactId
-                        ? artifacts.find((a) => a.id === e.artifactId)
-                        : undefined
-                    }
-                    run={run}
-                    onImage={onImage}
-                    onImageLoad={onImageLoad}
-                    onOpenImage={openImage}
-                    onOpenPath={openPath}
-                    onShowPlan={showPlan}
-                  />
-                ))}
+                <EntryList
+                  entries={visibleEntries}
+                  artifacts={artifacts}
+                  liveId={
+                    task.status === "running" ? entries.at(-1)?.id : undefined
+                  }
+                  agent={task.agent}
+                  taskId={task.id}
+                  run={run}
+                  onImage={onImage}
+                  onImageLoad={onImageLoad}
+                  onOpenImage={openImage}
+                  onOpenPath={openPath}
+                  onShowPlan={showPlan}
+                />
                 {task.status === "running" && (
                   <div className="working">
                     <LoaderCircle size={15} className="spin" />O agente está
@@ -1519,7 +1492,10 @@ export default function App() {
                   />
                 )}
                 <div className="composer">
-                  <textarea
+                  <DraftInput
+                    key={selected}
+                    {...editorDraft.input}
+                    onEdit={(text) => saveDraft(selected, text, attachments)}
                     aria-label="Mensagem"
                     placeholder={
                       active
@@ -1528,8 +1504,6 @@ export default function App() {
                           ? "O que você quer planejar?"
                           : "Peça uma alteração ou digite / para skills e comandos…"
                     }
-                    value={draft}
-                    onChange={(e) => setDraft(e.target.value)}
                     onPaste={(e) => {
                       const images = [...e.clipboardData.files].filter((f) =>
                         f.type.startsWith("image/"),
@@ -1944,7 +1918,7 @@ export default function App() {
                             {locked
                               ? "Bloqueado enquanto o agente trabalha."
                               : task.agent === "devin"
-                                ? "O Devin CLI ainda não usa ferramentas MCP do Codebit como agente principal. Escolha Codex ou Claude para delegar; o Devin funciona como sub-agente."
+                                ? "O Devin CLI ainda não usa ferramentas MCP do Codebit como agente principal. Escolha Codex, Claude ou Antigravity para delegar; o Devin funciona como sub-agente."
                                 : "O agente principal recebe a ferramenta run_subagents. Os sub-agentes trabalham na mesma pasta e seguem o modo da tarefa."}
                           </p>
                           {task.subagents && !synced && !locked && (
@@ -2138,10 +2112,7 @@ export default function App() {
         (() => {
           const tasks =
             snapshot?.tasks.filter((t) => t.projectId === removing.id) ?? [];
-          const chats = tasks.filter((t) => !t.workItemId).length;
-          const board = (snapshot?.work ?? []).filter(
-            (w) => w.projectId === removing.id,
-          ).length;
+          const chats = tasks.length;
           const prompts = (snapshot?.prompts ?? []).filter(
             (p) => p.projectId === removing.id,
           ).length;
@@ -2178,11 +2149,9 @@ export default function App() {
                 <p className="help">
                   O Codebit apaga o que guarda deste projeto:{" "}
                   {count(chats, "conversa", "conversas")} (com imagens, anexos e
-                  planos),{" "}
-                  {count(board, "tarefa do quadro", "tarefas do quadro")},{" "}
-                  {count(prompts, "prompt salvo", "prompts salvos")} do projeto
-                  e as contas de redes sociais conectadas a ele. Não dá para
-                  desfazer.
+                  planos), {count(prompts, "prompt salvo", "prompts salvos")} do
+                  projeto e as contas de redes sociais conectadas a ele. Não dá
+                  para desfazer.
                 </p>
                 <p className="help">
                   A pasta <code>{removing.path}</code> não é alterada: você pode
@@ -2632,6 +2601,7 @@ function CommandPalette({
 const EntryView = memo(
   function EntryView({
     entry: e,
+    live,
     agent,
     taskId,
     artifact,
@@ -2643,6 +2613,8 @@ const EntryView = memo(
     onShowPlan,
   }: {
     entry: Entry;
+    // A thought still arriving.
+    live?: boolean;
     agent: AgentId;
     taskId: string;
     artifact?: Artifact;
@@ -2747,6 +2719,7 @@ const EntryView = memo(
             </div>
           </>
         )}
+        {e.kind === "thought" && <ThoughtView text={e.text} live={!!live} />}
         {e.kind === "activity" && (
           <>
             <ActivityIcon text={e.text} ok={e.ok} />
@@ -2832,6 +2805,7 @@ const EntryView = memo(
   (a, b) =>
     a.entry.id === b.entry.id &&
     a.entry.text === b.entry.text &&
+    a.live === b.live &&
     a.entry.resolved === b.entry.resolved &&
     a.entry.ok === b.entry.ok &&
     a.entry.agent === b.entry.agent &&
@@ -2839,6 +2813,86 @@ const EntryView = memo(
     a.taskId === b.taskId &&
     a.artifact?.id === b.artifact?.id,
 );
+// Keep typing independent of history length: memoizing individual rows still
+// creates and compares thousands of elements on every composer keystroke.
+const EntryList = memo(function EntryList({
+  entries,
+  artifacts,
+  liveId,
+  ...props
+}: Omit<ComponentProps<typeof EntryView>, "entry" | "artifact" | "live"> & {
+  entries: Entry[];
+  artifacts: Artifact[];
+  liveId?: string;
+}) {
+  const byId = useMemo(
+    () => new Map(artifacts.map((artifact) => [artifact.id, artifact])),
+    [artifacts],
+  );
+  // Containment per row still makes Chromium visit thousands of boxes on
+  // layout. Group them so offscreen layout can skip whole sections at once.
+  const batches: ReactNode[] = [];
+  for (let i = 0; i < entries.length; i += 100) {
+    const batch = entries.slice(i, i + 100);
+    batches.push(
+      <div
+        className="entry-batch"
+        key={batch[0].id}
+        style={{ containIntrinsicBlockSize: `auto ${batch.length * 80}px` }}
+      >
+        {batch.map((entry) => (
+          <EntryView
+            key={entry.id}
+            {...props}
+            entry={entry}
+            artifact={entry.artifactId ? byId.get(entry.artifactId) : undefined}
+            live={entry.kind === "thought" && entry.id === liveId}
+          />
+        ))}
+      </div>,
+    );
+  }
+  return batches;
+});
+// What the agent thought between actions: open while it arrives, then one
+// line that opens with a click.
+function ThoughtView({ text, live }: { text: string; live: boolean }) {
+  const [open, setOpen] = useState<boolean>();
+  const shown = open ?? live;
+  const first = text
+    .trim()
+    .split("\n")[0]
+    .replace(/[*_`#]/g, "")
+    .trim();
+  return (
+    <div className="thought">
+      <button
+        className="thought-head"
+        aria-expanded={shown}
+        onClick={() => setOpen(!shown)}
+      >
+        <Brain size={13} aria-hidden />
+        <strong>{live ? "Pensando…" : "Pensamento"}</strong>
+        {!shown && <span className="thought-preview">{first}</span>}
+        {shown ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+      </button>
+      {shown && (
+        <div className="thought-text markdown">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              // Plain text: a thought is no place to follow links from.
+              a: ({ children }) => <>{children}</>,
+              img: () => null,
+            }}
+          >
+            {text}
+          </ReactMarkdown>
+        </div>
+      )}
+    </div>
+  );
+}
 // A known cause as the error card title; otherwise a general one.
 function errorTitle(text: string) {
   if (/cota|quota|rate limit|usage limit|limite de uso/i.test(text))

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { Store } from "./store";
 import type { SocialAccount, SocialNetwork, SocialPost } from "../shared/types";
 import { Instagram } from "./instagram";
+import { LinkedIn } from "./linkedin";
 import type { Hosted } from "./tunnel";
 const day = 24 * 3600 * 1000;
 // Patreon has no API to create posts: the post is written in its editor, in
@@ -38,8 +39,10 @@ export interface SocialDeps {
 }
 export class SocialService {
   private instagram: Instagram;
+  private linkedin: LinkedIn;
   constructor(private deps: SocialDeps) {
     this.instagram = deps.instagram ?? new Instagram();
+    this.linkedin = new LinkedIn();
   }
   private now() {
     return this.deps.now?.() ?? Date.now();
@@ -110,6 +113,21 @@ export class SocialService {
       },
       token,
     );
+  }
+  async connectLinkedIn(projectId: string, token: string) {
+    token = token.trim();
+    if (!token) throw new Error("Cole o token de acesso do LinkedIn.");
+    const profile = await this.linkedin.profile(token);
+    const old = this.account(projectId, "linkedin");
+    const account: SocialAccount = {
+      id: old?.id ?? randomUUID(),
+      projectId,
+      network: "linkedin",
+      name: profile.name,
+      memberUrn: profile.memberUrn,
+      createdAt: new Date(this.now()).toISOString(),
+    };
+    return this.save(account, token);
   }
   async renew(accountId: string) {
     const account = this.deps.store.get<SocialAccount>("social", accountId);
@@ -216,6 +234,14 @@ export class SocialService {
     post: { title: string; text: string; images: string[]; audience: string },
   ) {
     return this.deps.patreon.publish(account.projectId, post);
+  }
+  publishLinkedIn(
+    account: SocialAccount,
+    post: { text: string; image?: string; altText?: string },
+  ) {
+    if (!account.memberUrn)
+      throw new Error("Reconecte o LinkedIn para atualizar os dados do perfil.");
+    return this.linkedin.publish(account.memberUrn, this.token(account), post.text, post.image ? { path: post.image, altText: post.altText } : undefined);
   }
   record(post: Omit<SocialPost, "createdAt">) {
     return this.deps.store.put<SocialPost>("post", {

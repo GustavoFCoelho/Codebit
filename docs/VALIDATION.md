@@ -2,6 +2,51 @@
 
 Ambiente: Windows 10 x64, Node 22.18, Electron 44.4.5. Data: 25/09/2026.
 
+## 24/10/2026 — input lag em conversas com 10 mil entradas
+
+- **Reprodução:** a consulta somente leitura ao banco local encontrou conversas de até 10.388 entradas. O teste anterior cobria 900; ampliado para 10.000, mediu 25,8 ms por tecla antes da correção, acima do limite de 10 ms.
+- **Diagnóstico:** o custo dominante era o layout do histórico. Isolar a lista React e aplicar `content-visibility` por entrada não bastou: o navegador ainda verificava milhares de caixas.
+- **Correção:** mensagens agrupadas em blocos de 100, com `content-visibility: auto` por bloco e retenção da altura medida. Todo o histórico continua no DOM. A lista React é memoizada, a busca de artefatos usa um mapa e os dados recebidos são aplicados como transições de menor prioridade que a digitação.
+- **Resultado no E2E:** 2,2 ms por tecla em repouso e 2,5 ms com atualizações disparadas por `task.update`; layout de 0,5 e 0,6 ms, respectivamente. O teste mantém o limite de 10 ms. Essa medição cobre recarga do histórico por eventos, não uma sessão real de streaming do modelo.
+- **Verificações:** chegada ao fim ao abrir a conversa, navegação até entradas antigas e limites entre blocos, preservação da posição durante atualização, nenhum caractere perdido e ocultar/mostrar contexto. Os E2Es de conversa longa, rascunhos e pensamentos passaram (3 testes), assim como o build.
+
+## 24/10/2026 — atualização dos CLIs locais
+
+- Codex CLI (npm): **0.159.3 → 0.164.0**, via `npm install -g @openai/codex@latest`.
+- Claude Code nativo: **2.1.300 → 2.1.310**, via `claude update`.
+- Claude Code WinGet: **2.1.292 → 2.1.302**, via `winget upgrade --id Anthropic.ClaudeCode --exact`.
+- Antigravity CLI: **1.4.7**, já instalado; `agy update` confirmou que é a versão mais recente, e `agy models` respondeu.
+- Devin CLI: **3000.11.216**, autenticado; cópia gerenciada pelo Devin Desktop, preservada. Atualize pelo próprio Desktop.
+- A cópia do Codex **0.163.0-alpha.11.2** em `%LOCALAPPDATA%/OpenAI/Codex/bin` pertence ao aplicativo Codex e foi preservada; sua atualização é feita pelo aplicativo.
+- `npm run build` passou. Smoke direto pelos adaptadores do Codebit passou com Codex 0.164.0 e Claude 2.1.310: descoberta, autenticação, resposta `CODEBIT_OK` e catálogo de modelos. Foi usada uma cópia temporária do smoke restrita a esses dois agentes.
+- O E2E `native.spec.ts` parou antes de testar os CLIs: não encontrou o título inicial `O que vamos construir?` na interface atual. Conversa e retomada pela interface não foram revalidadas nesta atualização.
+- O npm informou que não conseguiu limpar um executável antigo em uso (`EPERM`); a instalação nova foi concluída e validada, sem interromper sessões abertas.
+
+## Antigravity CLI (em desenvolvimento)
+
+- **Validação com o Antigravity CLI 1.4.3 real, em 20/10/2026:**
+  - **Executar:** comandos aprovados e recusados, e ferramenta de um MCP externo aprovada.
+  - **Bypass:** comando que apagaria um arquivo de antes da conversa parou para confirmação.
+  - **Planejar:** comando aprovado e `.md` do plano capturado no painel **Plano**, com o projeto intacto.
+  - MCPs do plugin expostos com nomes `codebit_<nome>`.
+  - Hook aguardando 95 segundos por uma resposta do usuário.
+  - Plugin funcionando numa pasta com espaço no caminho.
+- **Integração:** um processo stream-json por turno, retomada por `--conversation`, plugin temporário com MCPs e diretrizes e hook `PreToolUse` consultando o bridge local. Se o hook não alcança o Codebit, a ferramenta é negada; escrever na pasta do plugin é negado em todos os modos.
+- **Testes automatizados:** a cobertura da integração fica em `tests/antigravity.test.ts`.
+
+## 14/10/2026 — Claude Code 2.1.300 (modo código, sem versão nova)
+
+- **Claude Code atualizado:**
+  - A instalação nativa (`~/.local/bin`, a que o Codebit usa) foi de 2.1.284 para 2.1.300 com `claude update`.
+  - A do WinGet foi de 2.1.268 para 2.1.292, a mais nova disponível na origem do WinGet.
+- **Validação com o Claude Code 2.1.300 real:**
+  - O teste com os CLIs reais (`CODEBIT_NATIVE_TEST=1`, junto com o Codex CLI 0.159.3) passou: descoberta, catálogo, conversa e retomada da sessão.
+  - Uma sessão com o Haiku em Bypass:
+    - apagou sem perguntar uma pasta criada durante a conversa;
+    - pediu uma única confirmação para a pasta que já existia antes, e o Claude não perguntou de novo;
+    - mostrou o alcance com "1 arquivo já existia".
+  - `get_context_usage` respondeu com as cinco partes do medidor de contexto.
+
 ## Depois da 0.2.7 — sub-agentes padrão e interface nova (modo código, sem versão nova)
 
 - **Sub-agentes padrão:** em Configurações → Comportamento, com a opção de aplicar a todas as conversas. **Voltar ao padrão** faz uma conversa ajustada seguir o padrão de novo (a IPC `task.update` aceita `subagents: null`).
@@ -236,3 +281,17 @@ Remove-Item Env:CODEBIT_EXECUTABLE
 ```
 
 Para incluir o teste dos CLIs reais, defina também `CODEBIT_NATIVE_TEST=1`. A validação do pacote usa o aplicativo extraído em `win-unpacked`, que é o mesmo payload incluído no executável portátil.
+# DeepSeek — 24/10/2026
+
+- Novo agente autenticado por API key no cofre existente. Catálogo dinâmico pela API oficial, incluindo contexto e esforço. Nenhuma chave real foi utilizada nesta validação.
+- `npm test`: 277 testes passaram em 21 arquivos, incluindo 16 testes do DeepSeek (catálogo, erros de autenticação, ACP, retomada, aprovação, Bypass, Planejar, cancelamento, MCP e política de ferramentas).
+- `npm run build`: passou. O bundler mantém o aviso de chunks grandes já existente.
+- `tests/e2e/deepseek.spec.ts`: passou no Electron, verificando a presença do novo agente, campo password e habilitação do botão de salvar/consultar.
+- Harness oficial `0.2.1-rc.2` instalado (antes ausente). Runtime Node `22.23.4` isolado instalado com SHA-256 conferido no manifesto oficial; Node geral `22.18.0` preservado.
+- Inicialização ACP em Executar e retomada da mesma sessão em Bypass e Planejar validadas com o Harness real, sem chamar o modelo, usando uma credencial fictícia. O teste do catálogo também cobre troca de chave com uma consulta anterior ainda em andamento. A inferência real e o catálogo da conta do usuário dependem de cadastrar uma chave válida; não foram apresentados como validados.
+
+# Digitação independente da janela — 24/10/2026
+
+A caixa de mensagem agora mantém a atualização imediata do texto em um componente próprio (`DraftInput`). O restante da janela recebe o rascunho por uma transição React. Revisões impedem que uma atualização atrasada sobrescreva caracteres novos; envio e geração de imagem leem o texto atual, e cada edição atualiza o rascunho em memória antes da persistência habitual.
+
+Build e TypeScript passaram. O E2E de rascunhos passou com troca de conversa, anexos, recarga e reinício. No E2E com 10 mil entradas, o processamento síncrono por tecla, incluindo layout forçado, foi de 0,8 ms em média (p95 4,3 ms) parado e 0,6 ms (p95 0,8 ms) durante atualizações. Também passaram digitação por teclado, edição no início do campo, substituição do conteúdo, navegação pelo histórico e filtros. Esses valores medem processamento do evento e layout no teste, não toda a latência física entre teclado e exibição.

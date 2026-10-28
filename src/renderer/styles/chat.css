@@ -89,6 +89,12 @@
   margin-left: auto;
   margin-right: auto;
 }
+/* Skip offscreen history in batches, not one visibility check per row.
+   All messages stay in the DOM for search, selection and anchor navigation.
+   Chromium remembers each batch's measured height after it leaves view. */
+.entry-batch {
+  content-visibility: auto;
+}
 .entry {
   margin-bottom: 22px;
   min-width: 0;
@@ -123,6 +129,15 @@
 .agent-avatar.devin {
   background: var(--devin-bg);
   color: var(--devin);
+  font-weight: 600;
+}
+.agent-avatar.deepseek {
+  background: var(--deepseek-bg);
+  color: var(--deepseek);
+}
+.agent-avatar.antigravity {
+  background: var(--antigravity-bg);
+  color: var(--antigravity);
   font-weight: 600;
 }
 .entry-body {
@@ -232,6 +247,42 @@
   margin-left: 45px;
   margin-bottom: 10px;
   overflow-wrap: anywhere;
+}
+.entry-thought {
+  margin-left: 45px;
+  margin-bottom: 10px;
+}
+.thought-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.thought-head:hover {
+  color: var(--text-2);
+}
+.thought-head strong {
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.thought-preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-style: italic;
+}
+.thought-text {
+  margin: 4px 0 0 6px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border-card);
+  color: var(--text-2);
+  font-size: 12.5px;
 }
 .activity-icon {
   width: 19px;

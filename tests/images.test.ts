@@ -47,7 +47,13 @@ async function setup(key?: string, installation?: Installation) {
   const settings: Settings = {
     cliPaths: {},
     comfyUrl: "http://127.0.0.1:8188",
-    defaultModels: { codex: "", claude: "", devin: "" },
+    defaultModels: {
+      codex: "",
+      claude: "",
+      devin: "",
+      antigravity: "",
+      deepseek: "",
+    },
     mcp: [],
     workflows: [],
   };

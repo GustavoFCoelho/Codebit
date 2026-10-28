@@ -4,6 +4,7 @@ import {
   ExternalLink,
   HeartHandshake,
   RefreshCw,
+  Share2,
   Trash2,
 } from "lucide-react";
 import type {
@@ -77,6 +78,7 @@ export function SocialSettings({
     );
   const instagram = state?.accounts.find((a) => a.network === "instagram");
   const patreon = state?.accounts.find((a) => a.network === "patreon");
+  const linkedin = state?.accounts.find((a) => a.network === "linkedin");
   const soon =
     instagram?.expiresAt &&
     Date.parse(instagram.expiresAt) - Date.now() < 7 * 24 * 3600 * 1000;
@@ -106,6 +108,34 @@ export function SocialSettings({
             </select>
           </div>
         </div>
+      </div>
+      <div className="settings-card">
+        <div className="card-title">
+          <div className="provider-monogram linkedin"><Share2 size={23} /></div>
+          <div><h3>LinkedIn</h3><p>Publicações públicas no seu perfil pessoal, com texto e uma imagem opcional.</p></div>
+          <span className={`badge ${linkedin ? "success" : ""}`}>{linkedin ? "Conectado" : "Não conectado"}</span>
+        </div>
+        {linkedin ? <>
+          <div className="property"><span>Perfil pessoal</span><strong>{linkedin.name}</strong></div>
+          <p className="help">O token fica cifrado neste computador e vinculado a este projeto. Tokens do LinkedIn expiram; se a publicação parar de funcionar, gere outro token e conecte de novo.</p>
+          <div className="row-actions">
+            <button className={`quiet ${confirm === linkedin.id ? "danger" : ""}`} disabled={!!busy} onClick={() => confirm === linkedin.id ? void act("remove", () => api("social.remove", { id: linkedin.id })) : setConfirm(linkedin.id)}>{confirm === linkedin.id ? "Confirmar: desconectar" : "Desconectar"}</button>
+          </div>
+        </> : <>
+          <ol className="steps">
+            <li>No <a href="https://www.linkedin.com/developers/apps" target="_blank" rel="noreferrer">LinkedIn Developer Portal</a>, crie ou selecione um aplicativo.</li>
+            <li>Ative os produtos “Sign In with LinkedIn using OpenID Connect” e “Share on LinkedIn”.</li>
+            <li>Gere um token de usuário com os escopos <code>openid</code>, <code>profile</code> e <code>w_member_social</code>.</li>
+            <li>Cole o token abaixo. O Codebit valida o perfil e guarda o token cifrado neste computador.</li>
+          </ol>
+          <label>Token de acesso<input type="password" autoComplete="off" aria-label="Token do LinkedIn" placeholder="Token gerado no Developer Portal" value={token} onChange={(e) => setToken(e.target.value)} /></label>
+          <p className="help">Esta integração publica apenas no perfil pessoal. Não publica em páginas empresariais. As publicações são públicas e sempre aguardam sua aprovação no Codebit.</p>
+          <div className="row-actions">
+            <button className="primary" disabled={!token.trim() || !!busy} onClick={() => void act("linkedin", async () => { await api("social.linkedin", { projectId, token }); setToken(""); })}>
+              {busy === "linkedin" && <RefreshCw size={14} className="spin" />}Conectar LinkedIn
+            </button>
+          </div>
+        </>}
       </div>
       <div className="settings-card">
         <div className="card-title">
@@ -351,13 +381,14 @@ export function SocialSettings({
           <h3>Publicações</h3>
           <p className="help">
             O que os agentes publicaram por este projeto. Posts do Instagram
-            podem ser apagados daqui; os do Patreon, pelo site.
+            podem ser apagados daqui; LinkedIn e Patreon pelo próprio site.
           </p>
         </div>
         {!state?.posts.length ? (
           <p className="help">
-            Nenhuma publicação ainda. Peça ao agente, por exemplo: “Publique no
-            Instagram a imagem que você gerou, com uma legenda curta”.
+            Nenhuma publicação ainda. Peça ao agente, por exemplo: “Publique
+            esta atualização no meu LinkedIn” ou “Publique no Instagram a imagem
+            que você gerou, com uma legenda curta”.
           </p>
         ) : (
           <div className="social-posts" role="list" aria-label="Publicações">

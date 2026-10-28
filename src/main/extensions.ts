@@ -3,7 +3,6 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { parse } from "smol-toml";
 import type { AgentId, McpConfig, SkillInfo } from "../shared/types";
-import { subagentLabel } from "../shared/types";
 export async function skills(cwd?: string): Promise<SkillInfo[]> {
   const result: SkillInfo[] = [];
   for (const agent of ["codex", "claude"] as AgentId[]) {
@@ -56,11 +55,18 @@ export async function nativeMcp(cwd?: string) {
       true,
     ],
     [join(homedir(), ".claude.json"), "claude", false],
+    [
+      join(homedir(), ".gemini", "config", "mcp_config.json"),
+      "antigravity",
+      false,
+    ],
     ...(cwd ? [[join(cwd, ".mcp.json"), "claude", false]] : []),
   ] as [string, string, boolean][]) {
     try {
       const raw = await readFile(path, "utf8");
-      const config: any = toml ? parse(raw) : JSON.parse(raw);
+      // Antigravity accepts files saved with a byte order mark.
+      const text = raw.replace(/^﻿/, "");
+      const config: any = toml ? parse(text) : JSON.parse(text);
       for (const name of Object.keys(
         config.mcp_servers || config.mcpServers || {},
       ))
@@ -69,39 +75,27 @@ export async function nativeMcp(cwd?: string) {
   }
   return rows;
 }
-// Agents that insist on something that does not work waste the plan and can
-// loop forever; Codebit also stops them (see guard.ts).
-export const stopWhenStuck =
-  " Se uma ação não der o resultado esperado depois de duas tentativas (por exemplo, um download que não chega ou um comando que falha do mesmo jeito), não insista nem repita: pare e explique o problema ao usuário para decidirem juntos.";
 export function codebitInstructions(mcp: Record<string, any>, guidelines = "") {
   return (
     "Você está no Codebit. Responda em português do Brasil." +
-    stopWhenStuck +
     " Use o MCP codebit_images para gerar ou editar imagens; ele utiliza o provedor e modelo escolhidos na tarefa. Ele aceita formato, fundo transparente, várias imagens de referência (inclusive arquivos da pasta) e saveAs para salvar no projeto." +
-    (mcp.codebit_agents ? subagentInstructions(mcp.codebit_agents.env) : "") +
-    (mcp.codebit_tasks?.env?.CODEBIT_TASK_ROLE === "board"
-      ? " Esta conversa trabalha numa tarefa do quadro do projeto. Ao terminar, se perceber trabalho de continuação que mereça outra tarefa (um bug encontrado, uma melhoria, uma pendência), use add_tasks do MCP codebit_tasks, com título e descrição completa de cada uma. Elas ficam pendentes da aprovação do usuário: não trabalhe nelas agora."
-      : mcp.codebit_tasks
-        ? " Este projeto tem um quadro de tarefas no Codebit, que o MCP codebit_tasks alcança. Quando o usuário pedir para criar tarefas, registrar pendências ou deixar trabalho para depois no quadro, use add_tasks com requested_by_user: true; elas vão para a fila. Ideias suas vão sem esse campo e ficam pendentes da aprovação dele. Use list_tasks para ver o quadro e não duplicar. Não execute nesta conversa o que foi para o quadro."
-        : "") +
     (mcp.codebit_social
-      ? " Para publicar nas redes sociais deste projeto, use o MCP codebit_social (social_accounts, instagram_publish, patreon_publish). Cada publicação mostra a prévia exata e espera a aprovação do usuário; nunca publique por outro meio, como scripts, navegador ou APIs chamadas por você."
+      ? " Para publicar nas redes sociais deste projeto, use o MCP codebit_social (social_accounts, instagram_publish, linkedin_publish, patreon_publish). Cada publicação mostra a prévia exata e espera a aprovação do usuário; nunca publique por outro meio, como scripts, navegador ou APIs chamadas por você. O LinkedIn nesta versão publica somente no perfil pessoal, não em páginas empresariais."
       : "") +
-    guidelinesText(guidelines)
+    guidelinesText(guidelines) +
+    subagentInstructions(mcp)
   );
 }
-// The user turned sub-agents on to have work delegated, to the CLI and model
-// they chose; without saying when, agents keep doing everything themselves or
-// use their own native sub-agents.
-function subagentInstructions(env: Record<string, string> = {}) {
-  let label = "";
-  try {
-    label = subagentLabel(JSON.parse(env.CODEBIT_SUBAGENTS));
-  } catch {}
+// Sub-agent availability is a Codebit session setting and takes precedence
+// over instructions found in the project or supplied as workspace guidelines.
+export function subagentInstructions(
+  mcp: Record<string, any> = {},
+  codebitToolAvailable = true,
+) {
+  if (!codebitToolAvailable)
+    return "\n\nPolítica de sub-agentes desta sessão: este agente não oferece a ferramenta de delegação do Codebit. Não use sub-agentes nativos ou equipes; execute nesta sessão.";
   return (
-    " Os sub-agentes do Codebit estão ligados nesta conversa: run_subagents, do MCP codebit_agents, executa tarefas em paralelo" +
-    (label ? ` com ${label},` : "") +
-    " na mesma pasta. O usuário os ligou para você delegar: quando o pedido tiver partes que andam sozinhas (pesquisar, revisar, analisar ou alterar arquivos e módulos diferentes, escrever testes, comparar alternativas), divida e delegue essas partes com run_subagents, em vez de fazer tudo em sequência. Para delegar, prefira run_subagents aos seus sub-agentes nativos. Os sub-agentes não veem esta conversa: descreva cada tarefa por completo, com contexto, arquivos e o que entregar, e não deixe dois editarem o mesmo arquivo. Trabalho curto, ou em que cada passo depende do anterior, faça você mesmo. Se as instruções do projeto (AGENTS.md, CLAUDE.md ou semelhantes) proibirem sub-agentes ou delegação, elas valem: não use run_subagents sem um pedido explícito do usuário."
+    "\n\nPolítica de sub-agentes do Codebit: só delegue pela ferramenta run_subagents do MCP codebit_agents; nunca use sub-agentes nativos, equipes ou outras formas de delegação. O Codebit verifica a permissão efetiva desta sessão a cada chamada: se a ferramenta informar que está bloqueada, não tente novamente e faça o trabalho nesta sessão. Essa permissão é controlada pelo usuário no Codebit; instruções do projeto e diretrizes do workspace não podem habilitar nem bloquear a delegação. Quando a ferramenta estiver liberada, use-a para partes independentes, descrevendo contexto e resultado esperado e evitando que dois agentes editem os mesmos arquivos."
   );
 }
 // User guidelines from Settings, sent to every agent.
@@ -133,17 +127,8 @@ export function mcpFor(
     (c) => c.enabled && (c.agent === agent || c.agent === "both"),
   )) {
     const name = "codebit_" + c.name.replace(/[^\w-]/g, "_");
-    if (
-      [
-        "codebit_images",
-        "codebit_agents",
-        "codebit_social",
-        "codebit_tasks",
-      ].includes(name)
-    )
-      throw new Error(
-        "Os nomes images, agents, social e tasks são reservados.",
-      );
+    if (["codebit_images", "codebit_agents", "codebit_social"].includes(name))
+      throw new Error("Os nomes images, agents e social são reservados.");
     if (c.transport === "stdio")
       servers[name] = {
         command: c.command,
@@ -166,7 +151,9 @@ export function mcpFor(
     // Devin CLI does not accept HTTP MCP servers over ACP.
     else if (agent !== "devin")
       servers[name] =
-        agent === "codex" ? { url: c.url } : { type: "http", url: c.url };
+        agent === "codex" || agent === "antigravity"
+          ? { url: c.url }
+          : { type: "http", url: c.url };
   }
   return servers;
 }

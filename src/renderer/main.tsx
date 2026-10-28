@@ -8,7 +8,7 @@ import "./styles/chat.css";
 import "./styles/panel.css";
 import "./styles/settings.css";
 import "./styles/board.css";
-import "./styles/work.css";
+import "./styles/gaming-bench.css";
 import "./styles/features.css";
 import "./styles/identity.css";
 import "./styles/responsive.css";

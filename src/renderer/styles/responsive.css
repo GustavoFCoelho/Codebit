@@ -36,7 +36,8 @@
   .entry-request,
   .entry-image,
   .entry-error,
-  .entry-warning {
+  .entry-warning,
+  .entry-thought {
     margin-left: 0;
   }
   .mode-toggle button {

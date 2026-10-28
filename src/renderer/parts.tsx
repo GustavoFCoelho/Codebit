@@ -278,6 +278,28 @@ function BlastView({ blast }: { blast: BlastPreview }) {
         <TriangleAlert size={15} aria-hidden />
         <strong>{blast.summary}</strong>
       </div>
+      {!!blast.existing?.files && (
+        <p className="blast-warning">
+          {blast.existing.files === 1
+            ? "1 arquivo já existia"
+            : `${blast.existing.files.toLocaleString("pt-BR")} arquivos já existiam`}{" "}
+          antes desta conversa ({formatBytes(blast.existing.bytes)}).
+        </p>
+      )}
+      {blast.reachesExisting && (
+        <p className="blast-warning">
+          O que só se sabe na hora pode alcançar arquivos que já existiam antes
+          desta conversa.
+        </p>
+      )}
+      {blast.files > (blast.temporary?.files ?? 0) &&
+        !blast.existing?.files &&
+        !blast.reachesExisting && (
+          <p className="help">
+            {blast.temporary?.files ? "Fora temporários e caches, tudo" : "Tudo"}{" "}
+            o que ele apaga foi criado durante esta conversa.
+          </p>
+        )}
       {blast.outside && (
         <p className="blast-warning">Inclui itens fora da pasta da tarefa.</p>
       )}
@@ -290,7 +312,7 @@ function BlastView({ blast }: { blast: BlastPreview }) {
         <p className="help">
           Inclui {blast.temporary.files.toLocaleString("pt-BR")} arquivos
           temporários ou de cache ({formatBytes(blast.temporary.bytes)}), que
-          não contam para os limites.
+          saem sem confirmação.
         </p>
       )}
       {blast.filtered && (

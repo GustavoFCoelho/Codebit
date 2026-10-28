@@ -57,6 +57,7 @@ test("confirmação antes de apagar: o pedido mostra o alcance do comando", asyn
         ],
         more: 9,
         outside: true,
+        existing: { files: 4405, bytes: 100_600_000_000 },
       },
     },
   });
@@ -87,6 +88,9 @@ test("confirmação antes de apagar: o pedido mostra o alcance do comando", asyn
     await expect(scope).toContainText(
       "Apaga 4.405 arquivos e 312 pastas · 93,7 GB",
     );
+    await expect(scope).toContainText(
+      "4.405 arquivos já existiam antes desta conversa (93,7 GB).",
+    );
     await expect(scope).toContainText("Inclui itens fora da pasta da tarefa.");
     await expect(scope).toContainText("work\\oraculo_astral");
     await expect(scope).toContainText("60 GB");
@@ -94,18 +98,22 @@ test("confirmação antes de apagar: o pedido mostra o alcance do comando", asyn
     const card = page.locator(".request-card.pending");
     await expect(card.getByRole("button", { name: "Cancelar" })).toBeVisible();
     await expect(card.getByRole("button", { name: "Permitir" })).toBeVisible();
-    // The limits live in Settings → Comportamento.
+    // The switch lives in Settings → Comportamento, with no limits to set.
     await page
       .getByRole("button", { name: "Configurações", exact: true })
       .click();
     await page
       .getByRole("button", { name: "Comportamento", exact: true })
       .click();
-    await expect(page.getByText("Confirmação antes de apagar")).toBeVisible();
-    await expect(page.getByLabel("A partir de quantos arquivos")).toHaveValue(
-      "50",
-    );
-    await expect(page.getByLabel("A partir de quantos MB")).toHaveValue("1024");
+    await expect(
+      page.getByRole("heading", { name: "Confirmação antes de apagar" }),
+    ).toBeVisible();
+    await expect(
+      page.getByText(
+        "Pedir confirmação antes de apagar arquivos que já existiam",
+      ),
+    ).toBeVisible();
+    await expect(page.getByLabel("A partir de quantos arquivos")).toHaveCount(0);
   } finally {
     await app.close();
   }

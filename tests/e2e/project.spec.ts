@@ -4,11 +4,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Store } from "../../src/main/store";
-import {
-  defaultImages,
-  type Task,
-  type WorkItem,
-} from "../../src/shared/types";
+import { defaultImages, type Task } from "../../src/shared/types";
 test("remover projeto: confirma, apaga do Codebit e mantém a pasta", async () => {
   const root = resolve(".codebit-test", "project-" + randomUUID());
   const store = new Store(join(root, "data"));
@@ -39,17 +35,6 @@ test("remover projeto: confirma, apaga do Codebit e mantém a pasta", async () =
       images: defaultImages,
     });
   }
-  store.put<WorkItem>("work", {
-    id: randomUUID(),
-    projectId: "p-old",
-    title: "Tarefa antiga",
-    description: "",
-    origin: "user",
-    state: "todo",
-    order: 1,
-    createdAt: now,
-    updatedAt: now,
-  });
   store.close();
   const env: Record<string, string> = {
     ...Object.fromEntries(
@@ -91,7 +76,6 @@ test("remover projeto: confirma, apaga do Codebit e mantém a pasta", async () =
       .getByRole("button", { name: "Remover o projeto Projeto antigo" })
       .click();
     await expect(dialog).toContainText("1 conversa");
-    await expect(dialog).toContainText("1 tarefa do quadro");
     await expect(dialog).toContainText(folders["p-old"]);
     await expect(dialog).toContainText("não é alterada");
     await dialog.getByRole("button", { name: "Remover projeto" }).click();
@@ -107,13 +91,11 @@ test("remover projeto: confirma, apaga do Codebit e mantém a pasta", async () =
       return {
         projects: s.projects.map((p: any) => p.name),
         tasks: s.tasks.map((t: any) => t.title),
-        work: s.work.length,
       };
     });
     expect(left).toEqual({
       projects: ["Forja"],
       tasks: ["Conversa de Forja"],
-      work: 0,
     });
     expect(existsSync(join(folders["p-old"], "leia.md"))).toBe(true);
   } finally {

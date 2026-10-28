@@ -1,0 +1,153 @@
+.gaming-bench {
+  flex: 1;
+  overflow: auto;
+}
+.bench-config {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+.bench-config label {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.bench-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+.bench-card {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-bottom: 17px;
+}
+.bench-prompt-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.bench-prompt-fields {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.bench-prompt-fields input,
+.bench-prompt-fields select {
+  padding: 8px 10px;
+  font-size: 12px;
+}
+.bench-prompt-fields textarea {
+  min-height: 92px;
+  padding: 9px 10px;
+  font-size: 12px;
+}
+.bench-prompt-actions {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+}
+.bench-category-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+}
+.bench-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  color: var(--green-text);
+}
+.bench-card-head h3,
+.bench-history h3 {
+  color: var(--text);
+  font-size: 14px;
+  margin-bottom: 6px;
+}
+.bench-card-head p {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.bench-prompts {
+  display: grid;
+  gap: 8px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.bench-prompts span::before {
+  content: "•";
+  color: var(--green);
+  margin-right: 8px;
+}
+.bench-card .primary {
+  align-self: flex-start;
+  margin-top: auto;
+}
+.bench-history-item {
+  display: flex;
+  width: 100%;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 12px;
+}
+.bench-history-item > span:first-child {
+  flex: 1;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bench-history {
+  display: grid;
+  gap: 10px;
+  margin: 18px 0 28px;
+}
+.bench-history > h3 {
+  color: var(--text);
+  font-size: 14px;
+  margin: 0 0 2px;
+}
+.bench-run-card {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.bench-run-head {
+  display: flex;
+  width: 100%;
+  min-height: 46px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 13px;
+  color: var(--text-2);
+  text-align: left;
+}
+.bench-run-title {
+  flex: 1;
+  color: var(--text);
+  font-weight: 600;
+}
+.bench-run-sessions {
+  padding: 0 13px 5px;
+  border-top: 1px solid var(--border);
+}
+@media (max-width: 1050px) {
+  .bench-grid { grid-template-columns: 1fr; }
+  .bench-config { grid-template-columns: 1fr; }
+}
+@media (max-width: 650px) {
+  .bench-prompt-editor { grid-template-columns: 1fr; }
+  .bench-prompt-actions { justify-content: flex-end; }
+}

@@ -32,9 +32,7 @@ export function Board({
 }) {
   const [over, setOver] = useState(false);
   const running = cards.filter((c) => busy.includes(c.task.status)).length;
-  const available = snapshot.tasks.filter(
-    (t) => !t.boardAt && !t.archived && !t.workItemId,
-  );
+  const available = snapshot.tasks.filter((t) => !t.boardAt && !t.archived);
   const add = (id: string) => run(() => api("task.board", { id, on: true }));
   return (
     <div

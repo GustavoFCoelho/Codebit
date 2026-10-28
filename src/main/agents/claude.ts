@@ -7,6 +7,7 @@ import { claudeCommands } from "./catalog";
 import { claudeWindows } from "./quota";
 import { codebitInstructions } from "../extensions";
 import { claudeContext } from "./context";
+import { newer } from "../updater";
 import type {
   AgentEvent,
   AgentSession,
@@ -16,6 +17,8 @@ import type {
   Task,
 } from "../../shared/types";
 const editTools = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
+// The oldest version known to take --thinking-display.
+const thinkingDisplaySince = "2.1.292";
 const permissionModes = {
   plan: "plan",
   execute: "manual",
@@ -26,8 +29,12 @@ export class ClaudeSession implements AgentSession {
   private ready: Promise<any>;
   private requests = new Map<string, any>();
   // Commands held by the blast radius hook, with what they reach.
-  private hooks = new Map<string, string>();
+  private hooks = new Map<string, { command: string; summary: string }>();
+  // Commands the user allowed at that hook: when Claude asks about the same
+  // one right after, it goes without a second question.
+  private allowed = new Set<string>();
   private textSeen = false;
+  private thoughtSeen = false;
   private model = "";
   private used = 0;
   // Messages sent but not yet taken by Claude, which echoes each one it
@@ -62,9 +69,19 @@ export class ClaudeSession implements AgentSession {
       JSON.stringify({ mcpServers: mcp }),
       "--append-system-prompt",
       codebitInstructions(mcp, guidelines),
+      // Keep native delegation out of the session; Codebit's own MCP tool is
+      // exposed only when the user's per-session setting enables it.
+      "--disallowedTools",
+      "Agent",
+      "Task",
     ];
     if (task.mode === "bypass")
       args.push("--allow-dangerously-skip-permissions");
+    // Without it a non-interactive session leaves the thinking text out.
+    // Older versions refuse the flag, so they go without thoughts.
+    const version = i.version.match(/^\d+\.\d+\.\d+/)?.[0];
+    if (version && !newer(thinkingDisplaySince, version))
+      args.push("--thinking-display", "summarized");
     if (task.nativeId) args.push(`--resume=${task.nativeId}`);
     if (task.model) args.push("--model", task.model);
     if (task.effort) args.push("--effort", task.effort);
@@ -76,8 +93,9 @@ export class ClaudeSession implements AgentSession {
       (msg) => this.receive(msg),
       (e) => emit({ type: "error", text: e.message }),
     );
-    // Commands that delete a lot stop for the user, even in Bypass: the hook
-    // runs before Claude's own permissions. A long timeout, since a hook that
+    // Commands that delete files from before the conversation stop for the
+    // user, even in Bypass: the hook runs before Claude's own permissions.
+    // A long timeout, since a hook that
     // times out lets the command through.
     this.ready = this.channel.request("initialize", {
       hooks: inspect
@@ -104,6 +122,7 @@ export class ClaudeSession implements AgentSession {
       if (msg.session_id) this.emit({ type: "native", id: msg.session_id });
       this.model = msg.model || "";
       this.textSeen = false;
+      this.thoughtSeen = false;
       this.emit({ type: "turn" });
     }
     if (msg.type === "user" && msg.isReplay && msg.uuid)
@@ -130,11 +149,27 @@ export class ClaudeSession implements AgentSession {
         this.textSeen = true;
         this.emit({ type: "text", text: e.delta.text });
       }
+      // Claude's thinking, summarized; some blocks come without text.
+      if (
+        e?.type === "content_block_delta" &&
+        e.delta?.type === "thinking_delta" &&
+        e.delta.thinking
+      ) {
+        this.thoughtSeen = true;
+        this.emit({ type: "thought", text: e.delta.thinking });
+      }
     }
     if (msg.type === "assistant")
       for (const block of msg.message?.content || []) {
         if (block.type === "text" && !this.textSeen && !subagent)
           this.emit({ type: "text", text: block.text });
+        if (
+          block.type === "thinking" &&
+          block.thinking &&
+          !this.thoughtSeen &&
+          !subagent
+        )
+          this.emit({ type: "thought", text: block.thinking });
         if (block.type === "tool_use")
           this.emit({
             type: "activity",
@@ -206,6 +241,17 @@ export class ClaudeSession implements AgentSession {
         });
         return;
       }
+      if (this.allowed.delete(r.input?.command)) {
+        this.channel.send({
+          type: "control_response",
+          response: {
+            subtype: "success",
+            request_id: id,
+            response: { behavior: "allow", updatedInput: r.input },
+          },
+        });
+        return;
+      }
       this.requests.set(id, r);
       if (r.tool_name === "AskUserQuestion")
         this.emit({
@@ -265,8 +311,8 @@ export class ClaudeSession implements AgentSession {
       ? this.inspect(command, asking).catch(() => undefined)
       : Promise.resolve(undefined);
   }
-  // A command about to run: on its way unless it deletes a lot, in which
-  // case the user sees what it reaches and decides.
+  // A command about to run: on its way unless it deletes files from before
+  // the conversation, in which case the user sees what it reaches and decides.
   private async guard(id: string, input: any) {
     const command = input?.tool_input?.command;
     const blast = await this.blast(command, false);
@@ -274,7 +320,7 @@ export class ClaudeSession implements AgentSession {
       this.hookAnswer(id, {});
       return;
     }
-    this.hooks.set(id, blast.summary);
+    this.hooks.set(id, { command, summary: blast.summary });
     this.emit({
       type: "request",
       request: {
@@ -297,6 +343,7 @@ export class ClaudeSession implements AgentSession {
   async send(text: string, attachments: string[]) {
     await this.ready;
     this.textSeen = false;
+    this.allowed.clear();
     const uuid = randomUUID();
     this.pending.add(uuid);
     const content: any[] = [{ type: "text", text }];
@@ -338,17 +385,18 @@ export class ClaudeSession implements AgentSession {
     });
   }
   respond(id: string, value: any) {
-    const summary = this.hooks.get(id);
-    if (summary !== undefined) {
+    const held = this.hooks.get(id);
+    if (held) {
       this.hooks.delete(id);
       const allow = value.decision === "accept";
+      if (allow) this.allowed.add(held.command);
       this.hookAnswer(id, {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: allow ? "allow" : "deny",
           permissionDecisionReason: allow
             ? "O usuário viu o alcance no Codebit e permitiu."
-            : `O usuário viu o alcance no Codebit (${summary}) e cancelou. Não tente apagar isso por outro caminho: explique o que pretendia e pergunte como seguir.`,
+            : `O usuário viu o alcance no Codebit (${held.summary}) e cancelou. Não tente apagar isso por outro caminho: explique o que pretendia e pergunte como seguir.`,
         },
       });
       return;

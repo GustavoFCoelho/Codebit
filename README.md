@@ -6,8 +6,8 @@
 
 **Seus agentes de código numa janela só.**
 
-Codex, Claude Code e Devin lado a lado: conversas, tarefas em paralelo, imagens e travas de segurança,<br />
-com os CLIs e os planos que você já tem.
+Codex, Claude Code, Devin, Antigravity e DeepSeek lado a lado: conversas, tarefas em paralelo, imagens e travas de segurança,<br />
+com os CLIs, assinaturas ou chaves de API de cada provedor.
 
 [Instalar](#instalação) · [O que ele faz](#o-que-ele-faz) · [Guia completo](docs/GUIA.md)
 
@@ -15,6 +15,7 @@ com os CLIs e os planos que você já tem.
 ![Codex CLI](https://img.shields.io/badge/Codex%20CLI-compat%C3%ADvel-10a37f)
 ![Claude Code](https://img.shields.io/badge/Claude%20Code-compat%C3%ADvel-d97757)
 ![Devin CLI](https://img.shields.io/badge/Devin%20CLI-compat%C3%ADvel-3b82f6)
+![Antigravity CLI](https://img.shields.io/badge/Antigravity%20CLI-compat%C3%ADvel-a78bfa)
 
 </div>
 
@@ -23,9 +24,9 @@ com os CLIs e os planos que você já tem.
 ## Por que o Codebit
 
 - **Um lugar para todos os agentes.** Comece com o Claude, passe para o Codex no meio da conversa e volte. Cada agente retoma a própria sessão e recebe o que perdeu.
-- **Nada de conta nova.** O Codebit não tem servidor nem telemetria. Ele usa os CLIs instalados na sua máquina, com os logins e as assinaturas que você já paga.
+- **Sem conta do Codebit.** O Codebit não tem servidor nem telemetria. Ele usa os CLIs instalados na sua máquina, com os logins e assinaturas existentes. O DeepSeek usa API key e cobrança por consumo, com catálogo consultado na API oficial.
 - **Trabalho em paralelo de verdade.** Várias conversas ao mesmo tempo, sub-agentes que dividem um trabalho grande, uma fila de mensagens enquanto o agente responde.
-- **Seguro por padrão.** Antes de um comando que apaga muito, você vê o alcance e decide. Um agente que insiste no que não funciona é parado. Chaves de API ficam cifradas.
+- **Seguro por padrão.** Antes de um comando que apaga arquivos importantes, você vê o alcance e decide. Um agente que insiste no que não funciona é parado. Chaves de API ficam cifradas.
 
 ## O que ele faz
 
@@ -49,7 +50,7 @@ Clique em **Contexto**, na barra de status: o Codebit mostra quanto ocupam as in
 
 ### Nada some sem você ver
 
-Pedidos como "limpe a pasta" às vezes viram um comando que apaga bem mais do que devia. Antes de rodar, o Codebit mede o alcance (arquivos, pastas, tamanho e os maiores itens) e espera você permitir ou cancelar. No Claude Code isso vale até no modo Bypass. Exclusões pequenas, temporários e caches passam direto.
+Pedidos como "limpe a pasta" às vezes viram um comando que apaga bem mais do que devia. Quando um comando vai apagar arquivos que já existiam antes da conversa, ou descartar alterações não salvas no Git, o Codebit mostra o alcance (arquivos, pastas, tamanho e os maiores itens) e espera você permitir ou cancelar. No Claude Code e no Antigravity isso vale até no modo Bypass. O que o agente criou durante a conversa, temporários e caches saem sem perguntar.
 
 ![Confirmação de um comando que apagaria 93,7 GB](docs/screenshots/confirmacao.png)
 
@@ -62,7 +63,7 @@ Pedidos como "limpe a pasta" às vezes viram um comando que apaga bem mais do qu
 - **Links para arquivos**: caminhos citados pelo agente abrem com um clique, mesmo encurtados ou de outra pasta.
 - **Skills, comandos e MCP**: digite `/` para os comandos do agente e conecte seus próprios servidores MCP.
 - **Secrets**: chaves de API cifradas, entregues a todas as sessões como variáveis de ambiente.
-- **Quadro de tarefas** por projeto, **voz local**, **redes sociais** (Instagram e Patreon, sempre com a sua aprovação) e atualização pelo próprio app.
+- **Voz local**, **redes sociais** (Instagram, LinkedIn pessoal e Patreon, sempre com a sua aprovação) e atualização pelo próprio app.
 
 ## Instalação
 
@@ -71,11 +72,12 @@ Você precisa de:
 - **Windows 10 ou 11** (x64) e **Node.js 22.18+**.
 - **Pelo menos um agente** com login feito:
 
-| Agente      | Instalação                                          | Login               |
-| ----------- | --------------------------------------------------- | ------------------- |
-| Codex CLI   | `npm install -g @openai/codex`                      | `codex login`       |
-| Claude Code | `npm install -g @anthropic-ai/claude-code`          | `claude auth login` |
-| Devin CLI   | vem com o Devin Desktop, e o Codebit o acha sozinho | `devin auth login`  |
+| Agente          | Instalação                                              | Login                                 |
+| --------------- | ------------------------------------------------------- | ------------------------------------- |
+| Codex CLI       | `npm install -g @openai/codex`                          | `codex login`                         |
+| Claude Code     | `npm install -g @anthropic-ai/claude-code`              | `claude auth login`                   |
+| Devin CLI       | vem com o Devin Desktop, e o Codebit o acha sozinho     | `devin auth login`                    |
+| Antigravity CLI | `irm https://antigravity.google/cli/install.ps1 \| iex` | abra `agy` e entre com a conta Google |
 
 Depois:
 
@@ -117,17 +119,17 @@ npm start
 | Usar uma skill ou comando do CLI                           | Digite `/` no início da mensagem. [Mais](docs/GUIA.md#skills-e-comandos-no-chat)                |
 | Acompanhar várias tarefas ao mesmo tempo                   | **Multitarefa**, na barra lateral. [Mais](docs/GUIA.md#modo-multitarefa)                        |
 | Dividir um trabalho grande entre vários agentes            | Chip **Sub-agentes**, abaixo da mensagem. [Mais](docs/GUIA.md#sub-agentes)                      |
-| Deixar agentes trabalhando numa fila de tarefas            | Linha **Tarefas** do projeto. [Mais](docs/GUIA.md#quadro-de-tarefas)                            |
 | Repetir um pedido que uso sempre                           | **+** de **PROMPTS**, na barra lateral. [Mais](docs/GUIA.md#prompts-salvos)                     |
 | Isolar uma tarefa da pasta original                        | **Criar worktree isolada**, ao criar a tarefa (projetos Git).                                   |
 | Saber do que o contexto da conversa é feito                | **Contexto**, na barra de status. [Mais](docs/GUIA.md#ocultar-contexto-uso-de-contexto-e-cota)  |
+| Ver o que o agente pensa entre as ações                    | Linha **Pensamento** no chat. [Mais](docs/GUIA.md#pensamentos-do-agente)                        |
 | Ajustar a confirmação antes de apagar                      | **Configurações → Comportamento**. [Mais](docs/GUIA.md#confirmação-antes-de-apagar)             |
 | Ver o que mudou, navegar nos arquivos ou abrir um terminal | Painel lateral da tarefa. [Mais](docs/GUIA.md#painel-lateral)                                   |
 | Gerar ou editar imagens                                    | Chip de imagens → **Gerar imagem**, ou peça ao agente. [Mais](docs/GUIA.md#geração-de-imagens)  |
 | Dar instruções permanentes a todos os agentes              | **Configurações → Comportamento → Diretrizes**. [Mais](docs/GUIA.md#diretrizes-para-os-agentes) |
 | Guardar uma chave de API para os agentes                   | **Configurações → Secrets**. [Mais](docs/GUIA.md#secrets)                                       |
 | Adicionar um servidor MCP                                  | **Configurações → MCP → Adicionar conexão**. [Mais](docs/GUIA.md#servidores-mcp)                |
-| Publicar no Instagram ou no Patreon                        | **Configurações → Redes sociais**. [Mais](docs/GUIA.md#redes-sociais)                           |
+| Publicar no Instagram, LinkedIn ou Patreon                 | **Configurações → Redes sociais**. [Mais](docs/GUIA.md#redes-sociais)                           |
 | Dar instruções por voz                                     | Faixa **Voz**, abaixo do título (precisa de preparo). [Mais](docs/GUIA.md#voz-local-com-vosk)   |
 
 **Atalhos:** `Ctrl+N` nova tarefa · `Ctrl+K` buscar · `Ctrl+J` chat rápido · `Ctrl+.` interromper · `/` skills e comandos. Enter envia; Shift+Enter quebra a linha.
@@ -137,16 +139,17 @@ npm start
 ## Dados e privacidade
 
 - Tudo fica no seu computador, em `%APPDATA%\Codebit`: conversas, anexos, imagens e worktrees. Para backup, feche o app e copie a pasta.
-- Secrets, a chave da OpenAI e os tokens do Instagram são cifrados pelo Windows.
-- Sem telemetria. Além dos próprios agentes, o Codebit só acessa a rede quando você usa a API de imagens da OpenAI, o ComfyUI, o Instagram, o Patreon ou o túnel do Cloudflare.
+- Secrets, a chave da OpenAI e os tokens das redes sociais são cifrados pelo Windows.
+- Sem telemetria. Além dos próprios agentes, o Codebit só acessa a rede quando você usa a API de imagens da OpenAI, o ComfyUI, o Instagram, o LinkedIn, o Patreon ou o túnel do Cloudflare.
 
 [Mais sobre dados e segurança](docs/GUIA.md#dados-segurança-e-privacidade).
 
 ## Limitações
 
 - Só Windows, por enquanto.
-- O Devin, como agente principal, ainda não usa as ferramentas internas do Codebit (imagens pelo agente, sub-agentes, quadro de tarefas e redes sociais). Como sub-agente, funciona normalmente.
-- A confirmação antes de apagar vale para qualquer comando do Claude Code. No Codex e no Devin, só para os pedidos de aprovação do modo Executar.
+- Só o Devin, como agente principal, ainda não usa as ferramentas internas do Codebit (imagens pelo agente, sub-agentes e redes sociais). Codex, Claude e Antigravity usam; o Devin funciona normalmente como sub-agente.
+- O Antigravity não envia pensamentos, não lista skills nem comandos e não informa a cota fora do terminal (use `/usage` no `agy`). Imagens anexadas chegam como caminhos de arquivo; mensagens durante a resposta esperam na fila.
+- A confirmação antes de apagar vale para qualquer comando do Claude Code e do Antigravity, inclusive em Bypass. No Codex e no Devin, só para os pedidos de aprovação do modo Executar.
 - Conversas do mesmo projeto trabalham na mesma pasta ao mesmo tempo. O Codebit avisa quando duas alteram o mesmo arquivo; para isolar, use worktrees.
 
 ## Para quem quer contribuir

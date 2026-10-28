@@ -1,11 +1,19 @@
 // Shown in the UI and sent to the CLIs. Bump with package.json; a test checks both.
 export const appVersion = "0.2.7";
-export type AgentId = "codex" | "claude" | "devin";
-export const agentIds: AgentId[] = ["codex", "claude", "devin"];
+export type AgentId = "codex" | "claude" | "devin" | "antigravity" | "deepseek";
+export const agentIds: AgentId[] = [
+  "codex",
+  "claude",
+  "devin",
+  "antigravity",
+  "deepseek",
+];
 export const agentNames: Record<AgentId, string> = {
   codex: "Codex",
   claude: "Claude",
   devin: "Devin",
+  antigravity: "Antigravity",
+  deepseek: "DeepSeek",
 };
 export type ImageProviderId = "codex" | "openai" | "comfyui";
 export const imageProviderNames: Record<ImageProviderId, string> = {
@@ -102,6 +110,10 @@ const agentOwnVariables: Record<AgentId, RegExp> = {
   claude: /^(ANTHROPIC_|CLAUDE_)/,
   codex: /^(CODEX_|OPENAI_BASE_URL$)/,
   devin: /^(DEVIN_|WINDSURF_)/,
+  // GEMINI_API_KEY moves Antigravity CLI off the Google account login.
+  antigravity: /^(AGY_|GEMINI_|GOOGLE_)/,
+  // The API key is intentional; global DSH home/endpoint overrides are not.
+  deepseek: /^(DSH_|DEEPSEEK_BASE_URL$)/,
 };
 export function secretBlockedFor(name: string, agent: AgentId) {
   return agentOwnVariables[agent].test(name);
@@ -125,66 +137,7 @@ export interface Project {
   path: string;
   git: boolean;
   trusted: boolean;
-  // The project's task board: off by default.
-  work?: WorkSettings;
-}
-// Task board mode: when on, agents start on the board's tasks by themselves.
-export interface WorkSettings {
-  enabled: boolean;
-  agent: AgentId;
-  model: string;
-  effort: string;
-  mode: "execute" | "bypass";
-  // Tasks worked on at the same time, in the project folder.
-  max: number;
-}
-export const defaultWork: WorkSettings = {
-  enabled: false,
-  agent: "codex",
-  model: "",
-  effort: "",
-  mode: "bypass",
-  max: 1,
-};
-// A task on a project's board. The user's and the approved ones wait in
-// "todo"; the AI's recommendations stay "pending" until approved.
-export interface WorkItem {
-  id: string;
-  projectId: string;
-  title: string;
-  description: string;
-  origin: "user" | "ai";
-  state: "pending" | "todo" | "started";
-  // The internal session working on it, kept out of the sidebar.
-  taskId?: string;
-  // Position among the tasks waiting to start.
-  order: number;
-  // The board task whose session recommended this one.
-  sourceId?: string;
-  // The project conversation that added it through codebit_tasks.
-  chatId?: string;
-  createdAt: string;
-  updatedAt: string;
-  approvedAt?: string;
-}
-export type WorkStatus =
-  | "pending"
-  | "todo"
-  | "running"
-  | "waiting"
-  | "done"
-  | "failed"
-  | "interrupted";
-// Where a board task stands, from its session.
-export function workStatus(item: WorkItem, task?: Task): WorkStatus {
-  if (item.state !== "started") return item.state;
-  if (!task) return "interrupted";
-  if (task.status === "waiting") return "waiting";
-  if (["running", "queued"].includes(task.status) || task.background)
-    return "running";
-  if (task.status === "failed") return "failed";
-  if (task.status === "interrupted") return "interrupted";
-  return "done";
+  hidden?: boolean;
 }
 export interface ImageOptions {
   provider: ImageProviderId;
@@ -239,8 +192,12 @@ export interface Task {
   // Own sub-agent options; null in an update returns to the default.
   subagents?: SubagentOptions | null;
   parentId?: string;
-  // Internal session of a board task: not listed with the conversations.
-  workItemId?: string;
+  gamingBenchBatch?: {
+    id: string;
+    title: string;
+    category: string;
+    createdAt: string;
+  };
   archived: boolean;
   createdAt: string;
   updatedAt: string;
@@ -278,7 +235,12 @@ export interface BlastPreview {
   more: number;
   // Something it deletes is outside the task folder (scratch aside).
   outside: boolean;
-  // What is in caches and scratch folders: routine, not held to the limits.
+  // Files that were there before the conversation began, temporary and cache
+  // folders aside: deleting them is what makes a command stop.
+  existing?: { files: number; bytes: number };
+  // What is only known at run time may reach such files.
+  reachesExisting?: boolean;
+  // What is in caches and scratch folders: routine, it never asks.
   temporary?: { files: number; bytes: number };
   // The count stopped early (a very large folder).
   partial?: boolean;
@@ -298,11 +260,10 @@ export type InspectCommand = (
   asking: boolean,
   cwd?: string,
 ) => Promise<BlastPreview | undefined>;
+// Stops commands that delete files from before the conversation or throw
+// away uncommitted Git changes.
 export interface DeleteGuardSettings {
   enabled: boolean;
-  // Asks from this many files, or this size; always outside the task folder.
-  files: number;
-  megabytes: number;
 }
 // "61,2 GB", "340 KB".
 export const formatBytes = (n: number) =>
@@ -313,16 +274,12 @@ export const formatBytes = (n: number) =>
       : n >= 1024
         ? `${Math.round(n / 1024)} KB`
         : `${n} bytes`;
-// Asset projects (Blender files of a gigabyte and more) set the size limit.
-export const defaultDeleteGuard: DeleteGuardSettings = {
-  enabled: true,
-  files: 50,
-  megabytes: 1024,
-};
-export type SocialNetwork = "instagram" | "patreon";
+export const defaultDeleteGuard: DeleteGuardSettings = { enabled: true };
+export type SocialNetwork = "instagram" | "patreon" | "linkedin";
 export const socialNetworkNames: Record<SocialNetwork, string> = {
   instagram: "Instagram",
   patreon: "Patreon",
+  linkedin: "LinkedIn",
 };
 // A social account connected to one project. Tokens live apart, encrypted.
 export interface SocialAccount {
@@ -334,6 +291,8 @@ export interface SocialAccount {
   // Instagram: the professional account's id and type.
   userId?: string;
   accountType?: string;
+  // LinkedIn member URN (urn:li:person:...).
+  memberUrn?: string;
   // Instagram tokens last 60 days; Codebit renews them before that.
   expiresAt?: string;
   refreshedAt?: string;
@@ -376,7 +335,8 @@ export interface Entry {
     | "warning"
     | "error"
     | "image"
-    | "request";
+    | "request"
+    | "thought";
   text: string;
   createdAt: string;
   request?: RequestPrompt;
@@ -469,7 +429,7 @@ export interface Settings {
   defaultModels: Record<AgentId, string>;
   mcp: McpConfig[];
   workflows: Workflow[];
-  // Standing instructions sent to every agent (Codex, Claude and Devin).
+  // Standing instructions sent to every agent.
   guidelines?: string;
   // Windows notifications when a task ends, fails or needs the user.
   notifications?: boolean;
@@ -485,9 +445,16 @@ export interface Settings {
   // Folder with new builds; the running portable's folder when unset.
   updateFolder?: string;
   hasOpenAIKey?: boolean;
+  gamingBenchPrompts?: GamingBenchPrompt[];
+}
+export interface GamingBenchPrompt {
+  id: string;
+  category: "frontier" | "mid" | "economic";
+  name: string;
+  prompt: string;
 }
 export const defaultGuidelines =
-  "Ferramentas desatualizadas: se uma ferramenta ou CLI necessária estiver desatualizada (Codex, Claude Code, Devin ou dependências que eles usam), você tem permissão para atualizá-la diretamente, sem pedir confirmação, e deve atualizar também as informações internas que dependem da versão (configurações, documentação e registros do projeto). Ao terminar, informe a versão anterior e a nova. Se a instalação for gerenciada por outro aplicativo, como o Devin Desktop, explique como atualizar em vez de forçar.";
+  "Ferramentas desatualizadas: se uma ferramenta ou CLI necessária estiver desatualizada (Codex, Claude Code, Devin, Antigravity ou dependências que eles usam), você tem permissão para atualizá-la diretamente, sem pedir confirmação, e deve atualizar também as informações internas que dependem da versão (configurações, documentação e registros do projeto). Ao terminar, informe a versão anterior e a nova. Se a instalação for gerenciada por outro aplicativo, como o Devin Desktop, explique como atualizar em vez de forçar.";
 export interface ImageModel extends Model {
   provider: ImageProviderId;
   available: boolean;
@@ -532,7 +499,6 @@ export interface Snapshot {
   projects: Project[];
   tasks: Task[];
   prompts: SavedPrompt[];
-  work: WorkItem[];
   update?: UpdateState;
   source?: SourceState;
   settings: Settings;
@@ -541,6 +507,8 @@ export interface Snapshot {
 }
 export type AgentEvent =
   | { type: "text"; text: string }
+  // What the agent thinks between actions, as its CLI summarizes it.
+  | { type: "thought"; text: string }
   // Files lists what an edit tool changed, to spot conflicting chats; key
   // identifies the action with its full input, to spot an agent repeating it.
   // id: the tool call, so its outcome marks the same row.

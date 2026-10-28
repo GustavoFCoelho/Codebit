@@ -147,6 +147,14 @@ input.narrow {
   background: var(--devin-bg);
   color: var(--devin);
 }
+.provider-monogram.deepseek {
+  background: var(--deepseek-bg);
+  color: var(--deepseek);
+}
+.provider-monogram.antigravity {
+  background: var(--antigravity-bg);
+  color: var(--antigravity);
+}
 .provider-identity {
   flex: 1;
   min-width: 0;

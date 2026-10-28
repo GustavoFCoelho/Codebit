@@ -5,8 +5,8 @@ import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { blastRadius, commands, risky } from "../src/main/blast";
 import { capture } from "../src/main/process";
-import { defaultDeleteGuard } from "../src/shared/types";
 const roots: string[] = [];
+const pause = () => new Promise((r) => setTimeout(r, 30));
 afterEach(async () => {
   for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true, maxRetries: 5 });
@@ -73,19 +73,53 @@ describe("alcance de comandos que apagam", () => {
     const { cwd } = await folder();
     const glob = (await blastRadius("del /q work\\parte_1*.txt", cwd))!;
     expect(glob.files).toBe(11);
-    const find = (await blastRadius("find work -name '*.tmp' -delete", cwd))!;
-    expect(find).toMatchObject({ filtered: true, files: 25 });
-    expect(find.summary).toMatch(/^Pode apagar até 25 arquivos/);
+    // find counts only what its -name picks; a folder it picks goes whole.
+    const find = (await blastRadius(
+      "find work -name 'parte_1*' -delete",
+      cwd,
+    ))!;
+    expect(find).toMatchObject({ filtered: true, files: 11 });
+    expect(find.summary).toMatch(/^Pode apagar até 11 arquivos/);
+    const exec = (await blastRadius(
+      "find . -type d -name v001 -exec rm -rf {} +",
+      cwd,
+    ))!;
+    expect(exec).toMatchObject({ files: 1, dirs: 1, bytes: 51200 });
     const outside = (await blastRadius("rm ../vizinho.txt", cwd))!;
     expect(outside.outside).toBe(true);
     const unknown = (await blastRadius("rm -rf $CODEBIT_SEM_VALOR/x", cwd))!;
     expect(unknown.unknown).toContain("$CODEBIT_SEM_VALOR");
-    // Limits: small inside the folder passes; the rest asks.
-    const small = (await blastRadius("rm manter.txt", cwd))!;
-    expect(risky(small, defaultDeleteGuard)).toBe(false);
-    expect(risky(glob, { ...defaultDeleteGuard, files: 5 })).toBe(true);
-    expect(risky(outside, defaultDeleteGuard)).toBe(true);
-    expect(risky(unknown, defaultDeleteGuard)).toBe(true);
+    // rd and rmdir without /s or -r only remove empty folders.
+    for (const command of ["rmdir work", "rd work", "rmdir -p work/v001"])
+      expect(await blastRadius(command, cwd), command).toBeUndefined();
+    expect((await blastRadius("rmdir /s /q work", cwd))!.files).toBe(25);
+  });
+  it("só pergunta pelo que já existia antes da conversa", async () => {
+    const { cwd } = await folder();
+    await pause();
+    const since = Date.now();
+    await pause();
+    // What the agent made during the conversation, however big.
+    await mkdir(join(cwd, "renders"));
+    for (let i = 0; i < 60; i++)
+      await writeFile(join(cwd, "renders", `${i}.png`), "x".repeat(1024));
+    const fresh = (await blastRadius("rm -rf renders", cwd, since))!;
+    expect(fresh).toMatchObject({ files: 60, outside: false });
+    expect(fresh.existing).toBeUndefined();
+    expect(risky(fresh)).toBe(false);
+    // One old file among them is enough.
+    const mixed = (await blastRadius("rm -rf renders manter.txt", cwd, since))!;
+    expect(mixed.existing).toEqual({ files: 1, bytes: 4 });
+    expect(risky(mixed)).toBe(true);
+    const old = (await blastRadius("rm -rf work", cwd, since))!;
+    expect(old.existing).toEqual({ files: 25, bytes: 24 * 1024 + 51200 });
+    // Outside the folder the rule is the same.
+    const outside = (await blastRadius("rm ../vizinho.txt", cwd, since))!;
+    expect(outside).toMatchObject({ outside: true, existing: { files: 1 } });
+    await writeFile(join(cwd, "..", "rascunho.txt"), "novo");
+    const made = (await blastRadius("rm ../rascunho.txt", cwd, since))!;
+    expect(made.outside).toBe(true);
+    expect(risky(made)).toBe(false);
   });
   it("Git: o que clean removeria e as alterações que reset descarta", async () => {
     const { cwd } = await folder();
@@ -107,7 +141,8 @@ describe("alcance de comandos que apagam", () => {
     expect(reset.summary).toBe(
       "Descarta alterações não salvas no Git em 1 arquivo",
     );
-    expect(risky(reset, defaultDeleteGuard)).toBe(true);
+    // Uncommitted changes always ask, whoever made them.
+    expect(risky(reset)).toBe(true);
     // A dry run tells what clean -fd would remove: the untracked work folder.
     const clean = (await blastRadius("git clean -fd", cwd))!;
     expect(clean.files).toBe(25);
@@ -137,6 +172,8 @@ describe("alcance de comandos que apagam", () => {
       return cwd;
     }
     it("variáveis e cd do próprio comando, e o corpo de um heredoc", async () => {
+      const since = Date.now();
+      await pause();
       const cwd = await project();
       const command = [
         `cd "${cwd}" && python - <<'PYEOF'`,
@@ -146,11 +183,19 @@ describe("alcance de comandos que apagam", () => {
         "PYEOF",
         'BS=vendor/BodySlide && rm -rf "$BS/ShapeData/Peca" "$BS/Log_OS.txt" && (cd "$BS" && ls) && rm -rf build',
       ].join("\n");
-      const blast = (await blastRadius(command, cwd))!;
+      const blast = (await blastRadius(command, cwd, since))!;
       expect(blast.unknown).toBeUndefined();
       // Peca (folder + file), the log and build (folder + file).
       expect(blast).toMatchObject({ files: 3, dirs: 2, outside: false });
-      expect(risky(blast, defaultDeleteGuard)).toBe(false);
+      expect(risky(blast)).toBe(false);
+      // $(pwd) is the folder the command is in at that point.
+      const pwd = (await blastRadius(
+        'cd vendor && OUT="$(pwd -W)/BodySlide"; rm -rf "$OUT"',
+        cwd,
+        since,
+      ))!;
+      expect(pwd.unknown).toBeUndefined();
+      expect(pwd).toMatchObject({ files: 2, dirs: 3 });
       // Only the heredoc deletes nothing.
       expect(
         await blastRadius("python - <<'EOF'\ndel data['x']\nEOF", cwd),
@@ -172,24 +217,58 @@ describe("alcance de comandos que apagam", () => {
       const scratch = (await blastRadius("rm -rf tmp/tasks/velha", cwd))!;
       expect(scratch).toMatchObject({ files: 80, outside: false });
       expect(scratch.temporary?.files).toBe(80);
-      expect(risky(scratch, { ...defaultDeleteGuard, files: 5 })).toBe(false);
+      // Even from before the conversation.
+      expect(risky(scratch)).toBe(false);
       const probe = join(tmpdir(), "codebit-sonda-" + randomUUID());
       await mkdir(probe);
       roots.push(probe);
       const temp = (await blastRadius(`rm -rf "${probe}"`, cwd))!;
       expect(temp.outside).toBe(false);
-      expect(risky(temp, defaultDeleteGuard)).toBe(false);
+      expect(risky(temp)).toBe(false);
+      // Git Bash: $(cygpath -u "…") is the path inside.
+      const converted = (await blastRadius(
+        `rm -rf "$(cygpath -u "${tmpdir()}")"/codebit-sonda-*`,
+        cwd,
+      ))!;
+      expect(converted.unknown).toBeUndefined();
+      expect(risky(converted)).toBe(false);
     });
-    it("o que só se sabe na hora ainda pergunta", async () => {
+    it("o que só se sabe na hora pergunta se pode alcançar arquivos antigos", async () => {
       const cwd = await project();
+      await pause();
+      const since = Date.now();
+      await pause();
+      await mkdir(join(cwd, "source", "v012", "build_teste"), {
+        recursive: true,
+      });
+      await writeFile(join(cwd, "source", "v012", "build_teste", "a.nif"), "x");
+      // The unknown part stays inside a folder made during the conversation.
+      const loop = (folder: string) =>
+        `B=${folder}; for p in a:1 b:2; do IFS=: read dir n <<< "$p"; rm -rf $B/$dir; done`;
+      const inside = (await blastRadius(loop("source/v012"), cwd, since))!;
+      expect(inside.unknown).toContain("$dir");
+      expect(inside.reachesExisting).toBeUndefined();
+      expect(risky(inside)).toBe(false);
+      const older = (await blastRadius(loop("vendor"), cwd, since))!;
+      expect(older.reachesExisting).toBe(true);
+      expect(risky(older)).toBe(true);
+      // Before a pipe, find bounds what xargs deletes, with its -name.
+      const pipe = "find . -name '*.bak' | xargs rm -f";
+      expect(risky((await blastRadius(pipe, cwd, since))!)).toBe(false);
+      await writeFile(join(cwd, "vendor", "antigo.bak"), "x");
+      expect(risky((await blastRadius(pipe, cwd, Date.now() + 1))!)).toBe(
+        true,
+      );
+      // With no bound, or a bound full of old files, it asks.
       for (const command of [
         'for x in build/*; do rm -rf "$x"; done',
-        "find . -name '*.bak' | xargs rm -f",
-        'OUT="$(pwd)/build"; rm -rf "$OUT"',
+        'OUT="$(cat alvo.txt)"; rm -rf "$OUT"',
+        "cat lista.txt | xargs rm -f",
+        "Get-ChildItem vendor -Recurse | Remove-Item -Force",
       ]) {
-        const blast = (await blastRadius(command, cwd))!;
+        const blast = (await blastRadius(command, cwd, since))!;
         expect(blast.unknown, command).toBeTruthy();
-        expect(risky(blast, defaultDeleteGuard), command).toBe(true);
+        expect(risky(blast), command).toBe(true);
       }
       // Shell keywords in front do not hide a command.
       const guarded = (await blastRadius(

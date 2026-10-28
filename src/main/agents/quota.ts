@@ -173,6 +173,12 @@ async function devinQuota(installation: Installation, cwd: string) {
     note: "O Devin CLI não informa o saldo da conta. Use /usage no chat para ver o consumo da sessão.",
   };
 }
+async function antigravityQuota() {
+  return {
+    windows: [],
+    note: "O Antigravity CLI não informa a cota fora do terminal. Use /usage no agy para ver o consumo.",
+  };
+}
 export async function probeQuota(
   installation: Installation,
   cwd: string,
@@ -181,6 +187,11 @@ export async function probeQuota(
     codex: codexQuota,
     claude: claudeQuota,
     devin: devinQuota,
+    antigravity: antigravityQuota,
+    deepseek: async () => ({
+      windows: [],
+      note: "API DeepSeek: cobrança por consumo, descontada do saldo da plataforma. Consulte platform.deepseek.com para saldo e gastos.",
+    }),
   }[installation.agent](installation, cwd);
   return { ...quota, checkedAt: new Date().toISOString() };
 }

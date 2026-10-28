@@ -62,10 +62,15 @@ export class CodexSession implements AgentSession {
         bypass: "danger-full-access",
       }[this.task.mode],
       config: Object.fromEntries(
-        Object.entries(mcp).map(([name, value]) => [
-          "mcp_servers." + name,
-          value,
-        ]),
+        [
+          ...Object.entries(mcp).map(([name, value]) => [
+            "mcp_servers." + name,
+            value,
+          ]),
+          // Delegation is provided only by Codebit's gated MCP tool.
+          ["agents.enabled", false],
+          ["features.multi_agent", false],
+        ],
       ),
       developerInstructions: codebitInstructions(mcp, this.guidelines),
     };
@@ -190,6 +195,11 @@ export class CodexSession implements AgentSession {
       this.textSeen = true;
       this.emit({ type: "text", text: p.delta });
     }
+    // The reasoning summary Codex writes when asked, one part per step.
+    if (msg.method === "item/reasoning/summaryTextDelta")
+      this.emit({ type: "thought", text: p.delta });
+    if (msg.method === "item/reasoning/summaryPartAdded" && p.summaryIndex > 0)
+      this.emit({ type: "thought", text: "\n\n" });
     if (msg.method === "item/started") {
       const i = p.item;
       // A turn can hold several agent messages; keep them apart in the chat.
@@ -314,6 +324,8 @@ export class CodexSession implements AgentSession {
       input: this.input(text, attachments),
       model: this.task.model || null,
       ...(this.task.effort ? { effort: this.task.effort } : {}),
+      // Without it Codex writes no summary of its reasoning to show.
+      summary: "detailed",
     });
     const r = await this.starting;
     this.turnId ||= r?.turn?.id || "";

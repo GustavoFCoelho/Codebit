@@ -6,7 +6,6 @@ import type {
   Entry,
   Project,
   SavedPrompt,
-  WorkItem,
   Settings,
   Task,
   UserSecret,
@@ -74,7 +73,13 @@ export class Store {
     const defaults: Settings = {
       cliPaths: {},
       comfyUrl: "http://127.0.0.1:8188",
-      defaultModels: { codex: "", claude: "", devin: "" },
+      defaultModels: {
+        codex: "",
+        claude: "",
+        devin: "",
+        antigravity: "",
+        deepseek: "deepseek-flash",
+      },
       mcp: [],
       workflows: [],
       guidelines: defaultGuidelines,
@@ -114,7 +119,6 @@ export class Store {
       prompts: this.all<SavedPrompt>("prompt").sort((a, b) =>
         a.name.localeCompare(b.name, "pt-BR"),
       ),
-      work: this.all<WorkItem>("work").sort((a, b) => a.order - b.order),
       secrets: this.all<UserSecret>("user-secret").sort((a, b) =>
         a.name.localeCompare(b.name),
       ),

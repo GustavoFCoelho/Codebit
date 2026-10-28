@@ -449,6 +449,10 @@ a.attachment:hover {
   background: var(--red-bg);
   color: var(--red);
 }
+.provider-monogram.linkedin {
+  background: #dcecf8;
+  color: #0a66c2;
+}
 .steps {
   margin: 0 0 14px;
   padding-left: 20px;

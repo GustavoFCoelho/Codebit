@@ -239,6 +239,30 @@ describe("protocolo dos agentes", () => {
     expect(text).not.toContain("REPLAY");
     expect(JSON.parse(text).mode).toBe("accept-edits");
   });
+  it("Claude pede o texto dos pensamentos só às versões que aceitam", async () => {
+    for (const [version, display] of [
+      ["2.1.300", "summarized"],
+      ["2.1.292", "summarized"],
+      ["2.1.284", null],
+      ["test", null],
+    ] as const) {
+      let text = "";
+      let done = false;
+      const session = new ClaudeSession(
+        { ...installation("claude"), version },
+        task(await temp(), "claude"),
+        {},
+        (e) => {
+          if (e.type === "text") text += e.text;
+          if (e.type === "done") done = true;
+        },
+      );
+      cleanups.push(() => session.close());
+      await session.send("OPTIONS", []);
+      await eventually(() => done);
+      expect(JSON.parse(text).thinkingDisplay ?? null, version).toBe(display);
+    }
+  });
   it("Claude encaminha perguntas e aceita uma resposta", async () => {
     const events: AgentEvent[] = [];
     const session = new ClaudeSession(
@@ -1029,42 +1053,55 @@ describe("confirmação antes de apagar", () => {
       .entries(id)
       .filter((e) => e.kind === "request" && !e.resolved)
       .at(-1)!;
-  it("Claude: apagar muito para e mostra o alcance, mesmo em Bypass", async () => {
+  it("Claude: apagar o que já existia antes da conversa para, mesmo em Bypass", async () => {
     const rt = await runtime(["claude"]);
-    const t = await rt.createTask({ title: "Limpeza", agent: "claude" });
+    const p = await rt.project(await temp());
+    rt.store.put("project", { ...p, trusted: true });
+    await files(join(p.path, "antiga"), 3);
+    await new Promise((r) => setTimeout(r, 30));
+    const t = await rt.createTask({
+      title: "Limpeza",
+      agent: "claude",
+      projectId: p.id,
+    });
     expect(t.mode).toBe("bypass");
-    await files(join(t.cwd, "grande"), 60);
-    await files(join(t.cwd, "pequena"), 1);
-    // Small and inside the folder: it goes on its own.
-    await rt.send(t.id, "DELETE:rm -rf pequena");
+    // What the agent made during the conversation goes on its own, however big.
+    await new Promise((r) => setTimeout(r, 30));
+    await files(join(t.cwd, "renders"), 60);
+    await rt.send(t.id, "DELETE:rm -rf renders");
     await idle(rt, t.id);
     expect(lastReply(rt, t.id).text).toBe("liberado");
-    // Big: the user sees what it reaches and decides.
-    await rt.send(t.id, "DELETE:rm -rf grande");
+    // Files from before: the user sees what it reaches and decides.
+    await rt.send(t.id, "DELETE:rm -rf antiga renders");
     await eventually(() => rt.task(t.id).status === "waiting");
     const asked = pending(rt, t.id);
     expect(asked.request!.blast).toMatchObject({
-      files: 60,
-      dirs: 1,
+      files: 63,
+      dirs: 2,
       outside: false,
+      existing: { files: 3, bytes: 3 },
     });
     rt.respond(t.id, asked.id, { decision: "decline" });
     await idle(rt, t.id);
     expect(lastReply(rt, t.id).text).toMatch(
-      /^bloqueado: O usuário viu o alcance no Codebit \(Apaga 60 arquivos/,
+      /^bloqueado: O usuário viu o alcance no Codebit \(Apaga 63 arquivos/,
     );
-    // Allowed: it runs, with no second approval from Claude.
-    await rt.send(t.id, "DELETE:rm -rf grande");
+    // Allowed: it runs, and when Claude asks about it again the answer is
+    // already given.
+    await rt.send(t.id, "DELETEASK:rm -rf antiga");
     await eventually(() => rt.task(t.id).status === "waiting");
     rt.respond(t.id, pending(rt, t.id).id, { decision: "accept" });
     await idle(rt, t.id);
-    expect(lastReply(rt, t.id).text).toBe("permitido");
+    expect(lastReply(rt, t.id).text).toBe("de novo: allow");
+    expect(
+      rt.store.entries(t.id).filter((e) => e.kind === "request"),
+    ).toHaveLength(2);
     // Turned off, nothing stops.
     rt.store.saveSettings({
       ...rt.store.settings(),
       deleteGuard: { ...defaultDeleteGuard, enabled: false },
     });
-    await rt.send(t.id, "DELETE:rm -rf grande");
+    await rt.send(t.id, "DELETE:rm -rf antiga");
     await idle(rt, t.id);
     expect(lastReply(rt, t.id).text).toBe("liberado");
   });
@@ -1845,5 +1882,31 @@ describe("workflows de imagens", () => {
     const bound = bindWorkflow(preset, { image: "input.png" });
     expect(bound["10"].inputs.image).toBe("input.png");
     expect(bound["3"].inputs.latent_image).toEqual(["11", 0]);
+  });
+});
+describe("pensamentos", () => {
+  it("cada agente mostra o que pensa antes da resposta, numa entrada à parte", async () => {
+    const rt = await runtime(["codex", "claude", "devin"]);
+    for (const agent of ["codex", "claude", "devin"] as AgentId[]) {
+      const t = await rt.createTask({ title: agent, agent });
+      await rt.send(t.id, "THINK oi");
+      await idle(rt, t.id);
+      const entries = rt.store.entries(t.id);
+      // One entry for the thought, even with empty blocks and several parts.
+      const thoughts = entries.filter((e) => e.kind === "thought");
+      expect(thoughts, agent).toHaveLength(1);
+      expect(thoughts[0].text.replace(/\*/g, ""), agent).toMatch(
+        /^Lendo o pedido\.?\n\nVou responder\.$/,
+      );
+      expect(thoughts[0].agent).toBe(agent);
+      // It comes before the reply, which stays apart from it.
+      const kinds = entries.map((e) => e.kind);
+      expect(kinds.indexOf("thought")).toBeLessThan(
+        kinds.lastIndexOf("assistant"),
+      );
+      expect(lastReply(rt, t.id).text).not.toContain("Vou responder");
+      // Thoughts stay out of what goes to another agent.
+      expect(rt.handoffSummary(t.id)).not.toContain("Vou responder");
+    }
   });
 });

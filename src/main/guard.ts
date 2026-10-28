@@ -1,9 +1,9 @@
 import type { LoopGuardSettings } from "../shared/types";
 // Looking around is not an attempt: reading files or polling the output of
-// a background command can repeat as much as needed. Claude tool names, then
-// Devin's ACP tool kinds.
+// a background command can repeat as much as needed. Claude tool names,
+// Devin's ACP tool kinds, then Antigravity's tool steps.
 const lookingAround =
-  /^(?:Sub-agente · )?(?:Read|Grep|Glob|LS|NotebookRead|TodoWrite|BashOutput|TaskOutput|Monitor|ListMcpResourcesTool|ReadMcpResourceTool|read|search|think)[ ·:]/;
+  /^(?:Sub-agente · )?(?:Read|Grep|Glob|LS|NotebookRead|TodoWrite|BashOutput|TaskOutput|Monitor|ListMcpResourcesTool|ReadMcpResourceTool|read|search|think|read_file|view_file|list_dir|grep_search|find_by_name|command_status|read_url_content|search_web|wait)(?:[ ·:]|$)/;
 // Stops an agent that keeps trying something that is not working: the same
 // action again and again with no file edited in between (a download that
 // never arrives, a command that fails the same way), or failures in a row.

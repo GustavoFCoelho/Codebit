@@ -7,16 +7,17 @@ Referência completa dos recursos. Para instalar e dar os primeiros passos, come
   - [Modelos e esforço](#modelos-e-esforço)
   - [Trocar de agente](#trocar-de-agente)
   - [Devin CLI](#devin-cli)
+  - [Antigravity CLI](#antigravity-cli)
   - [Modos de permissão](#modos-de-permissão)
   - [Plano no modo Planejar](#plano-no-modo-planejar)
   - [Fila de mensagens](#fila-de-mensagens)
   - [Comandos e sub-agentes em segundo plano](#comandos-e-sub-agentes-em-segundo-plano)
   - [Conflitos entre conversas](#conflitos-entre-conversas)
+  - [Pensamentos do agente](#pensamentos-do-agente)
   - [Ocultar contexto, uso de contexto e cota](#ocultar-contexto-uso-de-contexto-e-cota)
 - [Trabalho em paralelo](#trabalho-em-paralelo)
   - [Sub-agentes](#sub-agentes)
   - [Modo Multitarefa](#modo-multitarefa)
-  - [Quadro de tarefas](#quadro-de-tarefas)
   - [Prompts salvos](#prompts-salvos)
   - [Chat rápido](#chat-rápido)
 - [Arquivos, imagens e links](#arquivos-imagens-e-links)
@@ -63,6 +64,7 @@ Escolha um modelo explícito para habilitar os esforços que ele anuncia:
 
 - No Codex, **Padrão · Médio**, por exemplo, aplica o padrão anunciado pelo modelo.
 - No Claude, **Padrão do CLI** usa a configuração nativa.
+- No Devin e no Antigravity, o esforço já faz parte da variante do modelo; o seletor de esforço fica vazio.
 - **Padrão do CLI**, no seletor de modelo, mantém a escolha nativa de modelo e esforço.
 
 Modelos manuais, ou sem capacidades anunciadas, continuam disponíveis, com esforço controlado pelo CLI. Um esforço incompatível é limpo ao trocar de modelo. Mudanças de modelo e esforço valem a partir da próxima mensagem e preservam a sessão da tarefa. O modelo padrão de cada agente fica em **Configurações → Agentes**.
@@ -81,19 +83,45 @@ O Codebit usa o Devin CLI pelo protocolo ACP (`devin acp`). Ele encontra também
 
 O catálogo vem de `devin models list` e inclui, por exemplo, SWE-2 High/Medium/Max. No Devin, cada variante já define o nível de raciocínio, então o seletor de esforço fica desativado.
 
-Limitação do Devin CLI 3000.10: ele inicia os servidores MCP enviados pelo Codebit, mas as ferramentas MCP dele só enxergam os servidores configurados no próprio Devin. Por isso, como agente principal, o Devin ainda não usa as ferramentas internas do Codebit (imagens, sub-agentes, quadro de tarefas, redes sociais). O **Gerar imagem** do chip de imagens continua funcionando, e como sub-agente o Devin funciona normalmente.
+Limitação do Devin CLI 3000.10: ele inicia os servidores MCP enviados pelo Codebit, mas as ferramentas MCP dele só enxergam os servidores configurados no próprio Devin. Por isso, como agente principal, o Devin ainda não usa as ferramentas internas do Codebit (imagens, sub-agentes, redes sociais). O **Gerar imagem** do chip de imagens continua funcionando, e como sub-agente o Devin funciona normalmente.
+
+### Antigravity CLI
+
+O Codebit encontra o Antigravity CLI (`agy`, do Google) em `%LOCALAPPDATA%\agy\bin\agy.exe` ou no PATH. Para instalar, execute o instalador oficial no PowerShell:
+
+```powershell
+irm https://antigravity.google/cli/install.ps1 | iex
+```
+
+Para fazer login, abra `agy` no terminal e entre com a sua conta Google. O Codebit confere o acesso com `agy models`. O catálogo vem desse mesmo comando, em linhas `id<TAB>nome`; cada variante já traz o esforço no nome, como Gemini 4 Argon (High) ou Claude Opus 5.5 (Low). Como no Devin, não há esforço separado para escolher.
+
+Cada turno roda num processo headless com `--input-format stream-json --output-format stream-json`, retomando a conversa com `--conversation <id>`. **Interromper** encerra o processo, porque o `agy` não tem comando de cancelar; a próxima mensagem retoma a conversa. Imagens anexadas chegam como caminhos de arquivo no texto, e o agente abre o arquivo.
+
+O `agy` 1.4 às vezes encerra um turno já respondido repetindo um erro de API que ele mesmo superou ao tentar de novo, como `API error (attempt 1): UNAVAILABLE (code 503)`, inclusive em turnos seguintes da mesma conversa. Quando a última etapa do turno é a resposta do agente, o Codebit considera o turno concluído. Uma falha que impede a resposta continua aparecendo como erro.
+
+O Antigravity usa as ferramentas internas do Codebit: imagens, sub-agentes e redes sociais. Como o CLI não aceita servidores MCP nem instruções por sessão, o Codebit cria um plugin temporário `codebit` em `antigravity/<id>/.agents/plugins/codebit`, na própria pasta de dados, e passa a pasta `antigravity/<id>` com `--add-dir`. O plugin leva `codebit_images`, `codebit_agents` e `codebit_social`, os servidores stdio e HTTP configurados para `antigravity` ou `both`, as instruções e diretrizes em `rules/AGENTS.md` e um hook `PreToolUse`. Ele é apagado quando a sessão fecha; sobras são removidas quando o Codebit inicia.
+
+O modo headless do `agy` não consegue perguntar ao usuário e nega comandos e MCP por conta própria. Por isso o Codebit usa `--dangerously-skip-permissions` e deixa a decisão com o hook, que consulta o bridge local antes das ferramentas controladas, conforme o modo abaixo. Se não alcançar o Codebit, a ferramenta é negada. Escrever na pasta do plugin é negado em todos os modos.
+
+**Uso pela assinatura:** executar o binário oficial como processo filho usa o plano da própria conta, segundo uma resposta no fórum do Google. Essa informação não consta da documentação oficial.
 
 ### Modos de permissão
 
-| Modo         | Codex                                                 | Claude              | Devin                                                       |
-| ------------ | ----------------------------------------------------- | ------------------- | ----------------------------------------------------------- |
-| **Planejar** | sandbox somente leitura                               | modo `plan`         | modo `plan`                                                 |
-| **Executar** | `workspace-write`, com aprovações encaminhadas a você | modo `manual`       | `accept-edits`: edições aprovadas, comandos pedem aprovação |
-| **Bypass**   | `approvalPolicy: never` com `danger-full-access`      | `bypassPermissions` | modo `bypass`                                               |
+| Modo         | Codex                                                 | Claude              | Devin                                                       | Antigravity                                                                                   |
+| ------------ | ----------------------------------------------------- | ------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| **Planejar** | sandbox somente leitura                               | modo `plan`         | modo `plan`                                                 | `--mode plan`; escrita só na pasta do plano; comandos e ferramentas externas pedem aprovação  |
+| **Executar** | `workspace-write`, com aprovações encaminhadas a você | modo `manual`       | `accept-edits`: edições aprovadas, comandos pedem aprovação | edições na tarefa seguem; comandos, ferramentas externas e edições fora dela pedem aprovação  |
+| **Bypass**   | `approvalPolicy: never` com `danger-full-access`      | `bypassPermissions` | modo `bypass`                                               | ações seguem, com confirmação antes de apagar arquivos antigos ou descartar alterações do Git |
+
+No **Antigravity**, o hook decide por ferramenta:
+
+- **Planejar:** comandos de terminal, MCPs de outros servidores e ferramentas do navegador pedem aprovação; ferramentas do Codebit passam. Escrita só é permitida na pasta da conversa em `~/.gemini/antigravity-cli/brain/<id>/`, onde o agente grava o plano `.md`; em qualquer outro lugar, é negada.
+- **Executar:** edições na pasta da tarefa seguem; fora dela, pedem aprovação. Comandos de terminal, MCPs de outros servidores e ferramentas do navegador pedem aprovação. Os pedidos de comandos que apagam arquivos mostram o alcance. Ferramentas do Codebit passam.
+- **Bypass:** as ações seguem, mas comandos que apagam arquivos de antes da conversa ou descartam alterações não salvas no Git param para confirmação. A proibição de escrever na pasta do plugin continua valendo.
 
 As aprovações, inclusive de ferramentas MCP, e as perguntas dos agentes aparecem na conversa. Os modos têm comportamentos diferentes em cada CLI: o Codebit não implementa um sandbox universal para ferramentas, MCPs ou terminal.
 
-**Bypass** é o modo padrão das novas tarefas. O agente e os sub-agentes executam comandos e alteram arquivos sem perguntar, e o botão fica laranja quando ativo. Para começar em Planejar ou Executar, mude em **Configurações → Comportamento → Modo das novas tarefas**. Use Bypass só em pastas em que você confia.
+**Bypass** é o modo padrão das novas tarefas. O agente e os sub-agentes executam comandos e alteram arquivos sem perguntar, e o botão fica laranja quando ativo. A confirmação antes de apagar continua valendo no Claude Code e no Antigravity. Para começar em Planejar ou Executar, mude em **Configurações → Comportamento → Modo das novas tarefas**. Use Bypass só em pastas em que você confia.
 
 ### Plano no modo Planejar
 
@@ -101,6 +129,7 @@ No modo **Planejar**, o plano proposto pelo agente abre na aba **Plano** do pain
 
 - **Claude:** o plano chega pela ferramenta `ExitPlanMode`, e o arquivo é o `.md` que o próprio Claude grava. No chat fica um cartão curto com **Ver plano**, **Continuar planejando** e **Aprovar e executar**; os mesmos botões aparecem no painel enquanto o agente espera. Ao aprovar, a tarefa passa para o modo padrão das novas tarefas (Bypass, ou Executar se o padrão for Planejar), inclusive na sessão em andamento.
 - **Codex e Devin:** a resposta final no modo Planejar é o plano, salvo em `plans/<tarefa>.md` na pasta de dados do Codebit. O item de plano nativo do Codex, quando existe, também vai para a aba.
+- **Antigravity:** o `.md` gravado em `~/.gemini/antigravity-cli/brain/<id>/` é capturado e vai para a aba **Plano**. O hook nega edições fora da pasta do plano.
 
 ### Fila de mensagens
 
@@ -108,7 +137,7 @@ Enquanto o agente responde, o campo de mensagem continua livre. Enter, ou o bot�
 
 - Quando a resposta termina normalmente, o próximo item é enviado sozinho. Depois de uma falha ou interrupção, a fila espera você. Em projetos ainda não confiáveis, nada é enviado automaticamente.
 - Cada item pode ser editado (Enter salva, Esc cancela), movido pelos botões ou arrastando, removido ou enviado na hora.
-- **Enviar agora** manda direto quando o agente está parado. Durante uma resposta do Codex, a mensagem entra na resposta em andamento (`turn/steer`). No Claude e no Devin, que respondem uma mensagem por vez, ela passa a ser a próxima.
+- **Enviar agora** manda direto quando o agente está parado. Durante uma resposta do Codex, a mensagem entra na resposta em andamento (`turn/steer`). No Claude, no Devin e no Antigravity, que respondem uma mensagem por vez, ela passa a ser a próxima.
 
 A fila fica salva na tarefa.
 
@@ -119,35 +148,52 @@ Quando o turno termina com comandos ou sub-agentes ainda rodando, o Codebit não
 - **Claude Code:** comandos com `run_in_background` e sub-agentes em segundo plano. Quando terminam, o próprio Claude começa um turno para relatar o resultado. As ferramentas usadas pelos sub-agentes aparecem como `Sub-agente · …`.
 - **Codex:** comandos que o turno deixou rodando, como um servidor de desenvolvimento, e sub-agentes em threads próprias. Como o Codex não retoma sozinho, a sessão fecha alguns segundos depois que tudo termina.
 - **Devin:** o protocolo ACP não informa trabalho em segundo plano, então a sessão fecha ao fim do turno.
+- **Antigravity:** cada turno roda num processo próprio, encerrado ao terminar. **Interromper** encerra o processo; a próxima mensagem retoma a conversa com o mesmo identificador.
 
 ### Conflitos entre conversas
 
 Quando duas conversas na mesma pasta alteram o mesmo arquivo em execuções que se sobrepõem, as duas recebem um aviso com o nome do arquivo e da outra conversa. Conversas uma depois da outra não geram aviso, e worktrees nunca entram em conflito.
 
-A detecção usa as ferramentas de edição de cada CLI: `fileChange` no Codex, `Edit`/`Write` no Claude e as edições do Devin, inclusive as de sub-agentes. Alterações feitas por comandos de terminal (`sed`, scripts) não são detectadas.
+A detecção usa as ferramentas de edição de cada CLI: `fileChange` no Codex, `Edit`/`Write` no Claude, as edições do Devin, inclusive as de sub-agentes, e `write_file`/`edit_file` no Antigravity. Alterações feitas por comandos de terminal (`sed`, scripts) não são detectadas.
+
+### Pensamentos do agente
+
+Entre as ações, o chat mostra o que o agente pensou, no resumo que o próprio CLI faz do raciocínio. Cada trecho vira uma linha **Pensamento** com o começo do texto, que abre com um clique. Enquanto chega, a linha aparece aberta, como **Pensando…**.
+
+- **Claude Code:** a partir da versão 2.1.292, o Codebit pede o resumo com `--thinking-display summarized`. Sem isso, uma sessão não interativa manda o pensamento sem texto. Versões anteriores não aceitam a opção e seguem sem pensamentos. Nem todo trecho de raciocínio vem com texto.
+- **Codex:** o Codebit pede o resumo a cada turno. Costuma vir um título curto por etapa; com esforço baixo, muitas vezes não há resumo.
+- **Devin:** os pensamentos que ele já envia, em frases curtas.
+- **Antigravity:** o `agy` não envia pensamentos; chegam só texto, etapas de ferramenta e uso.
+
+Mostrar não gasta tokens a mais: o raciocínio acontece e conta na cota de qualquer forma. Os pensamentos ficam só na tela; não voltam para o agente nem entram na troca de agente ou nos cartões do Multitarefa.
+
+**Ocultar pensamentos**, ao lado de **Ocultar contexto**, tira os pensamentos do chat. A escolha fica salva.
 
 ### Ocultar contexto, uso de contexto e cota
 
 - **Ocultar contexto**, no topo da tarefa, tira do chat as execuções de ferramentas e as aprovações já respondidas, deixando só a conversa. Pedidos pendentes, erros e imagens continuam visíveis. A escolha fica salva.
-- **Uso de contexto**, na barra de status, mostra quanto da janela de contexto do modelo ainda está livre, com base no uso informado na última resposta. Codex e Claude informam o tamanho da janela junto com o uso; no Devin, ele vem do catálogo. Trocar de agente ou de modelo limpa a leitura até a próxima resposta.
+- **Uso de contexto**, na barra de status, mostra quanto da janela de contexto do modelo ainda está livre, com base no uso informado na última resposta. Codex e Claude informam o tamanho da janela junto com o uso; no Devin, ele vem do catálogo. No Antigravity, o uso é a soma dos tokens de entrada e saída da última chamada, informada por etapa; o tamanho da janela é desconhecido, então não há porcentagem de espaço livre. Trocar de agente ou de modelo limpa a leitura até a próxima resposta.
 - **Do que o contexto é feito:** clique no medidor. No Claude Code, o Codebit lê a composição ao fim de cada resposta, sem chamar o modelo (`get_context_usage`), e a mostra numa barra em quatro partes:
   - **Instruções:** prompt de sistema, diretrizes, instruções do Codebit e arquivos de memória (`CLAUDE.md`).
   - **Ferramentas:** as do Claude Code e as dos servidores MCP, por servidor.
   - **Skills.**
   - **Conversa:** dividida entre o que as ferramentas devolveram (arquivos lidos, saídas de comandos), chamadas, respostas e mensagens.
 
-  Cada parte abre nos itens mais pesados. O painel também mostra a reserva de compactação, o espaço livre e as ferramentas adiadas (fora do contexto até o agente buscá-las), e dá uma dica quando faz sentido: integrações demais, uma conversa que cresceu por leituras ou o limite chegando. Os números são do próprio Claude Code. O Codex e o Devin informam só o total.
+  Cada parte abre nos itens mais pesados. O painel também mostra a reserva de compactação, o espaço livre e as ferramentas adiadas (fora do contexto até o agente buscá-las), e dá uma dica quando faz sentido: integrações demais, uma conversa que cresceu por leituras ou o limite chegando. Os números são do próprio Claude Code. O Codex, o Devin e o Antigravity informam só o total usado.
 
 - **Cota**, na barra de status, mostra o maior uso entre as janelas do plano do agente. Clique para ver cada janela, o horário de renovação e o plano. A leitura vem do CLI, não gasta cota e é refeita a cada 2 minutos no máximo, ou pelo ↻.
   - **Codex:** `account/rateLimits/read` (janelas de 5 horas e semanal, créditos e plano).
   - **Claude:** o comando local `/usage` (sessão de 5 horas, semana e semana por modelo) e o `rate_limit_event` das respostas.
   - **Devin:** o plano de `devin auth status`. O Devin CLI não informa o saldo; use `/usage` no chat.
+  - **Antigravity:** o `agy` não informa a cota fora do terminal; a nota orienta abrir `agy` e usar `/usage` lá.
 
 ## Trabalho em paralelo
 
 ### Sub-agentes
 
 No chip **Sub-agentes**, abaixo da mensagem, ative a delegação e escolha CLI, modelo, esforço e quantidade simultânea (1 a 8). O agente principal recebe a ferramenta `run_subagents` do MCP interno `codebit_agents`.
+
+Codex, Claude e Antigravity podem delegar pelas ferramentas internas do Codebit. Só o Devin ainda não as usa como agente principal; como sub-agente, funciona normalmente.
 
 - Cada sub-agente roda uma tarefa independente, na mesma pasta e no mesmo modo da tarefa, sem acesso à conversa e sem MCPs internos.
 - Chamadas acima do limite esperam na fila.
@@ -173,34 +219,6 @@ No Claude Code, as ferramentas do Codebit ficam sempre carregadas (`alwaysLoad`)
 - Os botões do cartão abrem a conversa completa, interrompem a execução ou tiram a tarefa do quadro sem apagá-la.
 
 Todas as tarefas rodam ao mesmo tempo. Peça partes que não editem os mesmos arquivos, ou use worktrees.
-
-### Quadro de tarefas
-
-Cada projeto tem um quadro, aberto pela linha **Tarefas** do projeto na barra lateral.
-
-**Colunas:**
-
-- **A fazer:** a fila, com as tarefas que você cria (título e descrição opcional) e as recomendações aprovadas. Dá para reordenar, editar e excluir.
-- **Em andamento:** tarefas trabalhando ou aguardando você.
-- **Concluídas.**
-- **Com problema:** tarefas que falharam ou foram interrompidas. **Tentar de novo** retoma a mesma sessão.
-
-**Modo tarefas** (desligado por padrão):
-
-- Ligado, o Codebit inicia um agente para a próxima tarefa de "A fazer" sempre que há lugar, até o limite de **Simultâneas** (1 a 4).
-- No topo do quadro você escolhe agente, modelo, esforço e permissão (Executar ou Bypass). A escolha vale para as próximas tarefas que começarem.
-- Desligado, nenhuma tarefa começa sozinha, e as que estão em andamento terminam normalmente. **Executar agora** inicia uma tarefa mesmo assim.
-- Se uma tarefa não consegue começar, ou se duas seguidas falham, o modo se desliga e o Windows avisa. Assim, um CLI ausente ou uma cota esgotada não queimam a fila inteira.
-
-**Sessões internas:** cada tarefa trabalha numa sessão própria, que não aparece nas conversas do projeto nem no Multitarefa. **Acompanhar** (ou **Abrir a sessão**) mostra essa sessão como um chat, onde dá para responder aprovações, mandar mensagens e interromper. Excluir a tarefa apaga a sessão, e vice-versa.
-
-**Os agentes também usam o quadro.** Toda sessão de um projeto, conversa normal ou sessão interna, recebe o MCP interno `codebit_tasks`, com `list_tasks` (ver o quadro) e `add_tasks` (criar tarefas):
-
-- **Numa conversa, o que você pede vai para a fila.** Por exemplo: "coloque no quadro: criar a dungeon e revisar os drops". As tarefas vão para "A fazer" com o selo **Conversa**.
-- **O que o agente sugere por conta própria fica pendente,** em **Pendentes de aprovação**, com o selo IA.
-- **Nas sessões internas, as tarefas de continuação também ficam pendentes.** Ao terminar, o agente recomenda o que achou (um bug, uma melhoria), e nada começa até você aprovar.
-
-No cartão, **Da conversa: …** leva até a conversa que criou a tarefa, e **De: …** mostra a tarefa que a recomendou. **Aprovar** manda a sugestão para o fim de "A fazer"; **Descartar** a apaga. Conversas sem projeto não têm quadro.
 
 ### Prompts salvos
 
@@ -300,12 +318,15 @@ Digite `/` no início da mensagem para abrir a lista de skills e comandos do age
 - **Claude:** comandos e skills anunciados pelo Claude Code, executados como `/nome argumentos`.
 - **Codex:** skills de `skills/list`, inseridas como `$nome` e enviadas ao Codex como skill.
 - **Devin:** skills de `devin skills list` e, depois da primeira mensagem, os comandos anunciados pelo ACP (`/compact`, `/context`…).
+- **Antigravity:** não lista skills nem comandos no Codebit. Os comandos de barra do `agy`, como `/usage`, só funcionam no terminal dele.
 
 Em projetos ainda não confiáveis, a lista só aparece depois da confirmação, porque consultar o CLI carrega as configurações do projeto.
 
 ### Servidores MCP
 
 Os CLIs continuam responsáveis pelas próprias configurações, extensões e permissões. Em **Skills e MCP**, no rodapé da barra lateral, o Codebit lista as skills locais nas pastas usuais do usuário e do projeto e os servidores MCP encontrados nas configurações dos CLIs. Plugins gerenciados pelo CLI podem funcionar mesmo sem aparecer nessa lista.
+
+A lista de MCPs nativos também lê `~/.gemini/config/mcp_config.json`, com os servidores globais do `agy` rotulados como `antigravity`.
 
 Servidores adicionados no Codebit, em **Configurações → MCP → Adicionar conexão**, recebem o prefixo `codebit_` e valem a partir da próxima execução, sem escrever nas configurações nativas. Para um servidor stdio, use o comando e os argumentos separados. Variáveis podem referenciar o ambiente sem copiar o segredo:
 
@@ -322,20 +343,20 @@ Servidores adicionados no Codebit, em **Configurações → MCP → Adicionar co
 }
 ```
 
-- `agent` aceita `codex`, `claude`, `devin` ou `both` (todos os agentes).
-- Para HTTP, use `transport: "http"` e `url`. O Devin recebe apenas servidores stdio.
+- `agent` aceita `codex`, `claude`, `devin`, `antigravity` ou `both` (todos os agentes).
+- Para HTTP, use `transport: "http"` e `url`; no plugin do Antigravity, o endereço vai como `url`. O Devin aceita apenas servidores stdio.
 - A autenticação interativa de servidores nativos continua no CLI.
-- Os nomes `images`, `agents`, `social` e `tasks` são reservados às pontes internas do Codebit, que usam credenciais locais temporárias por tarefa.
+- Os nomes `images`, `agents` e `social` são reservados às pontes internas do Codebit, que usam credenciais locais temporárias por tarefa.
 
 ### Secrets
 
-Em **Configurações → Secrets**, guarde chaves de API e outros valores sensíveis, cada um com **Nome**, **Valor** e **Descrição**. Eles chegam a todas as sessões dos agentes como variáveis de ambiente: conversas, sub-agentes, chat rápido, prompts salvos, quadro de tarefas e o terminal do painel.
+Em **Configurações → Secrets**, guarde chaves de API e outros valores sensíveis, cada um com **Nome**, **Valor** e **Descrição**. Eles chegam a todas as sessões dos agentes como variáveis de ambiente: conversas, sub-agentes, chat rápido, prompts salvos e o terminal do painel.
 
 - **O nome é o da variável:** só letras sem acento, números e `_`, como `OPENAI_API_KEY`. O que você digita vira esse formato sozinho ("chave do projeto" → `CHAVE_DO_PROJETO`). Nomes do sistema e do Codebit (`PATH`, `TEMP`, `CODEBIT_…` e semelhantes) são recusados.
 - **O agente não vê o valor.** Ele recebe só o nome e a descrição de cada secret, com a orientação de usar a variável (`$env:NOME` no PowerShell, `$NOME` no bash, `os.environ` no Python) e de nunca mostrar, registrar ou gravar o valor.
 - **O valor não volta para a tela.** Ele fica cifrado com a chave do seu usuário do Windows. Para trocá-lo, edite o secret e digite o novo; deixar o campo vazio mantém o valor salvo.
 - **Valores impressos são mascarados.** Se um agente imprimir o valor de um secret, o Codebit grava e mostra `[secret NOME]` no lugar, no chat, nas linhas de execução, nos sub-agentes e no chat rápido. Isso não desfaz o que o modelo já leu: a proteção principal é a orientação de não imprimir.
-- **Login dos próprios CLIs.** Variáveis que um CLI lê para entrar na conta não vão para ele. Com `ANTHROPIC_API_KEY` no ambiente, por exemplo, o Claude Code troca a assinatura por cobrança na API. Por isso, secrets `ANTHROPIC_…` e `CLAUDE_…` não vão para o Claude, `CODEX_…` e `OPENAI_BASE_URL` não vão para o Codex, e `DEVIN_…` não vai para o Devin; eles continuam indo para os demais agentes. Para usar uma dessas chaves num script do próprio agente, dê outro nome a ela. O Codex mantém o login da assinatura mesmo com `OPENAI_API_KEY` no ambiente, então esse nome vai para ele normalmente.
+- **Login dos próprios CLIs.** Variáveis que um CLI lê para entrar na conta não vão para ele. Com `ANTHROPIC_API_KEY` no ambiente, por exemplo, o Claude Code troca a assinatura por cobrança na API. Por isso, secrets `ANTHROPIC_…` e `CLAUDE_…` não vão para o Claude, `CODEX_…` e `OPENAI_BASE_URL` não vão para o Codex, e `DEVIN_…` não vai para o Devin. No Antigravity, ficam de fora `AGY_…`, `GEMINI_…` e `GOOGLE_…`: `GEMINI_API_KEY`, por exemplo, o tiraria do login da conta Google. Esses secrets continuam indo para os demais agentes. Para usar uma dessas chaves num script do próprio agente, dê outro nome a ela. O Codex mantém o login da assinatura mesmo com `OPENAI_API_KEY` no ambiente, então esse nome vai para ele normalmente.
 - **Conexões MCP** podem usar um secret com `${NOME}` no campo `env`.
 - **Imagens:** um `OPENAI_API_KEY` dos secrets também serve para o provedor **API OpenAI**, quando não há uma chave salva em **Configurações → Imagens**.
 
@@ -343,15 +364,17 @@ Mudanças valem a partir da próxima mensagem de cada conversa, e o terminal, a 
 
 ### Diretrizes para os agentes
 
-Em **Configurações → Comportamento → Diretrizes para os agentes**, escreva instruções permanentes. O Codebit as envia no início de cada sessão: no Codex, como instruções de desenvolvedor; no Claude, com `--append-system-prompt`; no Devin, que não tem prompt de sistema no ACP, junto da primeira mensagem. Diretrizes novas valem a partir da próxima sessão de cada tarefa. **Restaurar padrão** recupera o texto original.
+Em **Configurações → Comportamento → Diretrizes para os agentes**, escreva instruções permanentes. O Codebit as envia no início de cada sessão: no Codex, como instruções de desenvolvedor; no Claude, com `--append-system-prompt`; no Devin, que não tem prompt de sistema no ACP, junto da primeira mensagem; no Antigravity, no arquivo `rules/AGENTS.md` do plugin temporário. Diretrizes novas valem a partir da próxima sessão de cada tarefa. **Restaurar padrão** recupera o texto original.
 
-A diretriz padrão autoriza o agente a atualizar uma ferramenta ou CLI desatualizado (Codex, Claude Code, Devin ou suas dependências) sem pedir confirmação. Quando a instalação é gerenciada por outro aplicativo, como o Devin CLI do Devin Desktop, o agente explica como atualizar em vez de forçar.
+A diretriz padrão autoriza o agente a atualizar uma ferramenta ou CLI desatualizado (Codex, Claude Code, Devin, Antigravity ou suas dependências) sem pedir confirmação. Quando a instalação é gerenciada por outro aplicativo, como o Devin CLI do Devin Desktop, o agente explica como atualizar em vez de forçar.
 
 Ao fim de cada resposta e quando a janela volta ao foco (no máximo uma vez por minuto), o Codebit confere a versão dos CLIs. Se algum foi atualizado, inclusive pelo terminal, ele refaz a descoberta sem reiniciar e recarrega versão, login, catálogo, skills, comandos e cota.
 
 ### Redes sociais
 
-Cada projeto pode ter um Instagram e um Patreon, conectados em **Configurações → Redes sociais**. Nas tarefas desse projeto, Codex e Claude recebem o MCP interno `codebit_social`, com `social_accounts`, `instagram_publish` e `patreon_publish`.
+Cada projeto pode ter um Instagram, LinkedIn pessoal e Patreon, conectados em **Configurações → Redes sociais**. Nas tarefas desse projeto, os agentes recebem o MCP interno `codebit_social`, com `social_accounts`, `instagram_publish`, `linkedin_publish` e `patreon_publish`.
+
+Para conectar o LinkedIn pessoal, crie um app no [LinkedIn Developer Portal](https://www.linkedin.com/developers/apps), habilite os produtos “Sign In with LinkedIn using OpenID Connect” e “Share on LinkedIn” e gere um token com `openid`, `profile` e `w_member_social`. Cole o token nas configurações do projeto. O token é cifrado no armazenamento local do Codebit. A integração publica texto e uma imagem PNG/JPEG opcional no perfil pessoal; cada postagem mostra uma prévia e aguarda aprovação. O token tem prazo de validade e pode ser reconectado na mesma tela. Publicações em páginas empresariais não estão incluídas.
 
 **Aprovação sempre:** cada publicação aparece no chat como um cartão com a prévia exata (conta, imagens, título, texto e público) e só sai depois de **Publicar**, mesmo em Bypass. Em Planejar, publicar fica desabilitado. O link do post aparece na conversa e no histórico **Publicações** do projeto.
 
@@ -376,7 +399,7 @@ Cada projeto pode ter um Instagram e um Patreon, conectados em **Configurações
 - **Testar sem publicar** preenche um post de teste e para antes de publicar.
 - O Patreon pode bloquear automação, e os termos dele proíbem abusos técnicos: publique com moderação.
 
-O Devin, como agente principal, ainda não usa essas ferramentas.
+Só o Devin, como agente principal, ainda não usa essas ferramentas. O Antigravity as recebe pelo plugin temporário do Codebit.
 
 ### Voz local com Vosk
 
@@ -410,7 +433,7 @@ A frase de ativação pode ser trocada com o microfone pausado; frases com palav
 - **Barra lateral:** Prompts, Conversas e cada projeto podem ser recolhidos. Cada tarefa mostra a marca do agente e há quanto tempo mudou, ou um ponto de status: verde pulsando (trabalhando), âmbar (aguardando você), vermelho (falhou) ou cinza (interrompida). Arquivadas, Skills e MCP e Configurações ficam no rodapé.
 - **Arquivar e excluir:** passe o mouse sobre uma tarefa para ver **Arquivar** (ou **Restaurar**) e **Excluir**; o clique direito abre o mesmo menu, com **Abrir** e **Renomear**. **Excluir** pede confirmação e apaga, sem volta, o histórico, os anexos copiados, as imagens geradas e o plano da tarefa. A pasta do projeto nunca é alterada; numa conversa sem projeto dá para apagar também a pasta dela, e numa tarefa com worktree, remover a worktree (o branch continua no repositório). Tarefas trabalhando não podem ser arquivadas nem excluídas.
 - **Rascunhos:** a mensagem que você está escrevendo fica guardada por conversa, com os anexos, até ser enviada, inclusive ao reiniciar o Codebit. Um lápis na barra lateral marca as conversas com mensagem não enviada. Rascunhos de conversas excluídas, ou com mais de 30 dias, somem sozinhos.
-- **Remover projeto:** a lixeira no título do projeto, ou o clique direito (**Remover do Codebit…**), apaga do Codebit as conversas, o quadro de tarefas, os prompts salvos e as contas de redes sociais do projeto. **A pasta do projeto no disco não é alterada.** As worktrees criadas pelo Codebit só são removidas se você marcar a opção.
+- **Remover projeto:** a lixeira no título do projeto, ou o clique direito (**Remover do Codebit…**), apaga do Codebit as conversas, os prompts salvos e as contas de redes sociais do projeto. **A pasta do projeto no disco não é alterada.** As worktrees criadas pelo Codebit só são removidas se você marcar a opção.
 - **Configurações:** Agentes, Comportamento (diretrizes, modo das novas tarefas, sub-agentes padrão e proteção contra repetição), Imagens, Skills, MCP, Secrets, Redes sociais e Aplicativo (notificações, atualizações e modo código).
 - **Atalhos:** `Ctrl+K` busca, `Ctrl+N` cria uma tarefa, `Ctrl+J` abre o chat rápido e `Ctrl+.` interrompe a tarefa aberta.
 
@@ -420,26 +443,30 @@ Com o Codebit em segundo plano, o Windows avisa quando uma tarefa termina, falha
 
 ### Proteção contra repetição
 
-Um agente pode insistir numa ação que não funciona: um download que nunca chega, ou um comando que falha sempre do mesmo jeito. O Codebit se protege em duas camadas, para todos os agentes, sub-agentes, prompts salvos e o chat rápido:
-
-- **Orientação:** as instruções enviadas aos agentes pedem que, depois de duas tentativas sem o resultado esperado, o agente pare e explique o problema.
+Um agente pode insistir numa ação que não funciona: um download que nunca chega, ou um comando que falha sempre do mesmo jeito. O Codebit oferece uma proteção configurável para todos os agentes, sub-agentes, prompts salvos e o chat rápido. Os prompts não exigem parar e consultar o usuário após duas tentativas sem resultado.
 - **Trava:** se o agente continuar, o Codebit interrompe a execução quando a **mesma ação** é tentada 4 vezes sem nenhum arquivo alterado entre as tentativas, ou quando **6 ações seguidas falham**. A conversa mostra o cartão **Ação interrompida pelo Codebit**, o Windows avisa, e na sua próxima mensagem o agente recebe o motivo da parada.
 
 A ação é identificada pelo conteúdo (o comando completo, o endereço, os argumentos), não pela descrição que o agente escreve. Ler arquivos, buscar e acompanhar comandos em segundo plano não contam como tentativa, e editar um arquivo entre as tentativas conta como progresso. Os limites e a opção de desligar ficam em **Configurações → Comportamento → Proteção contra repetição**.
 
+No Antigravity, `read_file`, `list_dir`, `grep_search`, `find_by_name`, `command_status`, `read_url_content`, `search_web` e `wait` não contam como tentativa.
+
 ### Confirmação antes de apagar
 
-Pedidos como "limpe a pasta" às vezes viram um comando que apaga muito mais do que o pretendido. Antes de um comando que apaga arquivos ou descarta trabalho, o Codebit mede o alcance:
+Pedidos como "limpe a pasta" às vezes viram um comando que apaga muito mais do que o pretendido. Antes de um comando que apaga arquivos ou descarta trabalho, o Codebit confere o alcance:
 
-- **Apagar:** `rm`, `del`, `rd`/`rmdir`, `Remove-Item` e seus apelidos, `find … -delete`, inclusive dentro de `pwsh -Command`, `cmd /c` e `bash -c`. Ele conta arquivos e pastas, soma o tamanho e lista os itens mais pesados. Ele acompanha o próprio comando: variáveis definidas nele (`BS=pasta && rm -rf "$BS/x"`), mudanças de pasta com `cd` (as de dentro de `( … )` valem só ali), curingas no nome do arquivo, variáveis de ambiente e caminhos do Git Bash (`/d/…`). O corpo de um heredoc (`python - <<'EOF' … EOF`) é texto para outro programa e não conta como comando.
+- **Apagar:** `rm`, `del`, `rd /s`/`rmdir /s`, `Remove-Item` e seus apelidos, `find … -delete` e `find … -exec rm`, inclusive dentro de `pwsh -Command`, `cmd /c` e `bash -c`. `rd` e `rmdir` sem `/s` ou `-r` só removem pastas vazias e não contam. Ele conta arquivos e pastas, soma o tamanho e lista os itens mais pesados. Ele acompanha o próprio comando: variáveis definidas nele (`BS=pasta && rm -rf "$BS/x"`), mudanças de pasta com `cd` (as de dentro de `( … )` valem só ali), `$(pwd)` e `$(cygpath …)`, curingas no nome do arquivo, o `-name` do `find`, variáveis de ambiente e caminhos do Git Bash (`/d/…`). O corpo de um heredoc (`python - <<'EOF' … EOF`) é texto para outro programa e não conta como comando.
 - **Git:** `git clean -f` (pela simulação do próprio Git) e `git reset --hard`, `git checkout --` e `git restore`, que descartam alterações não salvas.
+
+**O que conta como importante:** os arquivos que já existiam antes de a conversa começar, na pasta do projeto ou fora dela, e as alterações não salvas no Git. O Codebit compara a data de criação de cada arquivo com o início da conversa. O que o agente criou durante a conversa (renders, builds, pastas de versão, testes), o que está na pasta temporária do sistema e as pastas `tmp`, `temp`, `cache`, `__pycache__` e `node_modules` saem sem perguntar, seja qual for o tamanho.
+
+Quando parte do caminho só existe na hora (`rm -rf "$B/$pasta"` com `$pasta` vindo de um laço), o Codebit olha a pasta conhecida, `$B`: só pergunta se lá dentro houver arquivos de antes da conversa. Num pipe, o `find` ou o `Get-ChildItem` da esquerda limitam o que o `xargs rm` ou o `Remove-Item` apagam. Sem nenhum limite conhecido (um caminho inteiro calculado na hora), ele pergunta.
 
 **Quando pergunta:**
 
-- **Claude Code, em qualquer modo, inclusive Bypass:** um gancho antes de cada comando para os que passam dos limites (por padrão, 50 arquivos ou 1 GB). Também para os que apagam fora da pasta da tarefa, têm alcance impossível de medir (um caminho calculado na hora) ou descartam alterações do Git. Exclusões pequenas passam direto, e o que está na pasta temporária do sistema ou em pastas `tmp`, `temp`, `cache`, `__pycache__` e `node_modules` da tarefa não conta para os limites nem como "fora da pasta". Se você permitir, o comando roda sem uma segunda aprovação; se cancelar, o agente recebe o alcance que você viu e a orientação de não tentar por outro caminho.
-- **Codex e Devin:** no modo Executar, o alcance aparece nos pedidos de aprovação que eles já fazem. No Bypass, esses CLIs não deixam interceptar o comando. No Codex em Executar, comandos dentro da pasta da tarefa costumam rodar no sandbox sem pedir aprovação. Para pedidos de limpeza, prefira o Claude, ou peça antes um plano no modo Planejar.
+- **Claude Code e Antigravity, em qualquer modo, inclusive Bypass:** o hook antes do comando pede confirmação quando ele alcança arquivos importantes. Se você cancelar, o agente recebe o alcance que você viu e a orientação de não tentar por outro caminho. No Claude, os demais comandos rodam direto, e permitir não gera uma segunda aprovação do CLI. No Antigravity, os demais comandos seguem o modo da tarefa: em Planejar e Executar, também pedem aprovação; em Bypass, seguem.
+- **Codex e Devin:** no modo Executar, o alcance aparece nos pedidos de aprovação que eles já fazem, dizendo se há arquivos de antes da conversa. No Bypass, esses CLIs não deixam interceptar o comando. No Codex em Executar, comandos dentro da pasta da tarefa costumam rodar no sandbox sem pedir aprovação. Para pedidos de limpeza, prefira o Claude ou o Antigravity, ou peça antes um plano no modo Planejar.
 
-Os limites e a opção de desligar ficam em **Configurações → Comportamento → Confirmação antes de apagar**. A cobertura depende dos comandos que o Codebit reconhece: um script que apaga arquivos por conta própria, ou uma ferramenta MCP que faz isso, não passa por essa conferência.
+A opção de desligar fica em **Configurações → Comportamento → Confirmação antes de apagar**. A cobertura depende dos comandos que o Codebit reconhece: um script que apaga arquivos por conta própria, ou uma ferramenta MCP que faz isso, não passa por essa conferência.
 
 ## O aplicativo
 
@@ -465,9 +492,9 @@ Com versão nova, o rodapé da barra lateral mostra **vX.Y.Z disponível · Atua
 ### Dados, segurança e privacidade
 
 - **Onde ficam os dados:** `%APPDATA%\Codebit`, a mesma pasta no executável e no modo código, com `codebit.sqlite`, anexos, imagens e worktrees. Para backup, feche o app e copie a pasta. `CODEBIT_DATA_DIR` escolhe outra pasta.
-- **Segredos:** os Secrets, a chave da OpenAI e os tokens do Instagram são cifrados pelo Windows e só podem ser lidos pelo mesmo usuário. As sessões do Patreon ficam em partições do Electron, uma por projeto, apagadas ao sair da conta em Configurações.
+- **Segredos:** os Secrets, a chave da OpenAI e os tokens do Instagram e LinkedIn são cifrados pelo Windows e só podem ser lidos pelo mesmo usuário. As sessões do Patreon ficam em partições do Electron, uma por projeto, apagadas ao sair da conta em Configurações.
 - **Isolamento:** a interface não tem acesso direto ao Node; usa um preload isolado e operações IPC validadas. A prévia de arquivos fica restrita à pasta de trabalho. Os CLIs rodam como processos nativos, sem interpolar prompts num shell.
-- **Rede:** o Codebit não tem telemetria nem servidor próprio. Além dos próprios agentes, ele só acessa a rede quando você usa um recurso que precisa disso: a API de imagens da OpenAI, o ComfyUI, o Instagram, o Patreon e o túnel do Cloudflare.
+- **Rede:** o Codebit não tem telemetria nem servidor próprio. Além dos próprios agentes, ele só acessa a rede quando você usa um recurso que precisa disso: a API de imagens da OpenAI, o ComfyUI, o Instagram, o LinkedIn, o Patreon e o túnel do Cloudflare.
 
 ## Desenvolvimento
 
@@ -492,14 +519,30 @@ npm run test:e2e -- tests/e2e/native.spec.ts
 Remove-Item Env:CODEBIT_NATIVE_TEST
 ```
 
-A última validação com CLIs reais usou Codex CLI 0.157.0 e Claude Code 2.1.283. `npm run test:voice-local` testa o caminho real da voz com áudio sintético, sem abrir o microfone.
+Em 24/10/2026, o smoke direto pelos adaptadores passou com Codex CLI 0.164.0 e Claude Code 2.1.310 (descoberta, autenticação, resposta e catálogo); o E2E visual parou no título inicial, antes de testar os agentes. A validação anterior de conversa e retomada pela interface usou Codex CLI 0.159.3 e Claude Code 2.1.300. O Antigravity foi validado na versão 1.4.3 em 20/10/2026; em 24/10, a instalação 1.4.7 foi confirmada atualizada e seu catálogo respondeu. Os resultados estão em [VALIDATION.md](VALIDATION.md); a cobertura automatizada do Antigravity fica em `tests/antigravity.test.ts`. `npm run test:voice-local` testa o caminho real da voz com áudio sintético, sem abrir o microfone.
+
+### DeepSeek por API key
+
+Em **Configurações → Agentes → DeepSeek**, informe a chave e clique em **Salvar chave e consultar modelos**. Ela fica cifrada como `DEEPSEEK_API_KEY` no cofre de Secrets; o valor não volta para a interface. Também é possível fornecer essa variável no ambiente que inicia o Codebit. Alterar, renomear ou excluir o secret invalida o catálogo anterior. Sessões já abertas conservam a credencial usada na abertura até serem reabertas.
+
+O catálogo vem de `GET https://api.deepseek.com/models`, incluindo nomes, janela de contexto e níveis de esforço quando informados. Não há uma lista fixa de modelos: opções novas aparecem ao atualizar o catálogo. `deepseek-flash` é apenas o padrão inicial; a versão atendida por esse alias é controlada pelo provedor. Chave inválida ou falha na consulta aparece como erro, sem apresentar uma lista antiga como validada.
+
+Para executar ferramentas, o Codebit usa o **DeepSeek Harness oficial (`dsh`)**, com transporte ACP e autenticação pela chave da API. Instalação: `npm install -g @deepseek-ai/dsh`, com Node 22.19 ou superior. Nesta máquina foi instalado o Harness `0.2.1-rc.2` e um Node `22.23.4` isolado em `%LOCALAPPDATA%\Codebit\tools`; o Node geral `22.18.0` foi preservado. A descoberta reconhece esse runtime isolado e o launcher npm. O uso do modelo é cobrado por consumo na conta DeepSeek.
+
+- Conversa, retomada, interrupção, ferramentas, anexos e uso de contexto passam pelo ACP. Imagens são enviadas diretamente quando o Harness anuncia suporte; o caminho do arquivo acompanha os anexos.
+- Os MCPs selecionados para DeepSeek ou todos os agentes são enviados à sessão, incluindo as ferramentas internas do Codebit. Stdio usa executáveis absolutos; HTTP preserva os headers configurados.
+- **Executar** pede autorização para ferramentas que não sejam leituras reconhecidas. **Bypass** aprova essas operações, preservando a inspeção de comandos destrutivos do Codebit. **Planejar** permite apenas ferramentas nativas de leitura; shell e MCP ficam bloqueados nesse modo.
+- Cada conversa tem um perfil isolado na pasta de dados do Codebit. Não altera a configuração global do Harness. Subagentes nativos do Harness ficam desabilitados porque não possuem um canal ACP próprio de aprovação; os subagentes do Codebit usam sessões separadas.
+- A chave passa ao processo pelo ambiente, sem ser gravada no perfil da conversa. O catálogo usa a API oficial e o Harness é direcionado ao endpoint oficial compatível com Messages.
+
+Referências: [catálogo de modelos](https://api-docs.deepseek.com/api/list-models/) e [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
 **Estrutura:**
 
-- `src/main/agents`: adaptadores de protocolo de cada CLI (Codex App Server, Claude Code stream-json, Devin ACP).
-- `src/main/runtime.ts`: sessões, fila, sub-agentes, quadro de tarefas e execuções rápidas.
+- `src/main/agents`: adaptadores de protocolo de cada CLI (Codex App Server, Claude Code stream-json, Devin ACP e Antigravity stream-json). O adaptador do Antigravity cria o plugin temporário com MCPs e instruções; `src/main/agy-hook.ts` encaminha as decisões de ferramentas ao Codebit pelo bridge local.
+- `src/main/runtime.ts`: sessões, fila, sub-agentes e execuções rápidas.
 - `src/main/images.ts`: provedores de imagem. `src/main/store.ts`: persistência SQLite.
-- `src/main/bridge.ts` e `src/main/image-mcp.ts`: as pontes MCP internas (`codebit_images`, `codebit_agents`, `codebit_tasks`, `codebit_social`).
+- `src/main/bridge.ts` e `src/main/image-mcp.ts`: as pontes MCP internas (`codebit_images`, `codebit_agents`, `codebit_social`).
 - `src/preload`: a ponte restrita entre a interface e o processo principal.
 - `src/renderer`: a interface React. Cores, raios e alturas vêm de variáveis em `src/renderer/styles/base.css`, e o CSS fica dividido por área.
 

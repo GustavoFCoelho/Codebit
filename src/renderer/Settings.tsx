@@ -87,13 +87,19 @@ const sections = [
     icon: Share2,
     title: "Redes sociais",
     description:
-      "Instagram e Patreon de cada projeto, para os agentes publicarem com a sua aprovação.",
+      "Instagram, perfil pessoal do LinkedIn e Patreon de cada projeto, com aprovação antes de publicar.",
   },
   {
     id: "Aplicativo",
     icon: Monitor,
     title: "Aplicativo",
     description: "Notificações, atualizações e modo código do Codebit.",
+  },
+  {
+    id: "Projetos",
+    icon: FolderOpen,
+    title: "Projetos",
+    description: "Escolha quais projetos aparecem na tela principal.",
   },
 ];
 // A setting with its name and explanation on the left, the control on the right.
@@ -134,6 +140,7 @@ export function SettingsView({
   const [tab, setTab] = useState(extensionsOnly ? "Skills" : "Agentes");
   const [settings, setSettings] = useState<Settings>();
   const [key, setKey] = useState("");
+  const [deepseekKey, setDeepseekKey] = useState("");
   const [imageModels, setImageModels] = useState<ImageModel[]>([]);
   const [checking, setChecking] = useState(false);
   const [notice, setNotice] = useState("");
@@ -319,7 +326,9 @@ export function SettingsView({
                       <small>Modelos disponíveis</small>
                       <span>
                         {a.catalogStatus === "loading"
-                          ? "Consultando o CLI…"
+                          ? a.id === "deepseek"
+                            ? "Consultando a API…"
+                            : "Consultando o CLI…"
                           : a.models.length
                             ? `${a.models.length} disponíveis`
                             : a.catalogStatus === "error"
@@ -330,6 +339,60 @@ export function SettingsView({
                   </div>
                   {a.authMessage && <p className="help">{a.authMessage}</p>}
                   {a.catalogError && <p className="help">{a.catalogError}</p>}
+                  {a.id === "deepseek" && (
+                    <div className="settings-card">
+                      <label>
+                        Chave de API DeepSeek
+                        <input
+                          type="password"
+                          autoComplete="new-password"
+                          aria-label="Chave de API DeepSeek"
+                          value={deepseekKey}
+                          placeholder={
+                            snapshot.secrets.some(
+                              (s) => s.name === "DEEPSEEK_API_KEY",
+                            )
+                              ? "Chave salva; preencha para substituir"
+                              : "DEEPSEEK_API_KEY"
+                          }
+                          onChange={(e) => setDeepseekKey(e.target.value)}
+                        />
+                      </label>
+                      <p className="help">
+                        A chave fica cifrada em Secrets. Os modelos, o contexto
+                        e os níveis de esforço são consultados na API oficial; o
+                        uso é cobrado pelo consumo.
+                      </p>
+                      <button
+                        className="quiet"
+                        disabled={!deepseekKey.trim()}
+                        onClick={() =>
+                          void run(async () => {
+                            const existing = snapshot.secrets.find(
+                              (s) => s.name === "DEEPSEEK_API_KEY",
+                            );
+                            await api("secrets.save", {
+                              id: existing?.id,
+                              name: "DEEPSEEK_API_KEY",
+                              value: deepseekKey.trim(),
+                              description: "API oficial DeepSeek",
+                            });
+                            setDeepseekKey("");
+                            await api("auth", { agent: "deepseek" });
+                          })
+                        }
+                      >
+                        Salvar chave e consultar modelos
+                      </button>
+                      <p className="help">
+                        O agente usa o DeepSeek Harness (dsh). Planejar permite
+                        ferramentas nativas de leitura; demais ferramentas ficam
+                        bloqueadas. Instalação:{" "}
+                        <code>npm install -g @deepseek-ai/dsh</code> (Node 22.19
+                        ou mais recente).
+                      </p>
+                    </div>
+                  )}
                   {a.installations.length > 1 && (
                     <label className="installation-choice">
                       Instalação selecionada
@@ -399,7 +462,7 @@ export function SettingsView({
               </div>
             </section>
             <aside className="settings-inspector">
-              <h3>Um fluxo, três agentes</h3>
+              <h3>Um fluxo, cinco agentes</h3>
               <div className="capability-list">
                 {[
                   "Conversa em streaming",
@@ -421,6 +484,8 @@ export function SettingsView({
               <code className="command">codex login</code>
               <code className="command">claude auth login</code>
               <code className="command">devin auth login</code>
+              <code className="command">agy</code>
+              <p className="help">No agy, entre com a sua conta Google.</p>
               <div className="divider" />
               <p className="help">
                 Uma instalação detectada ainda pode exigir login ou atualização.
@@ -435,9 +500,8 @@ export function SettingsView({
               <div className="card-head">
                 <h3>Diretrizes para os agentes</h3>
                 <p className="help">
-                  Enviadas a Codex, Claude e Devin no início de cada tarefa.
-                  Tarefas já abertas recebem as novas diretrizes na próxima
-                  sessão.
+                  Enviadas a todos os agentes no início de cada tarefa. Tarefas
+                  já abertas recebem as novas diretrizes na próxima sessão.
                 </p>
               </div>
               <textarea
@@ -593,60 +657,27 @@ export function SettingsView({
                 <h3>Confirmação antes de apagar</h3>
                 <p className="help">
                   Antes de um comando que apaga arquivos ou descarta alterações
-                  do Git, o Codebit mede o alcance: quantos arquivos e pastas, o
-                  tamanho e os maiores itens. No Claude Code isso vale em
-                  qualquer modo, inclusive Bypass. No Codex e no Devin, o
-                  alcance aparece nos pedidos de aprovação do modo Executar; no
-                  Bypass deles não há como interceptar. Apagar fora da pasta da
-                  tarefa, caminhos com variáveis e Git que descarta alterações
-                  sempre perguntam.
+                  do Git, o Codebit confere o que ele alcança. Só pergunta
+                  quando o comando apaga arquivos que já existiam antes da
+                  conversa começar, ou pode alcançá-los, e quando descarta
+                  alterações não salvas no Git. O que o agente criou durante a
+                  conversa, temporários e caches saem sem perguntar. No Claude
+                  Code e no Antigravity isso vale em qualquer modo, inclusive
+                  Bypass. No Codex e no Devin, o alcance aparece nos pedidos de
+                  aprovação do modo Executar; no Bypass deles não há como
+                  interceptar.
                 </p>
               </div>
               <Switch
                 checked={deletes.enabled}
                 onChange={(enabled) =>
                   void run(() =>
-                    save({ ...settings, deleteGuard: { ...deletes, enabled } }),
+                    save({ ...settings, deleteGuard: { enabled } }),
                   )
                 }
               >
-                Pedir confirmação antes de comandos que apagam muito
+                Pedir confirmação antes de apagar arquivos que já existiam
               </Switch>
-              {(
-                [
-                  [
-                    "files",
-                    "A partir de quantos arquivos",
-                    "Exclusões menores passam direto.",
-                  ],
-                  [
-                    "megabytes",
-                    "A partir de quantos MB",
-                    "Um único arquivo grande também pergunta.",
-                  ],
-                ] as const
-              ).map(([field, label, help]) => (
-                <SettingRow key={field} title={label} help={help}>
-                  <input
-                    className="narrow"
-                    type="number"
-                    min={1}
-                    disabled={!deletes.enabled}
-                    aria-label={label}
-                    value={deletes[field]}
-                    onChange={(e) =>
-                      setSettings({
-                        ...settings,
-                        deleteGuard: {
-                          ...deletes,
-                          [field]: Math.max(1, Number(e.target.value) || 1),
-                        },
-                      })
-                    }
-                    onBlur={() => void run(() => save(settings))}
-                  />
-                </SettingRow>
-              ))}
             </div>
           </section>
         )}
@@ -767,6 +798,32 @@ export function SettingsView({
                 </div>
               </div>
             )}
+          </section>
+        )}
+        {tab === "Projetos" && (
+          <section className="settings-stack">
+            <div className="settings-card">
+              {!snapshot.projects.length ? (
+                <p className="quiet">Nenhum projeto cadastrado.</p>
+              ) : snapshot.projects.map((project) => (
+                <SettingRow
+                  key={project.id}
+                  title={project.name}
+                  help={project.path}
+                >
+                  <button
+                    className="secondary"
+                    aria-label={`${project.hidden ? "Reexibir" : "Ocultar"} ${project.name}`}
+                    onClick={() => void run(async () => {
+                      await api("project.hide", { id: project.id, hidden: !project.hidden });
+                      await refresh();
+                    })}
+                  >
+                    {project.hidden ? "Reexibir" : "Ocultar"}
+                  </button>
+                </SettingRow>
+              ))}
+            </div>
           </section>
         )}
         {tab === "Imagens" && (
@@ -1120,7 +1177,7 @@ export function SettingsView({
               <div>
                 <strong>codebit_social</strong>
                 <small>
-                  Instagram e Patreon · oferecida nas tarefas de projetos com
+                  Instagram, LinkedIn e Patreon · oferecida nas tarefas de projetos com
                   redes conectadas; cada post espera a sua aprovação
                 </small>
               </div>
@@ -1192,9 +1249,10 @@ export function SettingsView({
             </div>
             <p className="help">
               Configure command e args para stdio; url para HTTP (o Devin aceita
-              apenas stdio). Agente: codex, claude, devin ou both (todos). No
-              campo env, use {'"TOKEN": "${MINHA_VARIAVEL}"'} para ler uma
-              variável do ambiente sem salvar seu segredo.
+              apenas stdio). Agente: codex, claude, devin, antigravity, deepseek
+              ou both (todos). No campo env, use{" "}
+              {'"TOKEN": "${MINHA_VARIAVEL}"'} para ler uma variável do ambiente
+              sem salvar seu segredo.
             </p>
             <textarea
               className="json-editor"

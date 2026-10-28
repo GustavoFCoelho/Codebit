@@ -13,6 +13,16 @@ const agentTitles: Record<AgentId, string> = {
   codex: "Codex CLI",
   claude: "Claude Code",
   devin: "Devin CLI",
+  antigravity: "Antigravity CLI",
+  deepseek: "DeepSeek Harness",
+};
+// Antigravity CLI's executable is agy.
+const binaries: Record<AgentId, string> = {
+  codex: "codex",
+  claude: "claude",
+  devin: "devin",
+  antigravity: "agy",
+  deepseek: "dsh",
 };
 // Runs `--version`; undefined when the CLI does not answer.
 export async function readVersion(spec: { command: string; args: string[] }) {
@@ -23,6 +33,35 @@ export async function readVersion(spec: { command: string; args: string[] }) {
 export function executable(path: string): { command: string; args: string[] } {
   if (/\.exe$/i.test(path) || process.platform !== "win32")
     return { command: path, args: [] };
+  if (/dsh\.(cmd|ps1)$/i.test(path)) {
+    const script = join(
+      dirname(path),
+      "node_modules",
+      "@deepseek-ai",
+      "dsh",
+      "lib",
+      "bin.js",
+    );
+    if (existsSync(script)) {
+      const tools = join(
+        process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"),
+        "Codebit",
+        "tools",
+      );
+      let node: string | undefined;
+      try {
+        node = readdirSync(tools)
+          .filter((n) => /^node-v[\d.]+-win-x64$/.test(n))
+          .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+          .map((n) => join(tools, n, "node.exe"))
+          .find(existsSync);
+      } catch {}
+      return {
+        command: process.env.CODEBIT_DSH_NODE_PATH || node || "node.exe",
+        args: [script],
+      };
+    }
+  }
   if (/codex\.(cmd|ps1)$/i.test(path)) {
     const script = join(
       dirname(path),
@@ -39,7 +78,7 @@ export function executable(path: string): { command: string; args: string[] } {
       };
   }
   throw new Error(
-    "Selecione o executável nativo .exe. Scripts npm do Codex também são suportados.",
+    "Selecione o executável nativo .exe. Scripts npm do Codex e DeepSeek Harness também são suportados.",
   );
 }
 function candidates(agent: AgentId, override?: string) {
@@ -77,11 +116,20 @@ function candidates(agent: AgentId, override?: string) {
         "bin",
       ),
     );
+  // Its installer puts agy in its own folder, on the PATH of new terminals.
+  if (agent === "antigravity")
+    roots.push(
+      join(
+        process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"),
+        "agy",
+        "bin",
+      ),
+    );
   const paths = [
     override,
     ...roots.flatMap((r) =>
       (process.platform === "win32" ? [".exe", ".cmd", ".ps1"] : [""]).map(
-        (ext) => join(r, agent + ext),
+        (ext) => join(r, binaries[agent] + ext),
       ),
     ),
   ];
@@ -134,6 +182,30 @@ export async function checkAuth(agent: AgentInfo): Promise<AgentInfo> {
     };
   const i = agent.selected;
   try {
+    if (agent.id === "deepseek")
+      return {
+        ...agent,
+        auth: "unknown",
+        authMessage:
+          "O Codebit verifica a chave DeepSeek consultando o catálogo oficial.",
+      };
+    // Antigravity CLI has no status command; listing models needs the login.
+    if (agent.id === "antigravity") {
+      const r = await capture(
+        i.command,
+        [...i.args, "models"],
+        process.cwd(),
+        30000,
+      );
+      const ready = r.code === 0 && /^\S+\t/m.test(r.stdout);
+      return {
+        ...agent,
+        auth: ready ? "ready" : "missing",
+        authMessage: ready
+          ? "Acesso configurado no CLI."
+          : "Abra o agy no terminal e entre com a sua conta Google.",
+      };
+    }
     const r = await capture(
       i.command,
       [
@@ -142,7 +214,7 @@ export async function checkAuth(agent: AgentInfo): Promise<AgentInfo> {
           codex: ["login", "status"],
           claude: ["auth", "status", "--json"],
           devin: ["auth", "status"],
-        }[agent.id],
+        }[agent.id as "codex" | "claude" | "devin"],
       ],
       process.cwd(),
       15000,

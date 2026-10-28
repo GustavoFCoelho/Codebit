@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
 import { Channel } from "./protocol";
 import { nativeModels } from "./models";
-import { guidelinesText, stopWhenStuck } from "../extensions";
+import { guidelinesText, subagentInstructions } from "../extensions";
 import type {
   AgentEvent,
   AgentSession,
@@ -16,7 +16,7 @@ const modes = { plan: "plan", execute: "accept-edits", bypass: "bypass" };
 // Devin CLI 3000.10 starts MCP servers received over ACP but its MCP tools only
 // see servers from its own config files, so the Codebit tools are not offered.
 const instructions =
-  "Você está no Codebit. Responda em português do Brasil." + stopWhenStuck;
+  "Você está no Codebit. Responda em português do Brasil.";
 const imageTypes: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -150,6 +150,8 @@ export class DevinSession implements AgentSession {
     const u = p.update || {};
     if (u.sessionUpdate === "agent_message_chunk" && u.content?.type === "text")
       this.emit({ type: "text", text: u.content.text });
+    if (u.sessionUpdate === "agent_thought_chunk" && u.content?.type === "text")
+      this.emit({ type: "thought", text: u.content.text });
     if (u.sessionUpdate === "tool_call")
       this.emit({
         type: "activity",
@@ -193,8 +195,8 @@ export class DevinSession implements AgentSession {
       {
         type: "text",
         text: this.instructed
-          ? text
-          : `${instructions}${guidelinesText(this.guidelines)}\n\n${text}`,
+          ? `${subagentInstructions(this.mcp, false)}\n\n${text}`
+          : `${instructions}${guidelinesText(this.guidelines)}${subagentInstructions(this.mcp, false)}\n\n${text}`,
       },
     ];
     this.instructed = true;

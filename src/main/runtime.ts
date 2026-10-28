@@ -47,8 +47,7 @@ import {
   socialNetworkNames,
   subagentsFor,
 } from "../shared/types";
-import type { SocialPreview, WorkItem, WorkSettings } from "../shared/types";
-import { defaultWork, workStatus } from "../shared/types";
+import type { SocialPreview } from "../shared/types";
 import type { SocialService } from "./social";
 import type { SecretVault } from "./secrets";
 import { Store } from "./store";
@@ -56,6 +55,9 @@ import { discover, checkAuth, readVersion } from "./discovery";
 import { CodexSession } from "./agents/codex";
 import { ClaudeSession } from "./agents/claude";
 import { DevinSession } from "./agents/devin";
+import { DeepseekSession } from "./agents/deepseek";
+import { deepseekModels } from "./agents/deepseek-api";
+import { AntigravitySession, type HookDecision } from "./agents/antigravity";
 import { probeCommands, probeModels } from "./agents/catalog";
 import { probeQuota } from "./agents/quota";
 import { createWorktree, isGit, removeWorktree } from "./workspace";
@@ -88,6 +90,8 @@ export class Runtime {
     { taskId: string; resolve: (ok: boolean) => void }
   >();
   private sessions = new Map<string, AgentSession>();
+  // Tool hooks of open Antigravity sessions, by their bridge key.
+  private hooks = new Map<string, (input: any) => Promise<HookDecision>>();
   // Subagent approvals shown in the parent chat, by their chat request id.
   private subRequests = new Map<
     string,
@@ -106,6 +110,8 @@ export class Runtime {
     { at: number; list: Promise<AgentCommand[]> }
   >();
   private assistantIds = new Map<string, string>();
+  // The thought entry being written, per task.
+  private thoughtIds = new Map<string, string>();
   // Activity rows by tool call, so the call's outcome marks its row.
   private calls = new Map<string, Map<string, string>>();
   // Tasks whose turn ended while background work kept the session open.
@@ -131,10 +137,6 @@ export class Runtime {
   quietMs = 3000;
   private notifyTimer?: NodeJS.Timeout;
   private disposed = false;
-  // Board starts run one after another per project, so none starts twice.
-  private dispatching = new Map<string, Promise<unknown>>();
-  // Board tasks that failed in a row, per project; two pause the mode.
-  private workFailures = new Map<string, number>();
   private detection?: Promise<AgentInfo[]>;
   private versionCheck = 0;
   private catalogLoads = new WeakMap<AgentInfo, Promise<AgentInfo>>();
@@ -164,6 +166,11 @@ export class Runtime {
       (taskId, message) => emit({ type: "image-progress", taskId, message }),
       () => this.agents.find((a) => a.id === "codex")?.selected,
     );
+    // Plugins of Antigravity sessions from an earlier run.
+    void rm(join(store.root, "antigravity"), {
+      recursive: true,
+      force: true,
+    }).catch(() => {});
   }
   refresh(taskId?: string) {
     this.emit({ type: "refresh", taskId });
@@ -208,6 +215,16 @@ export class Runtime {
     await this.detect();
     return true;
   }
+  private deepseekKeyRevision = 0;
+  deepseekKeyChanged() {
+    this.deepseekKeyRevision++;
+    const current = this.agents.find((a) => a.id === "deepseek");
+    if (!current) return;
+    this.catalogLoads.delete(current);
+    current.models = [];
+    current.auth = "unknown";
+    void this.auth("deepseek").catch(() => {});
+  }
   async auth(id: string) {
     const current = this.agents.find((a) => a.id === id);
     if (!current) throw new Error("Agente não encontrado.");
@@ -216,9 +233,28 @@ export class Runtime {
     current.catalogStatus = "loading";
     current.catalogError = undefined;
     this.refresh();
-    const isCurrent = () => !this.disposed && this.agents.includes(current);
+    const revision = this.deepseekKeyRevision;
+    const isCurrent = () =>
+      !this.disposed &&
+      this.agents.includes(current) &&
+      (current.id !== "deepseek" || revision === this.deepseekKeyRevision);
     const load = (async () => {
       try {
+        if (current.id === "deepseek") {
+          const key =
+            this.secrets?.value("DEEPSEEK_API_KEY") ||
+            process.env.DEEPSEEK_API_KEY;
+          const models = await deepseekModels(key, this.catalogAbort.signal);
+          if (isCurrent())
+            Object.assign(current, {
+              auth: "ready",
+              authMessage:
+                "Chave validada pela API oficial do DeepSeek. Cobrança por consumo.",
+              models,
+              catalogStatus: "ready",
+            });
+          return current;
+        }
         const checked = await checkAuth(current);
         if (!isCurrent()) return current;
         Object.assign(current, checked);
@@ -238,11 +274,18 @@ export class Runtime {
         current.catalogStatus = "ready";
       } catch (e) {
         if (isCurrent()) {
+          if (current.id === "deepseek") {
+            current.auth = "error";
+            current.authMessage =
+              "Verifique DEEPSEEK_API_KEY e a conexão com a API.";
+            current.models = [];
+          }
           current.catalogStatus = "error";
           current.catalogError = (e as Error).message;
         }
       } finally {
-        this.catalogLoads.delete(current);
+        if (current.id !== "deepseek" || revision === this.deepseekKeyRevision)
+          this.catalogLoads.delete(current);
         if (isCurrent()) this.refresh();
       }
       return current;
@@ -313,11 +356,10 @@ export class Runtime {
     title: string;
     agent: AgentId;
     worktree?: boolean;
+    gamingBenchBatch?: Task["gamingBenchBatch"];
     parentId?: string;
     // An existing folder, for a saved prompt's run kept as a conversation.
     cwd?: string;
-    // The board task this internal session works on.
-    workItemId?: string;
   }) {
     const p = input.projectId
       ? this.store.get<Project>("project", input.projectId)
@@ -349,7 +391,7 @@ export class Runtime {
       updatedAt: now,
       images: { ...defaultImages },
       parentId: input.parentId,
-      workItemId: input.workItemId,
+      gamingBenchBatch: input.gamingBenchBatch,
     };
     this.store.put("task", task);
     this.refresh();
@@ -450,7 +492,9 @@ export class Runtime {
       .sort((a, b) => a.boardAt!.localeCompare(b.boardAt!))
       .map((task) => {
         const entries = this.store.entries(task.id);
-        const recent = entries.filter((e) => e.kind !== "request").slice(-8);
+        const recent = entries
+          .filter((e) => e.kind !== "request" && e.kind !== "thought")
+          .slice(-8);
         const image = recent.findLast((e) => e.kind === "image");
         return {
           task,
@@ -563,6 +607,7 @@ export class Runtime {
       if (steered) {
         this.resetGuard(taskId);
         this.assistantIds.delete(taskId);
+        this.thoughtIds.delete(taskId);
         this.entry(taskId, "user", item.text, {
           attachments: item.attachments,
         });
@@ -697,24 +742,10 @@ export class Runtime {
       {
         codebit_images: this.bridgeConfig(task.id, "images"),
         ...(subagentsFor(task, this.store.settings()).enabled
-          ? {
-              codebit_agents: this.bridgeConfig(task.id, "agents", {
-                CODEBIT_SUBAGENTS: JSON.stringify(
-                  subagentsFor(task, this.store.settings()),
-                ),
-              }),
-            }
+          ? { codebit_agents: this.bridgeConfig(task.id, "agents") }
           : {}),
         ...(task.projectId && this.social?.accounts(task.projectId).length
           ? { codebit_social: this.bridgeConfig(task.id, "social") }
-          : {}),
-        // Every session of a project reaches its task board.
-        ...(task.projectId
-          ? {
-              codebit_tasks: this.bridgeConfig(task.id, "tasks", {
-                CODEBIT_TASK_ROLE: task.workItemId ? "board" : "chat",
-              }),
-            }
           : {}),
       },
       this.secrets?.env(task.agent),
@@ -733,31 +764,81 @@ export class Runtime {
     mcp: Record<string, any>,
     emit: (event: AgentEvent) => void,
   ): AgentSession {
-    return new sessionTypes[task.agent](
-      { ...installation, env: this.secrets?.env(task.agent) },
+    const guidelines = [
+      this.store.settings().guidelines,
+      this.secrets?.notes(task.agent),
+    ]
+      .filter((s) => s?.trim())
+      .join("\n\n");
+    const inspect = (command: string, asking: boolean, cwd?: string) =>
+      this.inspect(task, command, asking, cwd);
+    const i = { ...installation, env: this.secrets?.env(task.agent) };
+    if (task.agent === "deepseek")
+      return new DeepseekSession(
+        i,
+        task,
+        mcp,
+        emit,
+        guidelines,
+        inspect,
+        join(this.store.root, "deepseek", task.id),
+      );
+    if (task.agent !== "antigravity")
+      return new sessionTypes[task.agent](
+        i,
+        task,
+        mcp,
+        emit,
+        guidelines,
+        inspect,
+      );
+    // Its tool hook reaches the session through the bridge, by a key of its
+    // own: sub-agents and quick chats are not among the task sessions.
+    const key = randomUUID();
+    const session = new AntigravitySession(
+      i,
       task,
       mcp,
       emit,
-      [this.store.settings().guidelines, this.secrets?.notes(task.agent)]
-        .filter((s) => s?.trim())
-        .join("\n\n"),
-      (command, asking, cwd) => this.inspect(task, command, asking, cwd),
+      guidelines,
+      inspect,
+      {
+        dir: join(this.store.root, "antigravity", key),
+        hook: this.bridgeConfig(key, "hook"),
+        release: () => {
+          this.hooks.delete(key);
+          this.revokeBridge(key);
+        },
+      },
     );
+    this.hooks.set(key, (input) => session.hook(input));
+    return session;
+  }
+  // Antigravity asks before a gated tool runs; a closed session denies.
+  async hookTool(key: string, input: any): Promise<HookDecision> {
+    const hook = this.hooks.get(key);
+    return hook
+      ? hook(input)
+      : { decision: "deny", reason: "A sessão foi encerrada no Codebit." };
   }
   // What a command would delete. With an approval already on screen it is
-  // always shown; a command about to run on its own only stops when it goes
-  // beyond the user's limits, outside the task folder, or cannot be measured.
+  // always shown; a command about to run on its own only stops when it
+  // reaches files from before the conversation or uncommitted Git changes.
   private async inspect(
     task: Task,
     command: string,
     asking: boolean,
     cwd?: string,
   ) {
-    const preview = await blastRadius(command, cwd || task.cwd);
+    const preview = await blastRadius(
+      command,
+      cwd || task.cwd,
+      Date.parse(task.createdAt) || Date.now(),
+    );
     if (!preview) return;
     if (asking) return meaningful(preview) ? preview : undefined;
     const guard = this.store.settings().deleteGuard ?? defaultDeleteGuard;
-    return guard.enabled && risky(preview, guard) ? preview : undefined;
+    return guard.enabled && risky(preview) ? preview : undefined;
   }
   private redact(text: string) {
     return this.secrets ? this.secrets.redact(text) : text;
@@ -844,9 +925,32 @@ export class Runtime {
     }
     if (event.type === "turn") {
       this.assistantIds.delete(taskId);
+      this.thoughtIds.delete(taskId);
+      return;
+    }
+    if (event.type === "thought") {
+      // A thought between two parts of the reply splits the reply.
+      this.assistantIds.delete(taskId);
+      let id = this.thoughtIds.get(taskId);
+      if (!id) {
+        if (!event.text.trim()) return;
+        id = this.entry(taskId, "thought", "", {
+          agent: this.task(taskId).agent,
+        }).id;
+        this.thoughtIds.set(taskId, id);
+      }
+      const entry = this.store.get<Entry>("entry", id);
+      entry.text = this.redact(entry.text + event.text);
+      this.store.put("entry", entry);
+      if (!this.notifyTimer)
+        this.notifyTimer = setTimeout(() => {
+          this.notifyTimer = undefined;
+          this.refresh(taskId);
+        }, 60);
       return;
     }
     if (event.type === "text") {
+      this.thoughtIds.delete(taskId);
       let id = this.assistantIds.get(taskId);
       if (!id) {
         id = this.entry(taskId, "assistant", "", {
@@ -865,6 +969,7 @@ export class Runtime {
         }, 60);
     } else if (event.type === "activity") {
       this.assistantIds.delete(taskId);
+      this.thoughtIds.delete(taskId);
       const row = this.entry(taskId, "activity", event.text);
       this.trackCall(taskId, event.id, row.id);
       this.trackEdits(taskId, event.files);
@@ -888,10 +993,15 @@ export class Runtime {
       this.finish(taskId, "failed");
     } else if (event.type === "done") {
       // Codex and Devin answer plan mode in the chat: that answer is the
-      // plan. Claude hands its plan over with ExitPlanMode instead.
+      // plan. Claude hands its plan over with ExitPlanMode instead, and
+      // Antigravity's session sends the file it wrote.
       const t = this.task(taskId);
       const reply = this.assistantIds.get(taskId);
-      if (t.mode === "plan" && t.agent !== "claude" && reply) {
+      if (
+        t.mode === "plan" &&
+        !["claude", "antigravity"].includes(t.agent) &&
+        reply
+      ) {
         const text = this.store.get<Entry>("entry", reply).text;
         if (text.trim()) void this.savePlan(taskId, text);
       }
@@ -1014,6 +1124,7 @@ export class Runtime {
   private park(id: string) {
     this.parked.add(id);
     this.assistantIds.delete(id);
+    this.thoughtIds.delete(id);
     this.updateTask(id, { status: "idle" });
     this.sendNext(id);
   }
@@ -1066,6 +1177,7 @@ export class Runtime {
     this.subagents.delete(id);
     this.slots.delete(id);
     this.assistantIds.delete(id);
+    this.thoughtIds.delete(id);
     this.calls.delete(id);
     this.revokeBridge(id);
     for (const [key, pending] of this.socialRequests)
@@ -1079,32 +1191,22 @@ export class Runtime {
     this.updateTask(id, { status, background: undefined });
     // After a failure or interruption the queue waits for the user.
     if (status === "idle") this.sendNext(id);
-    const board = this.task(id).workItemId ? this.task(id) : undefined;
     // A queued message that went out keeps the task working: no notice yet.
-    if (status === "failed")
-      this.notify(
-        id,
-        board
-          ? `A tarefa do quadro falhou: ${board.title}`
-          : "A execução falhou.",
-        "failed",
-      );
+    if (status === "failed") this.notify(id, "A execução falhou.", "failed");
     if (status === "idle" && this.task(id).status === "idle")
       this.notify(
         id,
-        board
-          ? `Tarefa do quadro concluída: ${board.title}`
-          : `${agentNames[this.task(id).agent]} terminou.`,
+        `${agentNames[this.task(id).agent]} terminou.`,
         "completed",
       );
-    if (board) this.workFinished(board.projectId, status);
     void this.checkVersions().catch(() => {});
   }
   // Removes a project from Codebit with everything Codebit keeps for it:
-  // conversations, board, saved prompts and social accounts. The project
+  // conversations, saved prompts and social accounts. The project
   // folder is never touched; worktrees made by Codebit only when asked.
   async deleteProject(projectId: string, removeWorktrees = false) {
-    const project = this.store.get<Project>("project", projectId);
+    // Throws for a project that does not exist.
+    this.store.get<Project>("project", projectId);
     const tasks = this.store
       .all<Task>("task")
       .filter((t) => t.projectId === projectId);
@@ -1117,16 +1219,9 @@ export class Runtime {
       )
     )
       throw new Error(
-        "Interrompa as conversas, as tarefas do quadro e os prompts deste projeto que estão trabalhando antes de removê-lo.",
+        "Interrompa as conversas e os prompts deste projeto que estão trabalhando antes de removê-lo.",
       );
-    // Nothing new starts on the board while it goes.
-    this.store.put("project", {
-      ...project,
-      work: { ...(project.work ?? defaultWork), enabled: false },
-    });
     for (const t of tasks) await this.deleteTask(t.id, removeWorktrees);
-    for (const item of this.workItems(projectId))
-      this.store.delete("work", item.id);
     for (const prompt of this.store.all<SavedPrompt>("prompt"))
       if (prompt.projectId === projectId)
         this.store.delete("prompt", prompt.id);
@@ -1140,8 +1235,6 @@ export class Runtime {
     // Finished saved-prompt runs could not become conversations anymore.
     for (const [id, q] of this.quick)
       if (q.run.projectId === projectId) await this.dismissQuick(id);
-    this.dispatching.delete(projectId);
-    this.workFailures.delete(projectId);
     this.store.delete("project", projectId);
     this.refresh();
   }
@@ -1174,8 +1267,6 @@ export class Runtime {
     )
       paths.push(task.cwd);
     this.images.cancel(id);
-    // A board task goes with its internal session.
-    if (task.workItemId) this.store.delete("work", task.workItemId);
     for (const e of this.store.entries(id)) this.store.delete("entry", e.id);
     for (const a of this.store.artifacts(id))
       this.store.delete("artifact", a.id);
@@ -1183,6 +1274,7 @@ export class Runtime {
     this.guards.delete(id);
     this.calls.delete(id);
     this.assistantIds.delete(id);
+    this.thoughtIds.delete(id);
     this.revokeBridge(id);
     await Promise.all(
       paths.map((p) =>
@@ -1260,20 +1352,7 @@ export class Runtime {
     this.entry(taskId, "image", prompt, { artifactId: artifact.id });
     return artifact;
   }
-  // The project's task board.
-  workItems(projectId: string) {
-    return this.store
-      .all<WorkItem>("work")
-      .filter((i) => i.projectId === projectId)
-      .sort((a, b) => a.order - b.order);
-  }
-  private workItem(id: string) {
-    return this.store.get<WorkItem>("work", id);
-  }
-  private saveWork(item: WorkItem) {
-    this.store.put("work", { ...item, updatedAt: new Date().toISOString() });
-    this.refresh();
-  }
+  // Whether a task is working or has background work.
   private busyTask(taskId?: string) {
     if (!taskId) return false;
     try {
@@ -1284,295 +1363,6 @@ export class Runtime {
     } catch {
       return false;
     }
-  }
-  private nextOrder(projectId: string, first = false) {
-    const orders = this.workItems(projectId).map((i) => i.order);
-    return first ? Math.min(0, ...orders) - 1 : Math.max(0, ...orders) + 1;
-  }
-  // The user's tasks wait to start; the AI's wait for approval.
-  addWork(
-    projectId: string,
-    input: { title: string; description?: string },
-    meta: {
-      origin?: "user" | "ai";
-      sourceId?: string;
-      chatId?: string;
-    } = {},
-  ) {
-    const origin = meta.origin ?? "user";
-    const project = this.store.get<Project>("project", projectId);
-    const title = input.title.trim();
-    if (!title) throw new Error("Dê um título à tarefa.");
-    const now = new Date().toISOString();
-    const item: WorkItem = {
-      id: randomUUID(),
-      projectId: project.id,
-      title: title.slice(0, 200),
-      description: (input.description ?? "").trim().slice(0, 20000),
-      origin,
-      state: origin === "ai" ? "pending" : "todo",
-      order: this.nextOrder(project.id),
-      sourceId: meta.sourceId,
-      chatId: meta.chatId,
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.store.put("work", item);
-    this.refresh();
-    if (item.state === "todo") void this.dispatchWork(project.id);
-    return item;
-  }
-  editWork(id: string, patch: { title?: string; description?: string }) {
-    const item = this.workItem(id);
-    const title = patch.title?.trim();
-    if (patch.title !== undefined && !title)
-      throw new Error("Dê um título à tarefa.");
-    this.saveWork({
-      ...item,
-      title: title?.slice(0, 200) ?? item.title,
-      description:
-        patch.description?.trim().slice(0, 20000) ?? item.description,
-    });
-    return this.workItem(id);
-  }
-  approveWork(id: string) {
-    const item = this.workItem(id);
-    if (item.state !== "pending") return item;
-    this.saveWork({
-      ...item,
-      state: "todo",
-      order: this.nextOrder(item.projectId),
-      approvedAt: new Date().toISOString(),
-    });
-    void this.dispatchWork(item.projectId);
-    return this.workItem(id);
-  }
-  // Moves a waiting task up or down the line.
-  moveWork(id: string, direction: -1 | 1) {
-    const item = this.workItem(id);
-    const line = this.workItems(item.projectId).filter(
-      (i) => i.state === item.state,
-    );
-    const at = line.findIndex((i) => i.id === id);
-    const other = line[at + direction];
-    if (!other) return;
-    this.store.put("work", { ...item, order: other.order });
-    this.saveWork({ ...other, order: item.order });
-  }
-  async deleteWork(id: string) {
-    const item = this.workItem(id);
-    if (this.busyTask(item.taskId))
-      throw new Error("Interrompa a tarefa antes de excluí-la.");
-    if (
-      item.taskId &&
-      this.store.all<Task>("task").some((t) => t.id === item.taskId)
-    )
-      await this.deleteTask(item.taskId);
-    this.store.delete("work", id);
-    this.refresh();
-  }
-  // Back to the front of the line; it resumes in the same session.
-  retryWork(id: string) {
-    const item = this.workItem(id);
-    if (this.busyTask(item.taskId))
-      throw new Error("Esta tarefa já está em andamento.");
-    this.saveWork({
-      ...item,
-      state: "todo",
-      order: this.nextOrder(item.projectId, true),
-    });
-    void this.dispatchWork(item.projectId);
-    return this.workItem(id);
-  }
-  // Changes only the given settings, so quick successive changes add up.
-  setWork(projectId: string, patch: Partial<WorkSettings>) {
-    const project = this.store.get<Project>("project", projectId);
-    const work = { ...(project.work ?? defaultWork), ...patch };
-    if (work.enabled && !project.trusted)
-      throw new Error("Confie no projeto antes de ligar o modo tarefas.");
-    const settings: WorkSettings = {
-      ...work,
-      max: Math.min(4, Math.max(1, Math.round(work.max) || 1)),
-    };
-    this.store.put("project", { ...project, work: settings });
-    if (settings.enabled && !project.work?.enabled)
-      this.workFailures.delete(projectId);
-    this.refresh();
-    if (settings.enabled) void this.dispatchWork(projectId);
-    return settings;
-  }
-  // Starts a task now, even with the mode off.
-  startWork(id: string) {
-    const item = this.workItem(id);
-    return this.chain(item.projectId, () => this.launchWork(id));
-  }
-  dispatchAll() {
-    for (const p of this.store.all<Project>("project"))
-      if (p.work?.enabled) void this.dispatchWork(p.id);
-  }
-  // With the mode on, fills the free places with the next tasks in line.
-  dispatchWork(projectId: string) {
-    return this.chain(projectId, async () => {
-      const project = this.store
-        .all<Project>("project")
-        .find((p) => p.id === projectId);
-      const work = project?.work;
-      if (this.disposed || !project?.trusted || !work?.enabled) return;
-      const items = this.workItems(projectId);
-      let free = work.max - items.filter((i) => this.busyTask(i.taskId)).length;
-      for (const item of items.filter((i) => i.state === "todo")) {
-        if (free-- <= 0) break;
-        await this.launchWork(item.id);
-      }
-    });
-  }
-  private chain<T>(projectId: string, work: () => Promise<T>): Promise<T> {
-    const next = (this.dispatching.get(projectId) ?? Promise.resolve()).then(
-      work,
-      work,
-    );
-    this.dispatching.set(
-      projectId,
-      next.catch(() => {}),
-    );
-    return next;
-  }
-  private async launchWork(id: string) {
-    const item = this.workItem(id);
-    if (item.state === "pending")
-      throw new Error("Aprove a recomendação antes de executá-la.");
-    if (this.busyTask(item.taskId))
-      throw new Error("Esta tarefa já está em andamento.");
-    const project = this.store.get<Project>("project", item.projectId);
-    if (!project.trusted)
-      throw new Error("Confie no projeto antes de executar tarefas nele.");
-    const work = project.work ?? defaultWork;
-    const existing = this.store
-      .all<Task>("task")
-      .find((t) => t.id === item.taskId);
-    let task = existing;
-    if (!task) {
-      task = await this.createTask({
-        projectId: project.id,
-        title: item.title,
-        agent: work.agent,
-        workItemId: item.id,
-      });
-      const settings = { model: work.model || task.model, mode: work.mode };
-      try {
-        task = this.updateTask(task.id, { ...settings, effort: work.effort });
-      } catch {
-        task = this.updateTask(task.id, settings);
-      }
-    }
-    this.saveWork({ ...item, state: "started", taskId: task.id });
-    const text = existing
-      ? "Retome esta tarefa do quadro de onde parou. Se ela já estiver concluída, confirme com um resumo curto do que foi feito."
-      : [
-          `Tarefa do quadro do projeto ${project.name}: ${item.title}`,
-          item.description,
-          "Trabalhe nesta tarefa até concluí-la. Ao terminar, responda com um resumo curto do que foi feito e de como conferir.",
-        ]
-          .filter(Boolean)
-          .join("\n\n");
-    try {
-      await this.send(task.id, text);
-    } catch (e) {
-      // The reason stays in the session; the mode stops so the next tasks
-      // do not fail the same way.
-      this.entry(task.id, "error", (e as Error).message);
-      this.updateTask(task.id, { status: "failed" });
-      this.pauseWork(
-        project.id,
-        `não foi possível iniciar "${item.title}": ${(e as Error).message}`,
-      );
-      throw e;
-    }
-  }
-  private workFinished(projectId: string, status: Task["status"]) {
-    const failures =
-      status === "failed" ? (this.workFailures.get(projectId) ?? 0) + 1 : 0;
-    this.workFailures.set(projectId, failures);
-    if (failures >= 2)
-      this.pauseWork(projectId, "duas tarefas seguidas falharam");
-    else void this.dispatchWork(projectId);
-  }
-  private pauseWork(projectId: string, reason: string) {
-    const project = this.store.get<Project>("project", projectId);
-    if (!project.work?.enabled) return;
-    this.store.put("project", {
-      ...project,
-      work: { ...project.work, enabled: false },
-    });
-    this.workFailures.delete(projectId);
-    this.refresh();
-    this.attention?.({
-      title: "Modo tarefas pausado",
-      body: `${project.name}: ${reason}. Confira e ligue de novo no quadro.`,
-    });
-  }
-  // codebit_tasks, the channel from a project's sessions to its board. What
-  // the user asked for goes to "todo"; the agent's own ideas wait for
-  // approval, like the follow-ups of board sessions.
-  tasksTool(
-    taskId: string,
-    call: {
-      tool: string;
-      args?: {
-        tasks?: { title: string; description?: string }[];
-        requested_by_user?: boolean;
-      };
-    },
-  ) {
-    const task = this.task(taskId);
-    if (!task.projectId)
-      throw new Error(
-        "Esta conversa não tem projeto; o quadro de tarefas é de cada projeto.",
-      );
-    const reply = (text: string) => ({ content: [{ type: "text", text }] });
-    const items = this.workItems(task.projectId);
-    if (call.tool === "list_tasks") {
-      const tasks = new Map(this.store.all<Task>("task").map((t) => [t.id, t]));
-      return reply(
-        JSON.stringify(
-          items.slice(-100).map((i) => ({
-            title: i.title,
-            status: workStatus(i, i.taskId ? tasks.get(i.taskId) : undefined),
-            origin: i.origin,
-            description: i.description.slice(0, 300),
-          })),
-        ),
-      );
-    }
-    const list = call.args?.tasks ?? [];
-    const requested = call.args?.requested_by_user === true;
-    const pending = items.filter((i) => i.state === "pending").length;
-    if (!requested && pending + list.length > 50)
-      throw new Error(
-        "Já há muitas sugestões esperando aprovação neste projeto. Não sugira mais agora.",
-      );
-    const created = list.map((t) =>
-      this.addWork(task.projectId, t, {
-        origin: requested ? "user" : "ai",
-        sourceId: task.workItemId,
-        chatId: task.workItemId ? undefined : task.id,
-      }),
-    );
-    const titles = created.map((c) => c.title).join("; ");
-    const count =
-      created.length === 1 ? "1 tarefa" : `${created.length} tarefas`;
-    this.entry(
-      taskId,
-      "activity",
-      requested
-        ? `Quadro · ${count} em A fazer: ${titles}`
-        : `Quadro · ${count} ${created.length === 1 ? "sugerida, pendente" : "sugeridas, pendentes"} de aprovação: ${titles}`,
-    );
-    return reply(
-      requested
-        ? `Adicionadas ao quadro, em "A fazer": ${titles}.${this.store.get<Project>("project", task.projectId).work?.enabled ? " O modo tarefas está ligado: agentes vão começar nelas pela fila." : " O modo tarefas está desligado: elas esperam até o usuário ligar ou executar."} Não trabalhe nelas nesta conversa.`
-        : `Registradas como sugestões, pendentes de aprovação do usuário: ${titles}. Não trabalhe nelas agora.`,
-    );
   }
   // The codebit_social tools. Every post shows its exact preview in the chat
   // and waits for the user, even in Bypass.
@@ -1605,7 +1395,7 @@ export class Runtime {
     if (task.mode === "plan")
       throw new Error("Publicar está desabilitado no modo Planejar.");
     const args = call.args ?? {};
-    const network = call.tool === "patreon_publish" ? "patreon" : "instagram";
+    const network = call.tool === "patreon_publish" ? "patreon" : call.tool === "linkedin_publish" ? "linkedin" : "instagram";
     const account = this.social.account(task.projectId, network);
     if (!account)
       throw new Error(
@@ -1614,7 +1404,7 @@ export class Runtime {
     const images = await this.socialImages(
       task,
       args.images ?? [],
-      network === "instagram" ? ["png", "jpg", "jpeg"] : undefined,
+      network === "instagram" || network === "linkedin" ? ["png", "jpg", "jpeg"] : undefined,
     );
     const postId = randomUUID();
     if (network === "instagram") {
@@ -1678,6 +1468,40 @@ export class Runtime {
         url: result.url,
         mediaId: result.mediaId,
       });
+    }
+    if (network === "linkedin") {
+      const text = String(args.text ?? "").trim();
+      if (!text || text.length > 3000)
+        throw new Error("Informe um texto para o post do LinkedIn, com até 3.000 caracteres.");
+      if (images.length > 1)
+        throw new Error("O post do LinkedIn aceita no máximo uma imagem nesta integração.");
+      const accepted = await this.askToPublish(taskId, {
+        network,
+        account: account.name,
+        images,
+        text,
+      });
+      if (!accepted)
+        return reply("O usuário recusou a publicação. Não publique de outra forma; pergunte o que ele quer ajustar.");
+      this.entry(taskId, "activity", `LinkedIn · publicando no perfil de ${account.name}…`);
+      const result = await this.social.publishLinkedIn(account, {
+        text,
+        image: images[0],
+        altText: args.alt_text ? String(args.alt_text).slice(0, 1000) : undefined,
+      });
+      this.social.record({
+        id: postId,
+        projectId: task.projectId,
+        taskId,
+        network,
+        accountId: account.id,
+        url: result.url,
+        mediaId: result.id,
+        text,
+        images,
+      });
+      this.entry(taskId, "activity", `LinkedIn · publicado · ${result.url}`);
+      return reply({ published: true, url: result.url, postId: result.id });
     }
     const title = String(args.title ?? "").trim();
     const text = String(args.text ?? "").trim();
@@ -1893,6 +1717,7 @@ export class Runtime {
     this.store.put("artifact", artifact);
     // Text after the image starts a new message below it.
     this.assistantIds.delete(taskId);
+    this.thoughtIds.delete(taskId);
     this.entry(taskId, "image", image.prompt, { artifactId: artifact.id });
   }
   async quota(agentId: AgentId, refresh = false) {

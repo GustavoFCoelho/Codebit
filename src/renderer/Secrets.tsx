@@ -54,7 +54,7 @@ export function SecretsSettings({
           <p className="help">
             Chaves de API e outros valores sensíveis que todas as sessões dos
             agentes recebem como variáveis de ambiente, inclusive sub-agentes,
-            chat rápido, quadro de tarefas e o terminal do painel. O agente
+            chat rápido e o terminal do painel. O agente
             conhece só o nome e a descrição; usa o valor pela variável, como{" "}
             <code>$env:NOME</code>.
           </p>

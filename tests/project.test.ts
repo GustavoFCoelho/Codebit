@@ -76,13 +76,6 @@ describe("remover projeto", () => {
     });
     await s.rt.send(chat.id, "Oi");
     await eventually(() => s.rt.task(chat.id).status === "idle");
-    const item = s.rt.addWork("p1", { title: "Uma tarefa" });
-    await s.rt.startWork(item.id);
-    await eventually(
-      () =>
-        s.rt.task(s.store.get<any>("work", item.id).taskId).status === "idle",
-    );
-    s.rt.addWork("p1", { title: "Na fila" });
     const local = s.rt.savePrompt({
       name: "Do projeto",
       text: "x",
@@ -111,7 +104,6 @@ describe("remover projeto", () => {
     expect(s.store.all("project")).toEqual([]);
     expect(s.store.all("task")).toEqual([]);
     expect(s.store.entries(chat.id)).toEqual([]);
-    expect(s.store.all("work")).toEqual([]);
     expect(s.store.all("post")).toEqual([]);
     expect(s.store.all<any>("prompt").map((p) => p.id)).toEqual([global.id]);
     expect(s.store.all<any>("prompt").some((p) => p.id === local.id)).toBe(

@@ -3,6 +3,7 @@ import { Channel } from "./protocol";
 import { nativeModels } from "./models";
 import { capture } from "../process";
 import { appVersion } from "../../shared/types";
+import { deepseekModels } from "./deepseek-api";
 // Short-lived CLI process used only to query catalogs, without a conversation.
 async function probe<T>(
   installation: Installation,
@@ -68,12 +69,39 @@ async function devin(installation: Installation, cwd: string, args: string[]) {
     throw new Error(r.stderr.trim() || "O Devin CLI não respondeu.");
   return r.stdout;
 }
+// `agy models` prints one "id<TAB>name" line per model; the effort is part of
+// each variant, as in Gemini 4 Argon (High).
+export function antigravityModels(text: string): Model[] {
+  return nativeModels(
+    "antigravity",
+    [...text.matchAll(/^(\S+)\t(.+)$/gm)].map(([, value, name]) => ({
+      value,
+      name: name.trim(),
+    })),
+  );
+}
 export async function probeModels(
   installation: Installation,
   cwd: string,
   signal?: AbortSignal,
 ): Promise<Model[]> {
   signal?.throwIfAborted();
+  if (installation.agent === "deepseek")
+    return deepseekModels(
+      installation.env?.DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY,
+      signal,
+    );
+  if (installation.agent === "antigravity") {
+    const r = await capture(
+      installation.command,
+      [...installation.args, "models"],
+      cwd,
+      30000,
+    );
+    if (r.code !== 0)
+      throw new Error(r.stderr.trim() || "O Antigravity CLI não respondeu.");
+    return antigravityModels(r.stdout);
+  }
   // Opening an ACP session would start MCP servers; the CLI lists models directly.
   if (installation.agent === "devin")
     return nativeModels(
@@ -136,6 +164,8 @@ export async function probeCommands(
   installation: Installation,
   cwd: string,
 ): Promise<AgentCommand[]> {
+  // Its slash commands only work in the terminal.
+  if (["antigravity", "deepseek"].includes(installation.agent)) return [];
   if (installation.agent === "devin") {
     // Lines look like "  /name [user] (path) - description"; skills without
     // the slash can only be triggered by the model.

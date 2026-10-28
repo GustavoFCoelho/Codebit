@@ -45,7 +45,6 @@ import type {
   Settings,
   SocialPost,
   Task,
-  WorkItem,
 } from "../shared/types";
 protocol.registerSchemesAsPrivileged([
   {
@@ -76,7 +75,7 @@ const notices = new Set<Notification>();
 const appId = "local.codebit.desktop";
 const terminalBuffers = new Map<string, string>();
 const id = z.string().min(1).max(500);
-const agent = z.enum(["codex", "claude", "devin"]);
+const agent = z.enum(["codex", "claude", "devin", "antigravity", "deepseek"]);
 const imageProvider = z.enum(["codex", "openai", "comfyui"]);
 const imageOptions = z.object({
   provider: imageProvider,
@@ -110,18 +109,29 @@ const settingsSchema = z.object({
     codex: z.string().optional(),
     claude: z.string().optional(),
     devin: z.string().optional(),
+    antigravity: z.string().optional(),
+    deepseek: z.string().optional(),
   }),
   comfyUrl: z.url().refine((v) => /^https?:\/\//.test(v), "Use HTTP ou HTTPS."),
   defaultModels: z.object({
     codex: z.string(),
     claude: z.string(),
     devin: z.string().default(""),
+    antigravity: z.string().default(""),
+    deepseek: z.string().default("deepseek-flash"),
   }),
   mcp: z.array(
     z.object({
       id,
       name: z.string().min(1).max(100),
-      agent: z.enum(["codex", "claude", "devin", "both"]),
+      agent: z.enum([
+        "codex",
+        "claude",
+        "devin",
+        "antigravity",
+        "deepseek",
+        "both",
+      ]),
       enabled: z.boolean(),
       transport: z.enum(["stdio", "http"]),
       command: z.string().optional(),
@@ -144,13 +154,13 @@ const settingsSchema = z.object({
       failures: z.number().int().min(2).max(50),
     })
     .optional(),
-  deleteGuard: z
-    .object({
-      enabled: z.boolean(),
-      files: z.number().int().min(1).max(1_000_000),
-      megabytes: z.number().min(1).max(10_000_000),
-    })
-    .optional(),
+  deleteGuard: z.object({ enabled: z.boolean() }).optional(),
+  gamingBenchPrompts: z.array(z.object({
+    id: z.string().min(1).max(100),
+    category: z.enum(["frontier", "mid", "economic"]),
+    name: z.string().trim().min(1).max(120),
+    prompt: z.string().trim().min(1).max(20000),
+  })).max(200).optional(),
 });
 function emit(event: AppEvent) {
   if (event.type === "task-signal") voice?.signal(event.signal);
@@ -303,6 +313,14 @@ async function handle(method: string, args: any = {}) {
       runtime.refresh();
       return p;
     }
+    case "project.hide": {
+      const a = z.object({ id, hidden: z.boolean() }).parse(args);
+      const p = store.get<Project>("project", a.id);
+      p.hidden = a.hidden;
+      store.put("project", p);
+      runtime.refresh();
+      return p;
+    }
     // Forgets a project in Codebit; its folder on disk stays as it is.
     case "project.delete": {
       const a = z.object({ id, worktrees: z.boolean().optional() }).parse(args);
@@ -324,7 +342,6 @@ async function handle(method: string, args: any = {}) {
         });
         Menu.buildFromTemplate([
           item("Nova tarefa", "new"),
-          item("Quadro de tarefas", "board"),
           item("Abrir a pasta", "folder"),
           { type: "separator" },
           item("Remover do Codebit…", "delete"),
@@ -348,6 +365,12 @@ async function handle(method: string, args: any = {}) {
             title: z.string().max(150),
             agent,
             worktree: z.boolean().optional(),
+            gamingBenchBatch: z.object({
+              id: z.string().min(1).max(100),
+              title: z.string().min(1).max(200),
+              category: z.string().min(1).max(120),
+              createdAt: z.string().datetime(),
+            }).optional(),
           })
           .parse(args),
       );
@@ -556,74 +579,6 @@ async function handle(method: string, args: any = {}) {
         });
       });
     }
-    case "work.add": {
-      const a = z
-        .object({
-          projectId: id,
-          title: z.string().min(1).max(200),
-          description: z.string().max(20000).optional(),
-        })
-        .parse(args);
-      return runtime.addWork(a.projectId, a);
-    }
-    case "work.edit": {
-      const a = z
-        .object({
-          id,
-          title: z.string().max(200).optional(),
-          description: z.string().max(20000).optional(),
-        })
-        .parse(args);
-      return runtime.editWork(a.id, a);
-    }
-    case "work.approve":
-      return runtime.approveWork(id.parse(args.id));
-    case "work.approveAll": {
-      const projectId = id.parse(args.projectId);
-      for (const item of runtime.workItems(projectId))
-        if (item.state === "pending") runtime.approveWork(item.id);
-      return;
-    }
-    case "work.move": {
-      const a = z
-        .object({ id, direction: z.union([z.literal(-1), z.literal(1)]) })
-        .parse(args);
-      runtime.moveWork(a.id, a.direction);
-      return;
-    }
-    case "work.delete": {
-      const itemId = id.parse(args.id);
-      const taskId = store.get<WorkItem>("work", itemId).taskId;
-      if (taskId) {
-        terminals.get(taskId)?.kill();
-        terminals.delete(taskId);
-      }
-      await runtime.deleteWork(itemId);
-      return;
-    }
-    case "work.start":
-      await runtime.startWork(id.parse(args.id));
-      return;
-    case "work.retry":
-      return runtime.retryWork(id.parse(args.id));
-    case "work.settings": {
-      const a = z
-        .object({
-          projectId: id,
-          settings: z
-            .object({
-              enabled: z.boolean(),
-              agent,
-              model: z.string().max(200),
-              effort: z.string().max(50),
-              mode: z.enum(["execute", "bypass"]),
-              max: z.number().int().min(1).max(4),
-            })
-            .partial(),
-        })
-        .parse(args);
-      return runtime.setWork(a.projectId, a.settings);
-    }
     case "social.state": {
       const projectId = id.parse(args.projectId);
       return {
@@ -638,6 +593,15 @@ async function handle(method: string, args: any = {}) {
         .parse(args);
       store.get<Project>("project", a.projectId);
       const account = await social.connectInstagram(a.projectId, a.token);
+      runtime.refresh();
+      return account;
+    }
+    case "social.linkedin": {
+      const a = z
+        .object({ projectId: id, token: z.string().min(1).max(4000) })
+        .parse(args);
+      store.get<Project>("project", a.projectId);
+      const account = await social.connectLinkedIn(a.projectId, a.token);
       runtime.refresh();
       return account;
     }
@@ -677,7 +641,8 @@ async function handle(method: string, args: any = {}) {
       const post = store.get<SocialPost>("post", id.parse(args.id));
       if (
         post.url &&
-        /^https:[/][/](www[.])?(instagram|patreon)[.]com[/]/.test(post.url)
+        (/^https:[/][/](www[.])?(instagram|patreon)[.]com[/]/.test(post.url) ||
+          /^https:[/][/](www[.])?linkedin[.]com[/]/.test(post.url))
       )
         await shell.openExternal(post.url);
       return;
@@ -758,6 +723,7 @@ async function handle(method: string, args: any = {}) {
       return runtime.detect();
     }
     case "secrets.save": {
+      const previous = runtime.secrets!.list().find((s) => s.id === args.id);
       const secret = runtime.secrets!.save(
         z
           .object({
@@ -768,13 +734,21 @@ async function handle(method: string, args: any = {}) {
           })
           .parse(args),
       );
+      if (
+        secret.name === "DEEPSEEK_API_KEY" ||
+        previous?.name === "DEEPSEEK_API_KEY"
+      )
+        runtime.deepseekKeyChanged();
       runtime.refresh();
       return secret;
     }
-    case "secrets.delete":
+    case "secrets.delete": {
+      const previous = runtime.secrets!.list().find((s) => s.id === args.id);
       runtime.secrets!.delete(id.parse(args.id));
+      if (previous?.name === "DEEPSEEK_API_KEY") runtime.deepseekKeyChanged();
       runtime.refresh();
       return;
+    }
     case "settings.key": {
       const value = z.string().max(1000).parse(args.key).trim();
       if (value && !safeStorage.isEncryptionAvailable())
@@ -1237,14 +1211,9 @@ void (previous ? waitForExit(previous) : Promise.resolve()).then(() => {
     if (process.env.CODEBIT_DEV_URL)
       await win.loadURL(process.env.CODEBIT_DEV_URL);
     else await win.loadFile(join(__dirname, "../renderer/index.html"));
-    // Projects with the task board on pick up their line once the CLIs
-    // are known.
-    void runtime
-      .detect()
-      .then(() => runtime.dispatchAll())
-      .catch((e) => {
-        console.error("Falha na descoberta:", e.message);
-      });
+    void runtime.detect().catch((e) => {
+      console.error("Falha na descoberta:", e.message);
+    });
     updater.start();
     // Opened from the project folder (npm start or the desktop shortcut):
     // builds itself when src changes. Tests opt in with CODEBIT_SOURCE_ROOT.

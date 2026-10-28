@@ -27,6 +27,14 @@
   background: var(--devin-bg);
   color: var(--devin);
 }
+.agent-mark.deepseek {
+  background: var(--deepseek-bg);
+  color: var(--deepseek);
+}
+.agent-mark.antigravity {
+  background: var(--antigravity-bg);
+  color: var(--antigravity);
+}
 .badge.agent-badge {
   gap: 5px;
   padding-left: 3px;

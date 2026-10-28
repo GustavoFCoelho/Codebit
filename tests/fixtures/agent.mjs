@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline";
-import { readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 const dialect = process.argv[2];
 const png =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a8uoAAAAASUVORK5CYII=";
@@ -16,8 +16,10 @@ let permissionMode = null;
 // NOCONTEXT plays a Claude Code without get_context_usage.
 let noContext = false;
 // PreToolUse hooks registered by the client; DELETE:<command> asks them about
-// a Bash command before "running" it.
+// a Bash command before "running" it. DELETEASK:<command> then asks for
+// permission too, as Claude Code can after a hook allows.
 let hookIds = [];
+let askAfterHook = "";
 const out = (value) => process.stdout.write(JSON.stringify(value) + "\n");
 // Markers in the prompt: MODE reports permission settings, ECHO returns the
 // prompt, GUIDE returns the system instructions, SLOW delays the answer, HOLD
@@ -99,6 +101,25 @@ if (process.argv[3] === "--version") {
   process.stdout.write(process.env.CODEBIT_FIXTURE_VERSION ?? "fixture");
   process.exit(0);
 }
+if (dialect === "antigravity" && process.argv.includes("models")) {
+  if (process.argv.includes("--fixture-models-error")) {
+    process.stderr.write("Entre com a sua conta Google.");
+    process.exit(3);
+  }
+  process.stdout.write(
+    [
+      "Fetching available models...",
+      ...(process.argv.includes("--fixture-models-empty")
+        ? []
+        : [
+            "gemini-4-argon-medium\tGemini 4 Argon (Medium)",
+            "claude-opus-5-5-low\tClaude Opus 5.5 (Low)",
+          ]),
+      "",
+    ].join("\r\n"),
+  );
+  process.exit(0);
+}
 if (dialect === "devin" && process.argv[3] === "models") {
   out({
     families: [
@@ -145,7 +166,17 @@ const devin = { mode: "accept-edits", model: "swe-2-high", prompt: null };
 const devinModels = [
   { id: "model", options: [{ value: "swe-2-high", name: "SWE-2 High" }] },
 ];
+// THINK in the prompt: the answer comes after a thought in two parts.
+let thinking = false;
 const devinFinish = () => {
+  if (thinking) {
+    thinking = false;
+    for (const text of ["Lendo o pedido.", "\n\nVou responder."])
+      devinUpdate({
+        sessionUpdate: "agent_thought_chunk",
+        content: { type: "text", text },
+      });
+  }
   devinUpdate({ sessionUpdate: "usage_update", used: 900, size: 262000 });
   out({
     jsonrpc: "2.0",
@@ -167,7 +198,23 @@ const devinUpdate = (update) =>
     params: { sessionId: "native-devin", update },
   });
 const finish = () => {
+  const thought = thinking;
+  thinking = false;
   if (dialect === "codex") {
+    if (thought) {
+      out({
+        method: "item/reasoning/summaryTextDelta",
+        params: { itemId: "r1", summaryIndex: 0, delta: "**Lendo o pedido**" },
+      });
+      out({
+        method: "item/reasoning/summaryPartAdded",
+        params: { itemId: "r1", summaryIndex: 1 },
+      });
+      out({
+        method: "item/reasoning/summaryTextDelta",
+        params: { itemId: "r1", summaryIndex: 1, delta: "Vou responder." },
+      });
+    }
     out({
       method: "item/agentMessage/delta",
       params: { delta: responseText },
@@ -183,6 +230,16 @@ const finish = () => {
       params: { turn: { id: "turn-1", status: "completed" } },
     });
   } else {
+    // Claude also sends thinking blocks with no text; they show nothing.
+    if (thought)
+      for (const thinking of ["", "Lendo o pedido.", "\n\nVou responder."])
+        out({
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "thinking_delta", thinking },
+          },
+        });
     out({
       type: "stream_event",
       event: {
@@ -214,6 +271,217 @@ const finish = () => {
 };
 createInterface({ input: process.stdin }).on("line", (line) => {
   const m = JSON.parse(line);
+  if (dialect === "antigravity") {
+    if (m.event !== "user" || typeof m.message?.content !== "string") return;
+    const text = m.message.content;
+    const flag = (name) =>
+      process.argv.includes(name)
+        ? process.argv[process.argv.indexOf(name) + 1]
+        : undefined;
+    const conversation = process.argv.includes("--conversation")
+      ? flag("--conversation")
+      : "81519a41-d90e-44ed-8751-6896089148c7";
+    const trace = {
+      argv: process.argv.slice(3),
+      input: m,
+      pid: process.pid,
+      hook: Object.fromEntries(
+        ["NODE", "SCRIPT", "URL", "TOKEN"].map((key) => [
+          key,
+          process.env["CODEBIT_HOOK_" + key],
+        ]),
+      ),
+    };
+    if (process.env.CODEBIT_AGY_TRACE)
+      writeFileSync(process.env.CODEBIT_AGY_TRACE, JSON.stringify(trace));
+    const step = (update) =>
+      out({
+        event: "step_update",
+        step_update: { conversation_id: conversation, ...update },
+      });
+    const tool = (index, name, parameters, state = "DONE", extra = {}) =>
+      step({
+        step_index: index,
+        state,
+        step_type: "tool",
+        tool_name: name,
+        duration_seconds: 0.05,
+        tool_info: { name, parameters, ...extra },
+      });
+    out({
+      event: "init",
+      conversation_id: conversation,
+      init: {
+        model: flag("--model"),
+        cwd: process.cwd(),
+        tools: ["run_command"],
+        permission_mode: "always-proceed",
+      },
+    });
+    step({ step_index: 0, state: "DONE", step_type: "user_input" });
+    // Keep running even after stdin closes: interrupt must kill this process.
+    if (text.includes("HOLD")) {
+      setInterval(() => {}, 1000);
+      return;
+    }
+    if (text.includes("FAILTURN") || text.includes("FAILSHORT")) {
+      process.stdout.write(
+        JSON.stringify({
+          event: "result",
+          result: {
+            conversation_id: conversation,
+            status: "ERROR",
+            ...(text.includes("FAILTURN")
+              ? { error: "Falha informada no result." }
+              : {}),
+          },
+        }) + "\n",
+        () =>
+          process.stderr.write(
+            'AGY_ERROR: {"short_error":"Falha curta do agy.","status":"UNKNOWN"}\n',
+            () => process.exit(3),
+          ),
+      );
+      return;
+    }
+    let response = "PITANGA\n";
+    if (text.includes("ECHO")) response = text;
+    if (text.includes("OPTIONS")) response = JSON.stringify(trace);
+    if (text.includes("STREAM")) {
+      step({
+        step_index: 1,
+        state: "DONE",
+        step_type: "agent_response",
+        duration_seconds: 3.6,
+        usage: { input_tokens: 7126, output_tokens: 44, total_tokens: 7170 },
+      });
+      const cmd = {
+        CommandLine: "npm test",
+        toolSummary: "testar",
+        WaitMsBeforeAsync: 10,
+      };
+      tool(2, "run_command", cmd, "ACTIVE");
+      tool(2, "run_command", cmd);
+      tool(3, "run_command", { CommandLine: "echo oi" }, "ERROR", {
+        error: { type: "TOOL_ERROR", message: "permission denied" },
+      });
+      const parameters = {
+        Arguments: {},
+        ServerName: "codebit_probe",
+        ToolName: "probe_echo",
+      };
+      tool(4, "call_mcp_tool", parameters, "ACTIVE");
+      tool(4, "call_mcp_tool", parameters, "DONE", { output: "PITANGA" });
+      tool(6, "write_file", { Path: "src/new.ts" }, "ACTIVE");
+      tool(6, "write_file", { Path: "src/new.ts" });
+      tool(7, "edit_file", { Path: "src/edited.ts" });
+    }
+    if (/PLAN(FILE|MISSING|OUTSIDE)/.test(text)) {
+      // Only tests that explicitly isolate HOME may create plan files.
+      if (
+        resolve(homedir()) !== resolve(process.env.CODEBIT_AGY_TEST_HOME || ".")
+      )
+        throw new Error(
+          "O plano do fixture exige uma pasta pessoal temporária.",
+        );
+      const brain = join(
+        homedir(),
+        ".gemini",
+        "antigravity-cli",
+        "brain",
+        conversation,
+      );
+      const path = join(
+        text.includes("PLANOUTSIDE") ? process.cwd() : brain,
+        "implementation_plan.md",
+      );
+      if (!text.includes("PLANMISSING")) {
+        mkdirSync(join(path, ".."), { recursive: true });
+        writeFileSync(
+          path,
+          "# Plano do Antigravity\n\n1. Cobrir a integração.\n",
+        );
+      }
+      tool(8, "write_file", { Path: path });
+      response = "Plano pronto na conversa.";
+    }
+    if (text.includes("PLANREPLY"))
+      response = "# Plano na resposta\n\n1. Testar.";
+    const finishAgy = () => {
+      const split = text.includes("STREAM")
+        ? 5
+        : Math.ceil(response.length / 2);
+      step({
+        step_index: 5,
+        state: "ACTIVE",
+        step_type: "agent_response",
+        text_delta: response.slice(0, split),
+      });
+      step({
+        step_index: 5,
+        state: "DONE",
+        step_type: "agent_response",
+        text_delta: response.slice(split),
+        duration_seconds: 2.1,
+        usage: {
+          input_tokens: 7406,
+          output_tokens: 3,
+          thinking_tokens: 20,
+          cache_read_tokens: 100,
+          total_tokens: 7529,
+        },
+      });
+      // STALEERROR: the answer ends the turn, yet the result repeats an API
+      // error the CLI already retried, as Antigravity CLI 1.4 does.
+      // ERRORAFTER: a model call fails after the answer.
+      if (text.includes("ERRORAFTER"))
+        step({
+          step_index: 6,
+          state: "DONE",
+          step_type: "error_message",
+          error: "API error (attempt 3): UNAVAILABLE (code 503)",
+        });
+      if (text.includes("STALEERROR") || text.includes("ERRORAFTER")) {
+        process.stdout.write(
+          JSON.stringify({
+            event: "result",
+            result: {
+              conversation_id: conversation,
+              status: "ERROR",
+              response,
+              error:
+                "API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable.",
+            },
+          }) + "\n",
+          () =>
+            process.stderr.write(
+              'AGY_ERROR: {"short_error":"API error","status":"UNKNOWN"}\n',
+              () => process.exit(3),
+            ),
+        );
+        return;
+      }
+      out({
+        event: "result",
+        result: {
+          conversation_id: conversation,
+          status: "SUCCESS",
+          response,
+          duration_seconds: 8.2,
+          num_turns: 1,
+          usage: {
+            input_tokens: 21825,
+            output_tokens: 81,
+            total_tokens: 21906,
+          },
+        },
+      });
+    };
+    if (text.includes("SLOW")) setTimeout(finishAgy, 200);
+    else finishAgy();
+    return;
+  }
+  if (line.includes("THINK")) thinking = true;
   if (dialect === "devin") {
     const reply = (result) => out({ jsonrpc: "2.0", id: m.id, result });
     if (m.method === "initialize")
@@ -744,6 +1012,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         responseText = JSON.stringify({
           model: flag("--model"),
           effort: flag("--effort"),
+          ...(flag("--thinking-display")
+            ? { thinkingDisplay: flag("--thinking-display") }
+            : {}),
         });
       const delay = respondTo(text, {
         permissionMode: permissionMode ?? flag("--permission-mode"),
@@ -912,7 +1183,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
             input: { plan, planFilePath },
           },
         });
-      } else if (text.includes("DELETE:")) {
+      } else if (/DELETE(ASK)?:/.test(text)) {
+        const [, ask, command] = /DELETE(ASK)?:(.*)/s.exec(text);
+        askAfterHook = ask ? command.trim() : "";
         if (!hookIds.length) {
           responseText = "sem gancho";
           setTimeout(finish, delay);
@@ -926,7 +1199,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
               input: {
                 hook_event_name: "PreToolUse",
                 tool_name: "Bash",
-                tool_input: { command: text.split("DELETE:")[1].trim() },
+                tool_input: { command: command.trim() },
               },
             },
           });
@@ -948,6 +1221,19 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         responseText = m.response.response.message;
       if (m.response.request_id === "hook-1") {
         const hook = m.response.response?.hookSpecificOutput;
+        if (askAfterHook && hook?.permissionDecision === "allow") {
+          out({
+            type: "control_request",
+            request_id: "approval-2",
+            request: {
+              subtype: "can_use_tool",
+              tool_name: "Bash",
+              input: { command: askAfterHook },
+            },
+          });
+          askAfterHook = "";
+          return;
+        }
         responseText =
           hook?.permissionDecision === "deny"
             ? `bloqueado: ${hook.permissionDecisionReason}`
@@ -955,6 +1241,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
               ? "permitido"
               : "liberado";
       }
+      if (m.response.request_id === "approval-2")
+        responseText = `de novo: ${m.response.response.behavior}`;
       finish();
     }
   }
